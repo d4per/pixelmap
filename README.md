@@ -3,7 +3,7 @@
 **Note! the source code will be available after the paper has been released**
 
 ## 📄 **White Paper**
-For a detailed explanation of the PIXELMAP framework, including methodology, experiments, and results, refer to our **[White Paper](https://doi.org/10.36227/techrxiv.173749998.89779329/v1)** *(Link coming soon)*.
+For a detailed explanation of the PIXELMAP framework, including methodology, experiments, and results, refer to our **[White Paper](https://doi.org/10.36227/techrxiv.173749998.89779329/v1)**.
 
 ---
 
