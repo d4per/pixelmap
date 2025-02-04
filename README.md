@@ -1,7 +1,7 @@
 # PIXELMAP Framework
 
 ## 📄 **White Paper**
-For a detailed explanation of the PIXELMAP framework, including methodology, experiments, and results, refer to our **[White Paper on ArXiv](#)** *(Link coming soon)*.
+For a detailed explanation of the PIXELMAP framework, including methodology, experiments, and results, refer to our **[White Paper](https://doi.org/10.36227/techrxiv.173749998.89779329/v1)**.
 
 ---
 
