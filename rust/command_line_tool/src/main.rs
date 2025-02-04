@@ -87,6 +87,11 @@ fn main() {
     let photo1 = read_photo(&args.photo1);
     let photo2 = read_photo(&args.photo2);
 
+    if photo1.width != photo2.width || photo1.height != photo2.height {
+        println!("Err: Photos must have the same dimensions");
+        return;
+    }
+
     // Example parameters (you can expose these via command line if desired).
     let clean_max_dist = 2.0;
     // Use the processing mode specified by the user.
@@ -172,12 +177,14 @@ fn to_dense_map(dense_photo_map: &DensePhotoMap) -> String {
 }
 
 pub fn save_photo(photo: Photo, filename: &str) {
+    println!("Writing image {filename}");
     let img = image::RgbaImage::from_raw(photo.width as u32, photo.height as u32, photo.img_data).unwrap();
     img.save(filename).unwrap();
 }
 
 pub fn read_photo(filename: &str) -> Photo {
-    let img = open(filename).expect("Kunde inte ladda bilden");
+    println!("Reading image file: {filename}");
+    let img = open(filename).expect("Could not load image");
     let pixel_data = img.to_rgba8().into_raw();
     Photo {
         img_data: pixel_data,

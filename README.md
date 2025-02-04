@@ -1,7 +1,5 @@
 # PIXELMAP Framework
 
-**Note! the source code will be available after the paper has been released**
-
 ## 📄 **White Paper**
 For a detailed explanation of the PIXELMAP framework, including methodology, experiments, and results, refer to our **[White Paper on ArXiv](#)** *(Link coming soon)*.
 
@@ -9,6 +7,11 @@ For a detailed explanation of the PIXELMAP framework, including methodology, exp
 
 ## 🌐 **Interactive Website**
 Explore PIXELMAP in action with our **[Interactive Demo](https://pixelmap.dogduck.com/)**, where you can upload your own images and visualize the dense correspondence mappings in real-time.
+
+
+## Open source implementation in Rust
+The source code is present in this repository in the [rust](rust) folder.
+
 
 ---
 

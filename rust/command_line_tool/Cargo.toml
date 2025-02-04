@@ -9,5 +9,5 @@ clap = { version = "4.5.27", features = ["derive"] }
 image = "0.24.9"
 
 [[bin]]
-name = "pixelmap_command_line_tool"
+name = "pixelmap"
 path = "src/main.rs"
