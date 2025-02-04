@@ -1,0 +1,13 @@
+[package]
+name = "pixelmap_command_line_tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pixelmap = { path = "../pixelmap", version = "0.1.0"}
+clap = { version = "4.5.27", features = ["derive"] }
+image = "0.24.9"
+
+[[bin]]
+name = "pixelmap_command_line_tool"
+path = "src/main.rs"

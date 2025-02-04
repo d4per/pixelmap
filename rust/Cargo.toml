@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "command_line_tool",
+    "pixelmap",
+]
+
+resolver = "2"
+
+# Optionally, you can keep some workspace-level settings:
+[profile.release]
+lto = true
+codegen-units = 10

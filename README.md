@@ -8,7 +8,7 @@ For a detailed explanation of the PIXELMAP framework, including methodology, exp
 ---
 
 ## 🌐 **Interactive Website**
-Explore PIXELMAP in action with our **[Interactive Demo](https://photomapping.dogduck.com/)**, where you can upload your own images and visualize the dense correspondence mappings in real-time.
+Explore PIXELMAP in action with our **[Interactive Demo](https://pixelmap.dogduck.com/)**, where you can upload your own images and visualize the dense correspondence mappings in real-time.
 
 ---
 
