@@ -6,6 +6,7 @@ use std::rc::Rc;
 /// The `CorrespondenceScoring` struct is responsible for evaluating the similarity between two photos
 /// using pixel comparisons within a circular neighborhood. This similarity is computed based on color
 /// differences between corresponding regions of the photos.
+#[derive(Clone)]
 pub struct CorrespondenceScoring {
     /// A shared reference to the first photo.
     photo1: Rc<Photo>,
@@ -30,6 +31,7 @@ impl CorrespondenceScoring {
     /// # Details
     /// This method precomputes a `sqrt_table` to optimize calculations of maximum x-offsets
     /// for each y-offset in the circular neighborhood.
+    /// The square root values are floored to ensure the offsets remain within the circular boundary.
     pub fn new(photo1: Rc<Photo>, photo2: Rc<Photo>, neighborhood_radius: isize) -> Self {
         let diameter = (2 * neighborhood_radius + 1) as usize;
         let mut sqrt_table = vec![0isize; diameter];

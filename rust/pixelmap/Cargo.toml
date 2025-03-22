@@ -2,12 +2,31 @@
 name = "pixelmap"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+cuda = ["rustacuda"]  # Only enable CUDA when the 'cuda' feature is selected
 
 [dependencies]
 rand = "0.9.0-alpha.2"
 kd-tree = "0.6.0"
 typenum = "1.17.0"
 nalgebra = "0.30.0"
+cuda-driver-sys = "0.3.0"  # Make this non-optional
+lazy_static = "1.4"        # Make this non-optional too
+
+# CUDA dependencies (optional)
+rustacuda = { version = "0.1.3", optional = true }
+ffi = { version = "0.1.1", optional = true }
 
 [lib]
 name = "pixelmap"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"

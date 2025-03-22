@@ -1,0 +1,6 @@
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-L", "/home/per/git/pixelmap/rust/cuda/cuda",
+    "-l", "pixelmap_cuda",
+]

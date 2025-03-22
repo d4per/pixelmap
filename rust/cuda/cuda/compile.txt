@@ -1,0 +1,2 @@
+
+nvcc -O3 --shared -Xcompiler -fPIC -o libpixelmap_cuda.so circular_feature.cu

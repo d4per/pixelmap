@@ -331,4 +331,237 @@ impl DensePhotoMap {
         }
         result
     }
+
+    /// Get packed data for efficient GPU processing (structure of arrays format)
+    pub fn get_packed_data(&self) -> Vec<f32> {
+        let cell_count = self.grid_width * self.grid_height;
+        let mut result = Vec::with_capacity(cell_count * 3);
+        
+        // First store all x mappings
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (mapped_x, _) = self.get_grid_coordinates(x, y);
+                result.push(mapped_x);
+            }
+        }
+        
+        // Then store all y mappings
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (_, mapped_y) = self.get_grid_coordinates(x, y);
+                result.push(mapped_y);
+            }
+        }
+        
+        // Finally store all used flags (as 1.0f or 0.0f)
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (mapped_x, _) = self.get_grid_coordinates(x, y);
+                result.push(if mapped_x.is_nan() { 0.0 } else { 1.0 });
+            }
+        }
+        
+        result
+    }
+    
+    /// Create a new DensePhotoMap from packed data (fixed implementation)
+    pub fn from_packed_data(
+        photo1: Rc<Photo>,
+        photo2: Rc<Photo>,
+        grid_width: usize, 
+        grid_height: usize, 
+        data: &[f32]
+    ) -> Self {
+        let cell_count = grid_width * grid_height;
+        let grid_cell_size = photo1.width / (grid_width - 1);
+        
+        // Create empty map
+        let mut map = DensePhotoMap {
+            photo1,
+            photo2,
+            grid_width,
+            grid_height,
+            map_data: vec![f32::NAN; grid_width * grid_height * 2],
+            grid_cell_size,
+        };
+        
+        // Extract the data in the same order it was packed
+        for y in 0..grid_height {
+            for x in 0..grid_width {
+                let idx = y * grid_width + x;
+                let x_value = data[idx];
+                let y_value = data[idx + cell_count];
+                
+                if data[idx + 2 * cell_count] > 0.5 {
+                    map.set_grid_coordinates(x, y, x_value, y_value);
+                } else {
+                    map.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
+                }
+            }
+        }
+        
+        map
+    }
+    
+    /// Update this map from packed data
+    pub fn update_from_packed_data(&mut self, data: &[f32]) {
+        let cell_count = self.grid_width * self.grid_height;
+        
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let idx = y * self.grid_width + x;
+                let x_value = data[idx];
+                let y_value = data[idx + cell_count];
+                
+                if data[idx + 2 * cell_count] > 0.5 {
+                    self.set_grid_coordinates(x, y, x_value, y_value);
+                } else {
+                    self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
+                }
+            }
+        }
+    }
+
+    /// Interpolate the map to a new grid size
+    pub fn interpolate(&self, target_width: usize, target_height: usize) -> Self {
+        // Create a new map with target dimensions
+        let mut result = DensePhotoMap::new(
+            self.photo1.clone(),
+            self.photo2.clone(), 
+            target_width, 
+            target_height
+        );
+        
+        // Calculate scale factors
+        let scale_x = (self.grid_width - 1) as f32 / (target_width - 1) as f32;
+        let scale_y = (self.grid_height - 1) as f32 / (target_height - 1) as f32;
+        
+        // Interpolate grid coordinates
+        for y in 0..target_height {
+            for x in 0..target_width {
+                // Calculate source coordinates in the original grid
+                let src_x = x as f32 * scale_x;
+                let src_y = y as f32 * scale_y;
+                
+                // Get interpolated point
+                let (map_x, map_y) = self.get_interpolated_point(src_x, src_y);
+                
+                // Set grid coordinates in the new map
+                result.set_grid_coordinates(x, y, map_x, map_y);
+            }
+        }
+        
+        result
+    }
+
+    /// Warp a photo using nearest-neighbor interpolation
+    pub fn warp(&self, photo: &Photo) -> Photo {
+        // Implementation needed - this is a skeletal version
+        let mut new_img_data = vec![0u8; photo.width * photo.height * 4];
+        
+        // Simple implementation for now
+        for y in 0..photo.height {
+            for x in 0..photo.width {
+                let (mapped_x, mapped_y) = self.map_photo_pixel(x as f32, y as f32);
+                let out_idx = (y * photo.width + x) * 4;
+                
+                if !mapped_x.is_nan() && mapped_x >= 0.0 && mapped_x < photo.width as f32 && 
+                   mapped_y >= 0.0 && mapped_y < photo.height as f32 {
+                    let src_x = mapped_x.round() as usize;
+                    let src_y = mapped_y.round() as usize;
+                    let src_idx = (src_y * photo.width + src_x) * 4;
+                    
+                    new_img_data[out_idx] = photo.img_data[src_idx];
+                    new_img_data[out_idx + 1] = photo.img_data[src_idx + 1];
+                    new_img_data[out_idx + 2] = photo.img_data[src_idx + 2];
+                    new_img_data[out_idx + 3] = photo.img_data[src_idx + 3];
+                }
+            }
+        }
+        
+        Photo {
+            img_data: new_img_data,
+            width: photo.width,
+            height: photo.height,
+        }
+    }
+    
+    /// Warp a photo using bilinear interpolation
+    pub fn warp_bilinear(&self, photo: &Photo) -> Photo {
+        // Needs actual implementation
+        // For now, just call the nearest-neighbor version
+        self.warp(photo)
+    }
+    
+    /// Warp a photo using bicubic interpolation
+    pub fn warp_bicubic(&self, photo: &Photo) -> Photo {
+        // Needs actual implementation
+        // For now, just call the nearest-neighbor version
+        self.warp(photo)
+    }
+    
+    /// Blend two photos using a mapping
+    pub fn blend(&self, photo1: &Photo, photo2: &Photo, blend_factor: f32) -> Photo {
+        // Needs actual implementation
+        // For now, return the first photo
+        Photo {
+            img_data: photo1.img_data.clone(),
+            width: photo1.width,
+            height: photo1.height,
+        }
+    }
+
+    /// Get x-coordinates as a vector
+    pub fn get_x_values(&self) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.grid_width * self.grid_height);
+        
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (x_val, _) = self.get_grid_coordinates(x, y);
+                result.push(x_val);
+            }
+        }
+        
+        result
+    }
+    
+    /// Get y-coordinates as a vector
+    pub fn get_y_values(&self) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.grid_width * self.grid_height);
+        
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (_, y_val) = self.get_grid_coordinates(x, y);
+                result.push(y_val);
+            }
+        }
+        
+        result
+    }
+    
+    /// Get usage flags as a vector
+    pub fn get_usage_flags(&self) -> Vec<bool> {
+        let mut result = Vec::with_capacity(self.grid_width * self.grid_height);
+        
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let (x_val, _) = self.get_grid_coordinates(x, y);
+                result.push(!x_val.is_nan());
+            }
+        }
+        
+        result
+    }
+    
+    /// Update usage flags from a vector
+    pub fn update_usage_flags(&mut self, flags: &[bool]) {
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                let idx = y * self.grid_width + x;
+                if idx < flags.len() && !flags[idx] {
+                    self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
+                }
+            }
+        }
+    }
 }

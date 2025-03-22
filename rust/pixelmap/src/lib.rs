@@ -49,14 +49,56 @@
 
 pub mod pixelmap_processor;
 
+// Add public modules
 pub mod photo;
+pub mod circular_feature_descriptor;
+pub mod circular_feature_grid;
+pub mod dense_photo_map;
 pub mod correspondence_mapping_algorithm;
-mod correspondence_scoring;
 pub mod affine_transform;
 pub mod affine_transform_cell;
-pub mod dense_photo_map;
-mod circular_feature_grid;
-mod circular_feature_descriptor;
+
+// Conditional compilation for CUDA support
+#[cfg(feature = "cuda")]
+pub mod cuda2;
+
+#[cfg(feature = "cuda")]
+pub mod cuda_bindings;
+
+pub use cuda_bindings::FeaturePair;
+
+mod cuda {
+    pub mod memory;
+}
+
+// Version information
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Internal Modules
+mod correspondence_scoring;
 mod circular_feature_descriptor_matcher;
+
 pub mod model_3d;
 pub mod ac_grid;
+pub mod core {
+    /// Module containing core functionality
+    // Core implementations will go here
+    pub mod core {
+        // Core implementations will go here
+    }
+}
+pub mod utils {
+    /// Module containing utility functions
+    // Utility implementations will go here
+    pub mod utils {
+        // Utility implementations will go here
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        assert_eq!(2 + 2, 4);
+    }
+}

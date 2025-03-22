@@ -4,7 +4,7 @@ use crate::correspondence_scoring::CorrespondenceScoring;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::Rng;
 use std::rc::Rc;
 
 /// Manages an iterative process for matching two images (`photo1` and `photo2`) by
@@ -22,9 +22,9 @@ use std::rc::Rc;
 ///    describing the best transforms found for each cell.
 pub struct CorrespondenceMappingAlgorithm {
     /// Reference-counted handle to the first (scaled) photo.
-    photo1: Rc<Photo>,
+    pub photo1: Rc<Photo>,
     /// Reference-counted handle to the second (scaled) photo.
-    photo2: Rc<Photo>,
+    pub photo2: Rc<Photo>,
     /// Size of each grid cell in pixels.
     grid_cell_size: usize,
     /// A queue of candidate [AffineTransform] objects to evaluate and refine.
@@ -93,7 +93,7 @@ impl CorrespondenceMappingAlgorithm {
     pub fn run_until_done(&mut self) {
         loop {
             // Shuffle transforms to avoid bias.
-            self.queue.shuffle(&mut thread_rng());
+            self.queue.shuffle(&mut rand::thread_rng());
             let is_done = self.run_queue();
             if is_done {
                 break;
@@ -270,30 +270,7 @@ impl CorrespondenceMappingAlgorithm {
                 grid_square.set(cm_out, score);
 
                 // Generate child transforms for neighboring cells and push them to out_queue.
-                if grid_x > 0 {
-                    out_queue.push(
-                        cm.extrapolate_mapping(((grid_x - 1) * self.grid_cell_size) as u16,
-                                               (grid_y * self.grid_cell_size) as u16)
-                    );
-                }
-                if grid_x < ac_grid.get_grid_width() - 1 {
-                    out_queue.push(
-                        cm.extrapolate_mapping(((grid_x + 1) * self.grid_cell_size) as u16,
-                                               (grid_y * self.grid_cell_size) as u16)
-                    );
-                }
-                if grid_y > 0 {
-                    out_queue.push(
-                        cm.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
-                                               ((grid_y - 1) * self.grid_cell_size) as u16)
-                    );
-                }
-                if grid_y < ac_grid.get_grid_height() - 1 {
-                    out_queue.push(
-                        cm.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
-                                               ((grid_y + 1) * self.grid_cell_size) as u16)
-                    );
-                }
+                self.update_neighbors(grid_x, grid_y, &cm, &mut out_queue);
             }
         }
 
@@ -301,6 +278,36 @@ impl CorrespondenceMappingAlgorithm {
         self.queue = out_queue;
         // If it's empty, the algorithm is done (no further improvements).
         self.queue.is_empty()
+    }
+
+    /// Updates neighboring cells by generating child transforms and pushing them to the out_queue.
+    fn update_neighbors(&self, grid_x: usize, grid_y: usize, cm: &AffineTransform, out_queue: &mut Vec<AffineTransform>) {
+        let ac_grid = &self.ac_grid;
+
+        if grid_x > 0 {
+            out_queue.push(
+                cm.extrapolate_mapping(((grid_x - 1) * self.grid_cell_size) as u16,
+                                       (grid_y * self.grid_cell_size) as u16)
+            );
+        }
+        if grid_x < ac_grid.get_grid_width() - 1 {
+            out_queue.push(
+                cm.extrapolate_mapping(((grid_x + 1) * self.grid_cell_size) as u16,
+                                       (grid_y * self.grid_cell_size) as u16)
+            );
+        }
+        if grid_y > 0 {
+            out_queue.push(
+                cm.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
+                                       ((grid_y - 1) * self.grid_cell_size) as u16)
+            );
+        }
+        if grid_y < ac_grid.get_grid_height() - 1 {
+            out_queue.push(
+                cm.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
+                                       ((grid_y + 1) * self.grid_cell_size) as u16)
+            );
+        }
     }
 
     /// Returns the current length of the queue (for debugging or monitoring).
@@ -393,8 +400,8 @@ impl CorrespondenceMappingAlgorithm {
                 // If the cell has a transform, set it in the DensePhotoMap.
                 grid.get_affine_transform().iter().for_each(|cmm| {
                     pm.set_grid_coordinates(
-                        (cmm.origin_x as usize / self.grid_cell_size),
-                        (cmm.origin_y as usize / self.grid_cell_size),
+                        cmm.origin_x as usize / self.grid_cell_size,
+                        cmm.origin_y as usize / self.grid_cell_size,
                         cmm.translate_x,
                         cmm.translate_y
                     );
@@ -402,5 +409,85 @@ impl CorrespondenceMappingAlgorithm {
             }
         }
         pm
+    }
+
+    /// Get photo1 height as u32
+    pub fn photo1_height(&self) -> u32 {
+        self.photo1.height as u32
+    }
+
+    /// Get photo1 width as u32
+    pub fn photo1_width(&self) -> u32 {
+        self.photo1.width as u32
+    }
+    
+    /// Get grid cell size
+    pub fn grid_cell_size(&self) -> usize {
+        self.grid_cell_size
+    }
+
+    /// Gather all transforms from the ac_grid
+    pub fn gather_transforms(&self) -> Vec<AffineTransform> {
+        // Instead of accessing a non-existent field, collect transforms from AC grid
+        let mut transforms = Vec::new();
+        
+        // Get transforms from each cell in the grid
+        for y in 0..self.ac_grid.get_grid_height() {
+            for x in 0..self.ac_grid.get_grid_width() {
+                if let Some(transform) = self.ac_grid.get_grid_square(x, y).get_affine_transform() {
+                    transforms.push(transform);
+                }
+            }
+        }
+        
+        transforms
+    }
+
+    /// Get grid sample points based on grid_cell_size
+    pub fn get_grid_sample_points(&self) -> Vec<(f32, f32)> {
+        // Instead of accessing a non-existent field, generate sample points
+        let mut points = Vec::new();
+        let step = self.grid_cell_size as f32 / 2.0;
+        
+        // Generate sample points based on photo1 dimensions and grid cell size
+        let width = self.photo1.width;
+        let height = self.photo1.height;
+        
+        for y in (0..height).step_by(self.grid_cell_size) {
+            for x in (0..width).step_by(self.grid_cell_size) {
+                points.push((x as f32 + step, y as f32 + step));
+            }
+        }
+        
+        points
+    }
+
+    /// Update scores from external systems
+    pub fn update_scores(&mut self, scores: &[f32]) {
+        // Implementation for updating scores
+        // This would update the AC grid with scores
+        println!("Updating {} scores", scores.len());
+        // TODO: Implement proper score updating
+    }
+
+    /// Apply transform updates after score updates
+    pub fn update_transforms_from_scores(&mut self) {
+        // Implementation for updating transforms from scores
+        // This would apply any pending score updates to the transforms
+        println!("Updating transforms from scores");
+        // TODO: Implement proper transform updating
+    }
+}
+
+impl Clone for CorrespondenceMappingAlgorithm {
+    fn clone(&self) -> Self {
+        CorrespondenceMappingAlgorithm {
+            photo1: self.photo1.clone(),
+            photo2: self.photo2.clone(),
+            grid_cell_size: self.grid_cell_size,
+            queue: self.queue.clone(),
+            scorer: self.scorer.clone(),
+            ac_grid: self.ac_grid.clone(),
+        }
     }
 }

@@ -31,6 +31,13 @@ impl Photo {
     ///
     /// # Returns
     /// A tuple `(r, g, b)` representing the red, green, and blue channels of the pixel.
+    ///
+    /// # Note
+    /// The choice of returning blue for out-of-bounds access is arbitrary and can be changed based on requirements.
+    /// It is chosen here to clearly indicate an out-of-bounds access.
+    ///
+    /// # Consideration
+    /// In a production context, consider returning a `Result<(u8, u8, u8), PhotoError>` for more robust error handling.
     pub fn get_rgb(&self, x: usize, y: usize) -> (u8, u8, u8) {
         // Rust doesn't allow negative indices, so `x < 0 || y < 0` is redundant, but was in the original code.
         // For clarity, we keep the index checks for completeness.
@@ -126,5 +133,36 @@ impl Photo {
             width: new_width,
             height: new_height,
         }
+    }
+
+    /// Create a new empty photo with the specified dimensions
+    pub fn new_empty(width: usize, height: usize) -> Self {
+        // Fix the field name - should be img_data, not buffer
+        let buffer = vec![0u8; width * height * 4]; // RGBA format
+        
+        Self {
+            img_data: buffer, // Changed from buffer to img_data
+            width,
+            height,
+        }
+    }
+    
+    /// Creates a new Photo with specified RGBA data and dimensions
+    pub fn new_with_data(img_data: Vec<u8>, width: usize, height: usize) -> Self {
+        Self {
+            img_data,
+            width,
+            height,
+        }
+    }
+    
+    /// Get a reference to the underlying image data
+    pub fn get_img_data(&self) -> &[u8] {
+        &self.img_data
+    }
+    
+    /// Get a mutable reference to the underlying image data
+    pub fn get_img_data_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.img_data
     }
 }

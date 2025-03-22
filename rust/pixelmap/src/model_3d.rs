@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use crate::photo::Photo;
 use crate::dense_photo_map::DensePhotoMap;
-use nalgebra::{DMatrix, DVector, SVD};
+use nalgebra::{DMatrix, SVD};
 
 /// A 3D model built from a 2D grid of correspondences. Each cell in the grid has a
 /// position in 3D space (`x, y, z`) plus texture coordinates (`u, v`) mapping it

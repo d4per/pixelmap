@@ -213,4 +213,9 @@ impl CircularFeatureGrid {
 
         descriptor
     }
+
+    /// Set feature descriptors explicitly
+    pub fn set_feature_descriptors(&mut self, descriptors: Vec<CircularFeatureDescriptor>) {
+        self.feature_descriptors = descriptors;
+    }
 }

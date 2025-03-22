@@ -2,6 +2,7 @@
 members = [
     "command_line_tool",
     "pixelmap",
+    "cuda"
 ]
 
 resolver = "2"

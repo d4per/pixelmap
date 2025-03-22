@@ -129,6 +129,19 @@ impl AffineTransform {
         (x2, y2)
     }
 
+    /// Transform a point (x, y) according to this affine transform
+    pub fn transform(&self, x: f32, y: f32) -> (f32, f32) {
+        // Compute the offset from the origin
+        let dx = x - self.origin_x as f32;
+        let dy = y - self.origin_y as f32;
+        
+        // Apply the transform matrix and add the translation
+        let tx = self.a11 * dx + self.a12 * dy + self.translate_x;
+        let ty = self.a21 * dx + self.a22 * dy + self.translate_y;
+        
+        (tx, ty)
+    }
+
     /// Creates a **new** `AffineTransform` in which the origin is shifted to
     /// a new integer coordinate `(x, y)`. The existing transform is applied
     /// to `(x, y)` to calculate the new translation offsets.
