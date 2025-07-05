@@ -4,6 +4,7 @@ use crate::circular_feature_grid;
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
+use std::rc::Rc;
 
 /// Manages a pipeline for finding and refining a mapping between two images (`photo1` and `photo2`).
 ///
@@ -14,10 +15,10 @@ use crate::photo::Photo;
 /// 4. Producing final [DensePhotoMap]s describing forward (`photo1` → `photo2`) and backward (`photo2` → `photo1`) transformations.
 pub struct PixelMapProcessor {
     /// The first image to be matched/registered.
-    photo1: Photo,
+    photo1: Rc<Photo>,
 
     /// The second image to be matched/registered.
-    photo2: Photo,
+    photo2: Rc<Photo>,
 
     /// An algorithm that manages local transformations and outlier filtering
     /// from `photo1` to `photo2`.
@@ -50,7 +51,7 @@ impl PixelMapProcessor {
     ///
     /// # Returns
     /// A new `PixelMapProcessor` ready to be initialized.
-    pub fn new(photo1: Photo, photo2: Photo, photo_width: usize) -> Self {
+    pub fn new(photo1: Rc<Photo>, photo2: Rc<Photo>, photo_width: usize) -> Self {
         // Temporary dummy Photo, used only so that CorrespondenceMappingAlgorithm can be constructed.
         let dummy_photo = Photo::default();
 

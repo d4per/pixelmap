@@ -1,6 +1,7 @@
 use clap::Parser;
 use pixelmap::dense_photo_map::DensePhotoMap;
 use pixelmap::pixelmap_processor::PixelMapProcessor;
+use std::rc::Rc;
 
 use std::fs::File;
 use std::io::Write;
@@ -84,8 +85,8 @@ fn main() {
     let args = Args::parse();
 
     // Load the two input photos (adjust these calls to match your actual I/O).
-    let photo1 = read_photo(&args.photo1);
-    let photo2 = read_photo(&args.photo2);
+    let photo1 = Rc::new(read_photo(&args.photo1));
+    let photo2 = Rc::new(read_photo(&args.photo2));
 
     if photo1.width != photo2.width || photo1.height != photo2.height {
         println!("Err: Photos must have the same dimensions");
