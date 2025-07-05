@@ -56,14 +56,7 @@ This synergy results in accurate pixel-to-pixel mappings, even in challenging co
 
 
 ## 🚀 **Getting Started**
-
-### **Installation**
-```bash
-TODO
-```
-
-### **Usage**
-TODO
+See build instructions inside the [rust](rust) folder.
 
 ---
 
@@ -72,6 +65,4 @@ This project is licensed under the **MIT License** — see the **LICENSE** file 
 
 ---
 
-For questions or collaborations, feel free to reach out or open an issue.
-
-**Let's redefine image correspondence together!** 🚀
+For questions or collaborations, feel free to reach out or open an issue. 🚀
