@@ -331,4 +331,62 @@ impl DensePhotoMap {
         }
         result
     }
+
+    /// Deserializes the `DensePhotoMap` from a byte slice.
+    ///
+    /// # Parameters
+    ///
+    /// * `data`: The byte slice to deserialize from.
+    /// * `photo1`: The first photo.
+    /// * `photo2`: The second photo.
+    ///
+    /// # Returns
+    ///
+    /// A new `DensePhotoMap` instance.
+    pub fn deserialize(data: &[u8], photo1: Rc<Photo>, photo2: Rc<Photo>) -> Self {
+        let mut offset = 0;
+
+        let grid_width = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+
+        let grid_height = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+
+        let grid_cell_size =
+            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+
+        let map_data_len = (data.len() - offset) / 4;
+        let mut map_data = Vec::with_capacity(map_data_len);
+        for i in 0..map_data_len {
+            let start = offset + i * 4;
+            let end = start + 4;
+            map_data.push(f32::from_le_bytes(data[start..end].try_into().unwrap()));
+        }
+
+        Self {
+            photo1,
+            photo2,
+            grid_width,
+            grid_height,
+            map_data,
+            grid_cell_size,
+        }
+    }
+
+    /// Serializes the `DensePhotoMap` to a byte vector, excluding the photos.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the serialized data.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(self.grid_width as u64).to_le_bytes());
+        data.extend_from_slice(&(self.grid_height as u64).to_le_bytes());
+        data.extend_from_slice(&(self.grid_cell_size as u64).to_le_bytes());
+        for &val in &self.map_data {
+            data.extend_from_slice(&val.to_le_bytes());
+        }
+        data
+    }
 }
