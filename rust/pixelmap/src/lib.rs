@@ -46,8 +46,12 @@
 //!
 //! - **`ac_grid`**: Implements a grid of `AffineTransformCell`s, used by the correspondence
 //!   mapping algorithm to store and update the best transform found for each grid cell.
+//!
+//! - **`processing_mode`**: Ready-made iteration schedules (`low`, `medium`, `high`) that
+//!   drive a `PixelMapProcessor` from initialization to a finished mapping.
 
 pub mod pixelmap_processor;
+pub mod processing_mode;
 
 pub mod photo;
 pub mod correspondence_mapping_algorithm;
@@ -60,3 +64,8 @@ mod circular_feature_descriptor;
 mod circular_feature_descriptor_matcher;
 pub mod model_3d;
 pub mod ac_grid;
+
+/// Head-to-head benchmark of the matcher's nearest-neighbour backends.
+/// Enabled by the `bench` feature; not part of the pipeline.
+#[cfg(feature = "bench")]
+pub mod matcher_bench;

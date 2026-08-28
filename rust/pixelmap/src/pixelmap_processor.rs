@@ -4,6 +4,7 @@ use crate::circular_feature_grid;
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Manages a pipeline for finding and refining a mapping between two images (`photo1` and `photo2`).
@@ -33,6 +34,14 @@ pub struct PixelMapProcessor {
 
     /// The initial width used for scaling the photos, if needed, during setup.
     initial_photo_width: usize,
+
+    /// Scaled copies of `photo1`/`photo2`, keyed by `(photo index, target width)`.
+    ///
+    /// Every `iterate()` builds two managers and each used to rescale both originals
+    /// from full resolution, even though the schedule only ever asks for three distinct
+    /// widths and the two managers of one iteration need the very same pair of images
+    /// with their roles swapped. At `high` that was 52 resamples of a 4096x2304 source.
+    scaled: HashMap<(usize, usize), Rc<Photo>>,
 }
 
 impl PixelMapProcessor {
@@ -55,32 +64,29 @@ impl PixelMapProcessor {
         // Temporary dummy Photo, used only so that CorrespondenceMappingAlgorithm can be constructed.
         let dummy_photo = Photo::default();
 
-        let mut result = PixelMapProcessor {
+        let result = PixelMapProcessor {
             photo1,
             photo2,
             ocm_manager1: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5),
             ocm_manager2: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5),
             total_comparisons: 0,
             initial_photo_width: photo_width,
+            scaled: HashMap::new(),
         };
 
-        // Re-initialize with the actual photos.
-        result.ocm_manager1 = CorrespondenceMappingAlgorithm::new(
-            photo_width,
-            &result.photo1,
-            &result.photo2,
-            5,
-            5,
-        );
-        result.ocm_manager2 = CorrespondenceMappingAlgorithm::new(
-            photo_width,
-            &result.photo2,
-            &result.photo1,
-            5,
-            5,
-        );
-
         result
+    }
+
+    /// Returns `photo1` (`which == 0`) or `photo2` (`which == 1`) scaled to `width`,
+    /// computing it at most once per `(photo, width)` pair.
+    fn scaled(&mut self, which: usize, width: usize) -> Rc<Photo> {
+        if let Some(p) = self.scaled.get(&(which, width)) {
+            return p.clone();
+        }
+        let src = if which == 0 { &self.photo1 } else { &self.photo2 };
+        let p = Rc::new(src.get_scaled_proportional(width));
+        self.scaled.insert((which, width), p.clone());
+        p
     }
 
     /// Performs the initial matching step:
@@ -94,8 +100,8 @@ impl PixelMapProcessor {
     pub fn init(&mut self) {
         // Scale down images if needed.
         let width = usize::min(self.initial_photo_width, self.photo1.width);
-        let photo1scaled = self.photo1.get_scaled_proportional(width);
-        let photo2scaled = self.photo2.get_scaled_proportional(width);
+        let photo1scaled = self.scaled(0, width);
+        let photo2scaled = self.scaled(1, width);
 
         // Create circular feature grids.
         let image1 = circular_feature_grid::CircularFeatureGrid::new(
@@ -116,43 +122,23 @@ impl PixelMapProcessor {
         let pairs = circle_area_info_matcher.match_areas(&image1, &image2);
 
         // Create new managers for the scaled images.
-        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::new(
-            photo1scaled.width,
-            &self.photo1,
-            &self.photo2,
-            5,
-            5
-        );
-        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::new(
-            photo1scaled.width,
-            &self.photo2,
-            &self.photo1,
-            5,
-            5
-        );
+        let w = photo1scaled.width;
+        let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
+        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5);
+        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, 5);
 
         // Add the initial matched points.
-        for (p1, p2) in pairs {
-            let s = 1.0;
-            let v = p1.total_angle - p2.total_angle;
-            let vv = -v;
+        for m in pairs {
+            let vv = -m.angle_delta;
 
             // Add forward mapping: (photo1 → photo2)
             ocm_manager1.add_init_point(
-                p1.center_x as f32 * s,
-                p1.center_y as f32 * s,
-                p2.center_x as f32 * s,
-                p2.center_y as f32 * s,
-                vv,
+                m.x1 as f32, m.y1 as f32, m.x2 as f32, m.y2 as f32, vv,
             );
 
             // Add reverse mapping: (photo2 → photo1)
             ocm_manager2.add_init_point(
-                p2.center_x as f32 * s,
-                p2.center_y as f32 * s,
-                p1.center_x as f32 * s,
-                p1.center_y as f32 * s,
-                -vv,
+                m.x2 as f32, m.y2 as f32, m.x1 as f32, m.y1 as f32, -vv,
             );
         }
         println!("init points added");
@@ -162,7 +148,7 @@ impl PixelMapProcessor {
         ocm_manager2.run_until_done();
 
         // Update total comparisons, store the managers.
-        self.total_comparisons = ocm_manager1.get_total_comparisons() + self.ocm_manager2.get_total_comparisons();
+        self.total_comparisons = ocm_manager1.get_total_comparisons() + ocm_manager2.get_total_comparisons();
         self.ocm_manager1 = ocm_manager1;
         self.ocm_manager2 = ocm_manager2;
     }
@@ -210,6 +196,7 @@ impl PixelMapProcessor {
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
         // Remove outliers by forward-backward consistency check.
+        
         pm1.remove_outliers(&pm2, clean_max_dist);
         pm2.remove_outliers(&pm1, clean_max_dist);
 
@@ -218,20 +205,11 @@ impl PixelMapProcessor {
         let pm2_smooth = pm2.smooth_grid_points_n_times(smooth_iterations);
 
         // Re-initialize managers with the smoothed maps.
-        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::new(
-            photo_width,
-            &self.photo1,
-            &self.photo2,
-            grid_cell_size,
-            neighborhood_radius
-        );
-        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::new(
-            photo_width,
-            &self.photo2,
-            &self.photo1,
-            grid_cell_size,
-            neighborhood_radius
-        );
+        let (s1, s2) = (self.scaled(0, photo_width), self.scaled(1, photo_width));
+        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(
+                s1.clone(), s2.clone(), grid_cell_size, neighborhood_radius);
+        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(
+                s2, s1, grid_cell_size, neighborhood_radius);
         ocm_manager1.init_from_photomapping(&pm1_smooth);
         ocm_manager2.init_from_photomapping(&pm2_smooth);
 

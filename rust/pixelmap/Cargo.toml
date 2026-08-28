@@ -9,5 +9,27 @@ kd-tree = "0.6.0"
 typenum = "1.17.0"
 nalgebra = "0.30.0"
 
+# Multi-threaded feature matching. Optional because wasm32-unknown-unknown has no
+# threads to hand out without SharedArrayBuffer and cross-origin isolation; build with
+# --no-default-features for wasm and the matcher falls back to a serial search.
+rayon = { version = "1.10", optional = true }
+
+# `rand::random` (the unseeded fallback in `base_seed`) reaches OS entropy through
+# getrandom, which refuses to build for wasm32-unknown-unknown unless it is told to use
+# the browser's crypto API. Depending on it directly, for wasm only, is the documented
+# way to turn that backend on; see .cargo/config.toml for the matching --cfg.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon", "kd-tree/rayon"]
+# Compiles `matcher_bench`, used to tune the match stride and to re-check the
+# search backends against each other.
+bench = []
+
 [lib]
 name = "pixelmap"
+
+[profile.release]
+codegen-units = 1

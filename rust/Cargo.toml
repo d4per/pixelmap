@@ -2,11 +2,12 @@
 members = [
     "command_line_tool",
     "pixelmap",
+    "viewer",
 ]
 
 resolver = "2"
 
-# Optionally, you can keep some workspace-level settings:
 [profile.release]
-lto = true
-codegen-units = 10
+# codegen-units = 1 so LTO can actually inline across the whole hot path.
+lto = "fat"
+codegen-units = 1

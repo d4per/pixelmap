@@ -10,7 +10,9 @@ Explore PIXELMAP in action with our **[Interactive Demo](https://pixelmap.dogduc
 
 
 ## Open source implementation in Rust
-The source code is present in this repository in the [rust](rust) folder.
+The source code is present in this repository in the [rust](rust) folder. It contains both a
+command line tool that writes the interpolated images to disc, and a viewer that animates
+them in a window.
 
 
 ---

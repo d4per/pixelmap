@@ -1,6 +1,7 @@
 use clap::Parser;
 use pixelmap::dense_photo_map::DensePhotoMap;
 use pixelmap::pixelmap_processor::PixelMapProcessor;
+use pixelmap::processing_mode::ProcessingMode;
 use std::rc::Rc;
 
 use std::fs::File;
@@ -29,7 +30,7 @@ struct Args {
     /// - medium: Slower, but more accurate.
     /// - high: Slowest, but likely the best result.
     #[arg(long, default_value = "low")]
-    processing_mode: String,
+    processing_mode: ProcessingMode,
 
     /// How many interpolations to produce (default is 10)
     #[arg(long, default_value_t = 10)]
@@ -38,47 +39,17 @@ struct Args {
     /// Base filename for interpolated outputs (e.g. "interp" -> "interp_1.jpg", ...)
     #[arg(long, default_value = "interpolation")]
     base_filename: String,
-}
 
+    /// Benchmark the feature matcher's nearest-neighbour backends against each other
+    /// and exit, without running the mapping pipeline.
+    #[cfg(feature = "bench")]
+    #[arg(long, hide = true)]
+    bench_matchers: bool,
 
-
-fn process_low(processor: &mut PixelMapProcessor) -> &mut PixelMapProcessor {
-    processor.iterate(400, 5, 5, 2, 3.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor
-}
-
-fn process_medium(processor: &mut PixelMapProcessor) -> &mut PixelMapProcessor {
-    processor.iterate(400, 5, 5, 2, 3.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor.iterate(400, 5, 5, 2, 0.5);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(800, 5, 5, 2, 3.0);
-    processor.iterate(800, 5, 5, 2, 1.0);
-    processor.iterate(800, 5, 5, 2, 2.0);
-    processor
-}
-
-fn process_high(processor: &mut PixelMapProcessor) -> &mut PixelMapProcessor {
-    processor.iterate(400, 5, 5, 2, 3.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor.iterate(400, 5, 5, 2, 0.5);
-    processor.iterate(400, 5, 5, 2, 1.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(400, 5, 5, 2, 2.0);
-    processor.iterate(800, 5, 5, 2, 3.0);
-    processor.iterate(800, 5, 5, 2, 1.0);
-    processor.iterate(800, 5, 5, 2, 2.0);
-    processor.iterate(1600, 5, 5, 2, 1.0);
-    processor.iterate(1600, 5, 5, 2, 2.0);
-    processor.iterate(1600, 5, 5, 2, 2.0);
-    processor
+    /// Working width for --bench-matchers. Defaults to the processing mode's width.
+    #[cfg(feature = "bench")]
+    #[arg(long, hide = true)]
+    bench_width: Option<usize>,
 }
 
 fn main() {
@@ -93,38 +64,26 @@ fn main() {
         return;
     }
 
+    #[cfg(feature = "bench")]
+    if args.bench_matchers {
+        let width = args.bench_width.unwrap_or_else(|| args.processing_mode.photo_width());
+        let reports = pixelmap::matcher_bench::run(&photo1, &photo2, width);
+        pixelmap::matcher_bench::print_reports(&reports);
+        return;
+    }
+
     // Example parameters (you can expose these via command line if desired).
     let clean_max_dist = 2.0;
     // Use the processing mode specified by the user.
-    let processing_mode = args.processing_mode.to_lowercase();
+    let processing_mode = args.processing_mode;
 
     // Create a processor and perform the main matching/iteration steps.
-    let mut processor = match processing_mode.as_str() {
-        "low" => PixelMapProcessor::new(photo1, photo2, 400),
-        "medium" => PixelMapProcessor::new(photo1, photo2, 800),
-        "high" => PixelMapProcessor::new(photo1, photo2, 1600),
-        _ => {
-            eprintln!(
-                "Invalid processing mode: {}. Use 'low', 'medium', or 'high'.",
-                args.processing_mode
-            );
-            std::process::exit(1);
-        }
-    };
+    let mut processor = PixelMapProcessor::new(photo1, photo2, processing_mode.photo_width());
     processor.init();
+    processing_mode.run(&mut processor);
 
-    match processing_mode.as_str() {
-        "low" => process_low(&mut processor),
-        "medium" => process_medium(&mut processor),
-        "high" => process_high(&mut processor),
-        _ => {
-            eprintln!(
-                "Invalid processing mode: {}. Use 'low', 'medium', or 'high'.",
-                args.processing_mode
-            );
-            std::process::exit(1);
-        }
-    };
+    #[cfg(feature = "bench")]
+    println!("matched area: {:.4}", processor.get_matched_area());
 
     // Obtain the result as a pair of DensePhotoMaps (one for each image).
     let (map1, map2) = processor.get_result(clean_max_dist);
@@ -165,8 +124,8 @@ fn main() {
 
 fn to_dense_map(dense_photo_map: &DensePhotoMap) -> String {
     let mut out = String::with_capacity(1000000);
-    for y in 0..dense_photo_map.photo1.width {
-        for x in 0..dense_photo_map.photo1.height {
+    for y in 0..dense_photo_map.photo1.height {
+        for x in 0..dense_photo_map.photo1.width {
             let (x2, y2) = dense_photo_map.map_photo_pixel(x as f32, y as f32);
             if x2.is_nan() {
                 continue;

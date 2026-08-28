@@ -4,8 +4,43 @@ use crate::correspondence_scoring::CorrespondenceScoring;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// Process-wide base seed for the queue shuffling.
+///
+/// The order in which the queue is drained decides which local optimum the
+/// relaxation settles into, so an unseeded run is not reproducible — the final
+/// mapping differs measurably between two runs of the same binary. Setting
+/// `PIXELMAP_SEED` pins it, which is what makes before/after comparisons of a
+/// change to the algorithm meaningful. Unset, the behaviour is as before: seeded
+/// from OS entropy.
+fn base_seed() -> u64 {
+    static BASE: OnceLock<u64> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        std::env::var("PIXELMAP_SEED")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(rand::random)
+    })
+}
+
+/// Distinguishes the RNGs of the managers created during one run, so the forward
+/// and backward passes do not share a stream.
+static INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// Edge length, in pixels, of the region the queue is grouped by between passes.
+///
+/// Scoring one transform touches an 11x11 patch of *both* photos. Grouping the queue
+/// so that consecutive transforms share most of that patch is what makes the pass
+/// cache-resident; at 1600 px the two photos are 5.8 MB each, so an ungrouped pass
+/// streams from DRAM.
+/// Measured on a 4096x2304 pair at `high`: anything from 6 to 16 performs the same,
+/// 4 is worse, and no grouping at all costs about 15%.
+const QUEUE_TILE: usize = 10;
 
 /// Manages an iterative process for matching two images (`photo1` and `photo2`) by
 /// assigning an [AffineTransform] to each cell in a grid. The algorithm refines these
@@ -33,6 +68,12 @@ pub struct CorrespondenceMappingAlgorithm {
     scorer: CorrespondenceScoring,
     /// A 2D grid that stores the best-known transform for each cell (and its score).
     ac_grid: ACGrid,
+    /// Shuffles the queue between passes. See [`base_seed`].
+    rng: SmallRng,
+    /// Reused buffer for the tile-ordering counting sort.
+    sort_scratch: Vec<AffineTransform>,
+    /// Reused bucket boundaries for the tile-ordering counting sort.
+    tile_offsets: Vec<u32>,
 }
 
 impl CorrespondenceMappingAlgorithm {
@@ -57,7 +98,18 @@ impl CorrespondenceMappingAlgorithm {
         // Scale the original photos to the specified width.
         let photo1a = Rc::new(photo1.get_scaled_proportional(photo_width));
         let photo2a = Rc::new(photo2.get_scaled_proportional(photo_width));
+        Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius)
+    }
 
+    /// Same as [`Self::new`], but takes photos that have already been scaled to the
+    /// working width. Callers that build several algorithms over the same pair of
+    /// images can then scale once instead of once per algorithm.
+    pub fn with_scaled(
+        photo1a: Rc<Photo>,
+        photo2a: Rc<Photo>,
+        grid_cell_size: usize,
+        neighborhood_radius: usize,
+    ) -> Self {
         // Determine how many cells fit in the scaled images.
         let grid_width = photo1a.width / grid_cell_size + 1;
         let grid_height = photo1a.height / grid_cell_size + 1;
@@ -73,6 +125,13 @@ impl CorrespondenceMappingAlgorithm {
                 neighborhood_radius as isize
             ),
             ac_grid: ACGrid::new(grid_width, grid_height),
+            rng: SmallRng::seed_from_u64(
+                base_seed() ^ INSTANCE
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            ),
+            sort_scratch: Vec::new(),
+            tile_offsets: Vec::new(),
         }
     }
 
@@ -92,13 +151,82 @@ impl CorrespondenceMappingAlgorithm {
     /// improvements can be made (i.e., the queue is empty at the end of a cycle).
     pub fn run_until_done(&mut self) {
         loop {
-            // Shuffle transforms to avoid bias.
-            self.queue.shuffle(&mut thread_rng());
+            // Group transforms by image region, shuffling within each region.
+            self.order_queue_by_tile();
             let is_done = self.run_queue();
             if is_done {
                 break;
             }
         }
+    }
+
+    /// Reorders the queue so that transforms whose origins fall in the same tile of
+    /// `photo1` are processed together, and shuffles within each tile.
+    ///
+    /// The original code shuffled the whole queue before every pass, so consecutive
+    /// scorings landed on unrelated parts of two multi-megabyte images. Grouping by
+    /// tile keeps a pass working inside a region small enough to stay cached; the
+    /// `photo2` side follows because the mapping being refined is smooth. The
+    /// within-tile shuffle preserves the reason the original shuffled at all — the
+    /// bias it avoids is between transforms competing for nearby cells, which is
+    /// local. Tiles are visited in serpentine order so that stepping from one tile to
+    /// the next is always a step to an adjacent region.
+    ///
+    /// This is a counting sort: two linear passes plus a scatter, reusing its buffers
+    /// across passes. That is cheaper than the full-width Fisher-Yates it replaces.
+    fn order_queue_by_tile(&mut self) {
+        let n = self.queue.len();
+        if n < 2 {
+            return;
+        }
+        let tile = QUEUE_TILE;
+        let tw = self.photo1.width / tile + 1;
+        let th = self.photo1.height / tile + 1;
+        let n_tiles = tw * th;
+
+        let queue = std::mem::take(&mut self.queue);
+        let mut sorted = std::mem::take(&mut self.sort_scratch);
+        let mut offsets = std::mem::take(&mut self.tile_offsets);
+
+        let tile_of = |cm: &AffineTransform| -> usize {
+            let tx = (cm.origin_x as usize / tile).min(tw - 1);
+            let ty = (cm.origin_y as usize / tile).min(th - 1);
+            // Serpentine: reverse the x order on odd rows so the last tile of one row
+            // is adjacent to the first tile of the next.
+            let tx = if ty & 1 == 1 { tw - 1 - tx } else { tx };
+            ty * tw + tx
+        };
+
+        offsets.clear();
+        offsets.resize(n_tiles + 1, 0u32);
+        for cm in &queue {
+            offsets[tile_of(cm) + 1] += 1;
+        }
+        for i in 1..=n_tiles {
+            offsets[i] += offsets[i - 1];
+        }
+
+        sorted.clear();
+        sorted.resize(n, queue[0]);
+        {
+            let mut cursor = offsets.clone();
+            for cm in &queue {
+                let t = tile_of(cm);
+                sorted[cursor[t] as usize] = *cm;
+                cursor[t] += 1;
+            }
+        }
+
+        for w in offsets.windows(2) {
+            let (a, b) = (w[0] as usize, w[1] as usize);
+            if b - a > 1 {
+                sorted[a..b].shuffle(&mut self.rng);
+            }
+        }
+
+        self.queue = sorted;
+        self.sort_scratch = queue;
+        self.tile_offsets = offsets;
     }
 
     /// Adds a new transform to the queue, deriving rotation from the given `angle`.
@@ -232,7 +360,7 @@ impl CorrespondenceMappingAlgorithm {
     /// `false` if there are still transforms to process in the next iteration.
     fn run_queue(&mut self) -> bool {
         let ac_grid = &self.ac_grid;
-        let mut out_queue: Vec<AffineTransform> = vec![];
+        let mut out_queue: Vec<AffineTransform> = Vec::with_capacity(self.queue.len());
 
         loop {
             let cm_opt = self.queue.pop();
@@ -255,11 +383,7 @@ impl CorrespondenceMappingAlgorithm {
 
             // Check bounds in the ACGrid.
             if grid_x >= ac_grid.get_grid_width() || grid_y >= ac_grid.get_grid_height() {
-                println!(
-                    "grid_x {} grid_y {} out of range: {} {}",
-                    grid_x, grid_y,
-                    ac_grid.get_grid_width(), ac_grid.get_grid_height()
-                );
+                debug_assert!(false, "grid coordinate {grid_x},{grid_y} out of range");
                 continue;
             }
 
@@ -314,55 +438,13 @@ impl CorrespondenceMappingAlgorithm {
     /// # Returns
     /// A tuple `(best_score, best_cm)`, where `best_cm` is the transform
     /// (among the few tested) with the lowest score.
+    ///
+    /// All five candidates share one circular neighbourhood and differ only by a
+    /// constant offset into `photo2`, so the scorer resolves that neighbourhood once
+    /// and evaluates the five offsets over it — see
+    /// [`CorrespondenceScoring::optimize_translation`].
     pub fn optimize_position(&self, cm: &AffineTransform) -> (f32, AffineTransform) {
-        let mut best_cm = cm;
-        let score0 = self.scorer.calculate_similarity_score(cm);
-        let mut best_score = score0;
-
-        // Try shifting translate_x by ±1 and see if score is better.
-        let test_cmx1 = AffineTransform {
-            translate_x: cm.translate_x - 1.0,
-            ..*cm
-        };
-        let score_x1 = self.scorer.calculate_similarity_score(&test_cmx1);
-
-        let test_cmx2 = AffineTransform {
-            translate_x: cm.translate_x + 1.0,
-            ..*cm
-        };
-        let score_x2 = self.scorer.calculate_similarity_score(&test_cmx2);
-
-        // Compare x-shifted results.
-        if score_x1 < best_score && score_x1 < score_x2 {
-            best_cm = &test_cmx1;
-            best_score = score_x1;
-        } else if score_x2 < best_score {
-            best_cm = &test_cmx2;
-            best_score = score_x2;
-        }
-        // Evaluate shifting translate_y by ±1 on the chosen "best" so far.
-        let test_cmy1 = AffineTransform {
-            translate_y: best_cm.translate_y - 1.0,
-            ..*best_cm
-        };
-        let score_y1 = self.scorer.calculate_similarity_score(&test_cmy1);
-
-        let test_cmy2 = AffineTransform {
-            translate_y: best_cm.translate_y + 1.0,
-            ..*best_cm
-        };
-        let score_y2 = self.scorer.calculate_similarity_score(&test_cmy2);
-
-        // Compare y-shifted results.
-        if score_y1 < best_score && score_y1 < score_y2 {
-            best_cm = &test_cmy1;
-            best_score = score_y1;
-        } else if score_y2 < best_score {
-            best_cm = &test_cmy2;
-            best_score = score_y2;
-        }
-
-        (best_score, *best_cm)
+        self.scorer.optimize_translation(cm)
     }
 
     /// Checks if a given [AffineTransform] has valid translation coordinates (within image bounds).
