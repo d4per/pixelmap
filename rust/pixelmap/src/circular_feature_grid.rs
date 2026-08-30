@@ -66,11 +66,15 @@ impl CircularFeatureGrid {
 
     /// Fills in the `feature_descriptors` for every position in the grid.
     ///
-    /// Pixels at least `radius` from every edge cannot wrap, so they are handled by a
-    /// branch- and division-free inner loop; only the border ring pays for the
-    /// toroidal modulo. On a 400x225 image with radius 10 that fast path covers about
-    /// 87% of the descriptors, and the two `%` it avoids were 64-bit divisions in the
-    /// innermost loop.
+    /// Along the interior of a row the disc is *slid* rather than re-walked: consecutive
+    /// centres overlap in all but one column per disc row, so [`AbsSums`] can update the
+    /// sums by subtracting the pixel leaving each of the `2r+1` rows and adding the one
+    /// entering it. That is 2*(2r+1) pixel loads per descriptor instead of the whole
+    /// disc — 42 instead of 317 at radius 10 — and, being integer arithmetic, gives
+    /// bit-identical sums.
+    ///
+    /// Only the border ring, where the disc wraps toroidally and the overlap argument
+    /// does not hold, still walks the full disc.
     fn populate_feature_descriptors(
         data: &[u8],
         width: usize,
@@ -80,50 +84,45 @@ impl CircularFeatureGrid {
         out: &mut [CircularFeatureDescriptor],
     ) {
         let (w, h) = (width as isize, height as isize);
+        let interior_x = radius < w - radius;
         for y in 0..h {
-            let interior_row = y >= radius && y < h - radius;
-            for x in 0..w {
-                let interior = interior_row && x >= radius && x < w - radius;
-                let sums = if interior {
-                    Self::disc_sums_interior(data, w, x, y, radius, row_half_width)
-                } else {
-                    Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width)
-                };
+            let interior_row = y >= radius && y < h - radius && interior_x;
+            if !interior_row {
+                for x in 0..w {
+                    let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
+                    out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
+                }
+                continue;
+            }
+            for x in 0..radius {
+                let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
+                out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
+            }
+            // Seed the running sums at the first interior centre of this row.
+            let mut acc = AbsSums::default();
+            for (i, &half) in row_half_width.iter().enumerate() {
+                let py = y + i as isize - radius;
+                for px in (radius - half)..=(radius + half) {
+                    acc.add(px, py, data, w);
+                }
+            }
+            for x in radius..(w - radius) {
+                if x > radius {
+                    // Slide one column right: one pixel out and one in per disc row.
+                    for (i, &half) in row_half_width.iter().enumerate() {
+                        let py = y + i as isize - radius;
+                        acc.sub(x - 1 - half, py, data, w);
+                        acc.add(x + half, py, data, w);
+                    }
+                }
+                out[(x + y * w) as usize] =
+                    Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
+            }
+            for x in (w - radius)..w {
+                let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
                 out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
             }
         }
-    }
-
-    /// Accumulates the disc sums for a centre that cannot touch an image edge.
-    #[inline]
-    fn disc_sums_interior(
-        data: &[u8],
-        w: isize,
-        center_x: isize,
-        center_y: isize,
-        radius: isize,
-        row_half_width: &[isize],
-    ) -> DiscSums {
-        let mut s = DiscSums::default();
-        for dy in -radius..=radius {
-            let half = row_half_width[(dy + radius) as usize];
-            // Start of this row's span; every pixel of it is in bounds.
-            let row_base = (((center_y + dy) * w + center_x - half) * 4) as usize;
-            for (i, dx) in (-half..=half).enumerate() {
-                let p = row_base + i * 4;
-                // SAFETY: the centre is at least `radius` from every edge and
-                // `half <= radius`, so `p + 2` is inside `data`.
-                let (r, g, b) = unsafe {
-                    (
-                        *data.get_unchecked(p) as isize,
-                        *data.get_unchecked(p + 1) as isize,
-                        *data.get_unchecked(p + 2) as isize,
-                    )
-                };
-                s.add(dx, dy, r, g, b);
-            }
-        }
-        s
     }
 
     /// Accumulates the disc sums for a centre near an edge, wrapping toroidally.
@@ -162,59 +161,43 @@ impl CircularFeatureGrid {
 
         let (sum_red, sum_green, sum_blue) = (s.sum_red, s.sum_green, s.sum_blue);
 
-        // Compute the "center of mass" for each color, i.e., X and Y offsets.
-        let red_cm_x = if sum_red == 0 { 0.0 } else { s.wx_red as f32 / sum_red as f32 };
-        let red_cm_y = if sum_red == 0 { 0.0 } else { s.wy_red as f32 / sum_red as f32 };
-        let red_angle = if sum_red == 0 { 0.0 } else { red_cm_y.atan2(red_cm_x) };
-        let red_radius = (red_cm_y * red_cm_y + red_cm_x * red_cm_x).sqrt();
+        let inv = |n: isize| if n == 0 { 0.0 } else { 1.0 / n as f32 };
+        let (ir, ig, ib) = (inv(sum_red), inv(sum_green), inv(sum_blue));
+        let red_cm_x = s.wx_red as f32 * ir;
+        let red_cm_y = s.wy_red as f32 * ir;
+        let green_cm_x = s.wx_green as f32 * ig;
+        let green_cm_y = s.wy_green as f32 * ig;
+        let blue_cm_x = s.wx_blue as f32 * ib;
+        let blue_cm_y = s.wy_blue as f32 * ib;
 
-        let green_cm_x = if sum_green == 0 { 0.0 } else { s.wx_green as f32 / sum_green as f32 };
-        let green_cm_y = if sum_green == 0 { 0.0 } else { s.wy_green as f32 / sum_green as f32 };
-        let green_angle = if sum_green == 0 { 0.0 } else { green_cm_y.atan2(green_cm_x) };
-        let green_radius = (green_cm_y * green_cm_y + green_cm_x * green_cm_x).sqrt();
-
-        let blue_cm_x = if sum_blue == 0 { 0.0 } else { s.wx_blue as f32 / sum_blue as f32 };
-        let blue_cm_y = if sum_blue == 0 { 0.0 } else { s.wy_blue as f32 / sum_blue as f32 };
-        let blue_angle = if sum_blue == 0 { 0.0 } else { blue_cm_y.atan2(blue_cm_x) };
-        let blue_radius = (blue_cm_y * blue_cm_y + blue_cm_x * blue_cm_x).sqrt();
-
-        // Compute the total color sum across R/G/B.
         let sum_all = sum_red + sum_green + sum_blue;
-        let total_cm_x = if sum_all == 0 { 0.0 } else {
-            (s.wx_red + s.wx_green + s.wx_blue) as f32 / sum_all as f32
+        let ia = inv(sum_all);
+        let total_cm_x = (s.wx_red + s.wx_green + s.wx_blue) as f32 * ia;
+        let total_cm_y = (s.wy_red + s.wy_green + s.wy_blue) as f32 * ia;
+        let total_radius = (total_cm_x * total_cm_x + total_cm_y * total_cm_y).sqrt();
+
+        descriptor.total_angle = if sum_all == 0 { 0.0 } else { total_cm_y.atan2(total_cm_x) };
+
+        // Rotating a channel's centre of mass by -total_angle needs no trigonometry:
+        // cos(total_angle) and sin(total_angle) are total_cm_x/total_radius and
+        // total_cm_y/total_radius by construction, so the rotation is one dot and one
+        // cross product scaled by 1/total_radius. That replaces three `atan2`, three
+        // `sin`, three `cos` and three `sqrt` per pixel with a single `sqrt`.
+        let (c, sn) = if total_radius == 0.0 {
+            (1.0, 0.0)
+        } else {
+            (total_cm_x / total_radius, total_cm_y / total_radius)
         };
-        let total_cm_y = if sum_all == 0 { 0.0 } else {
-            (s.wy_red + s.wy_green + s.wy_blue) as f32 / sum_all as f32
-        };
-        let total_angle = if sum_all == 0 { 0.0 } else { total_cm_y.atan2(total_cm_x) };
+        let rot = |x: f32, y: f32| (x * c + y * sn, y * c - x * sn);
+        let (arx, ary) = rot(red_cm_x, red_cm_y);
+        let (agx, agy) = rot(green_cm_x, green_cm_y);
+        let (abx, aby) = rot(blue_cm_x, blue_cm_y);
 
-        // Store the combined total center-of-mass and radius.
-        descriptor.total_angle = total_angle;
-        descriptor.total_radius = (total_cm_x * total_cm_x + total_cm_y * total_cm_y).sqrt();
-
-        // Rotate each color channel so that the total color angle is the new "zero" angle.
-        // This gives "fixed" coordinates, aligning each channel relative to the total angle.
-        descriptor.aligned_red_x = (red_angle - total_angle).cos() * red_radius;
-        descriptor.aligned_red_y = (red_angle - total_angle).sin() * red_radius;
-        descriptor.aligned_green_x = (green_angle - total_angle).cos() * green_radius;
-        descriptor.aligned_green_y = (green_angle - total_angle).sin() * green_radius;
-        descriptor.aligned_blue_x = (blue_angle - total_angle).cos() * blue_radius;
-        descriptor.aligned_blue_y = (blue_angle - total_angle).sin() * blue_radius;
-
-        // Fill in descriptor metadata.
         descriptor.center_x = center_x as u16;
         descriptor.center_y = center_y as u16;
-        descriptor.sum_red = sum_red as i32;
-        descriptor.sum_green = sum_green as i32;
-        descriptor.sum_blue = sum_blue as i32;
 
-        // Store a quantized version of the fixed coordinates as the feature vector.
-        descriptor.feature_vector[0] = f32::round(descriptor.aligned_red_x * 100.0) as i64;
-        descriptor.feature_vector[1] = f32::round(descriptor.aligned_red_y * 100.0) as i64;
-        descriptor.feature_vector[2] = f32::round(descriptor.aligned_green_x * 100.0) as i64;
-        descriptor.feature_vector[3] = f32::round(descriptor.aligned_green_y * 100.0) as i64;
-        descriptor.feature_vector[4] = f32::round(descriptor.aligned_blue_x * 100.0) as i64;
-        descriptor.feature_vector[5] = f32::round(descriptor.aligned_blue_y * 100.0) as i64;
+        let q = |v: f32| f32::round(v * 100.0) as i16;
+        descriptor.feature_vector = [q(arx), q(ary), q(agx), q(agy), q(abx), q(aby)];
 
         descriptor
     }
@@ -246,5 +229,82 @@ impl DiscSums {
         self.wy_green += dy * g;
         self.wx_blue += dx * b;
         self.wy_blue += dy * b;
+    }
+}
+
+/// The same sums as [`DiscSums`], but with the position moments kept in absolute image
+/// coordinates so that they survive a shift of the disc.
+///
+/// `DiscSums` weights each pixel by its offset *from the centre*, which changes for every
+/// retained pixel when the disc moves, so those moments cannot be updated incrementally.
+/// The absolute moments `A = sum(px*v)` and `B = sum(py*v)` can be, and the relative ones
+/// come back exactly as `Wx = A - x*S` and `Wy = B - y*S`.
+#[derive(Default, Clone, Copy)]
+struct AbsSums {
+    s: [i64; 3],
+    ax: [i64; 3],
+    ay: [i64; 3],
+}
+
+impl AbsSums {
+    #[inline(always)]
+    fn rgb(data: &[u8], px: isize, py: isize, w: isize) -> (i64, i64, i64) {
+        let p = ((py * w + px) * 4) as usize;
+        // SAFETY: only reached for centres at least `radius` from every edge, and
+        // `half <= radius`, so `px` is in `0..w` and `py` in `0..h`.
+        unsafe {
+            (
+                *data.get_unchecked(p) as i64,
+                *data.get_unchecked(p + 1) as i64,
+                *data.get_unchecked(p + 2) as i64,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, px: isize, py: isize, data: &[u8], w: isize) {
+        let (r, g, b) = Self::rgb(data, px, py, w);
+        let (pxi, pyi) = (px as i64, py as i64);
+        for (c, v) in [r, g, b].into_iter().enumerate() {
+            self.s[c] += v;
+            self.ax[c] += pxi * v;
+            self.ay[c] += pyi * v;
+        }
+    }
+
+    #[inline(always)]
+    fn sub(&mut self, px: isize, py: isize, data: &[u8], w: isize) {
+        let (r, g, b) = Self::rgb(data, px, py, w);
+        let (pxi, pyi) = (px as i64, py as i64);
+        for (c, v) in [r, g, b].into_iter().enumerate() {
+            self.s[c] -= v;
+            self.ax[c] -= pxi * v;
+            self.ay[c] -= pyi * v;
+        }
+    }
+
+    #[inline(always)]
+    fn to_disc_sums(&self, x: isize, y: isize) -> DiscSums {
+        let (xi, yi) = (x as i64, y as i64);
+        let rel = |c: usize| {
+            (
+                (self.ax[c] - xi * self.s[c]) as isize,
+                (self.ay[c] - yi * self.s[c]) as isize,
+            )
+        };
+        let (wx_red, wy_red) = rel(0);
+        let (wx_green, wy_green) = rel(1);
+        let (wx_blue, wy_blue) = rel(2);
+        DiscSums {
+            sum_red: self.s[0] as isize,
+            sum_green: self.s[1] as isize,
+            sum_blue: self.s[2] as isize,
+            wx_red,
+            wy_red,
+            wx_green,
+            wy_green,
+            wx_blue,
+            wy_blue,
+        }
     }
 }

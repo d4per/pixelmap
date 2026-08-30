@@ -93,7 +93,7 @@ fn rss_bytes() -> i64 {
 fn key_distance_sq(a: &CircularFeatureDescriptor, b: &CircularFeatureDescriptor) -> i64 {
     (0..6)
         .map(|k| {
-            let d = a.feature_vector[k] - b.feature_vector[k];
+            let d = a.feature_vector[k] as i64 - b.feature_vector[k] as i64;
             d * d
         })
         .sum()
@@ -275,7 +275,7 @@ pub fn run(photo1: &Photo, photo2: &Photo, width: usize) -> Vec<BackendReport> {
 /// for a kd-tree, whose median splits handle duplicates without getting stuck.
 pub fn print_key_space_stats(infos: &[CircularFeatureDescriptor], label: &str) {
     use std::collections::HashMap;
-    let mut counts: HashMap<[i64; 6], usize> = HashMap::new();
+    let mut counts: HashMap<[i16; 6], usize> = HashMap::new();
     for d in infos {
         *counts.entry(d.feature_vector).or_insert(0) += 1;
     }

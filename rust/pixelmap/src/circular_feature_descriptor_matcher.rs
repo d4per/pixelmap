@@ -1,31 +1,35 @@
 use crate::circular_feature_descriptor::CircularFeatureDescriptor;
 use crate::circular_feature_grid::CircularFeatureGrid;
 use kd_tree::{KdPoint, KdTree};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 /// Retained so that [`MatcherBackend::KdTreeLegacy`] can index the descriptor directly,
 /// exactly as the original implementation did. Every other backend uses [`FeaturePoint`].
+///
+/// The keys are `i16` in the descriptor; widening them to `i64` here keeps this backend
+/// bit-for-bit the baseline it was, whatever the storage type underneath.
 impl KdPoint for CircularFeatureDescriptor {
     type Scalar = i64;
     type Dim = typenum::U6;
     fn at(&self, k: usize) -> i64 {
-        self.feature_vector[k]
+        self.feature_vector[k] as i64
     }
 }
 
 /// The 6-D search key of a descriptor, packed next to the index of the descriptor
 /// it came from.
 ///
-/// The kd-tree only ever needs the six quantized coordinates plus a way back to the
-/// descriptor's centre and angle, so indexing this (28 bytes) instead of the whole
-/// [`CircularFeatureDescriptor`] (96 bytes) cuts both the tree's footprint and the
-/// bytes the build's median partition has to move by about 3.4x. At a working width of
-/// 1600 that is the difference between moving ~138 MB and ~40 MB. It is worth roughly
-/// 1.4x on its own, before any parallelism — which matters most on wasm, where there
-/// is no parallelism to fall back on.
+/// This was introduced when [`CircularFeatureDescriptor`] was 96 bytes and carried a
+/// pile of intermediate values the tree never looked at: indexing 28 bytes instead cut
+/// the bytes the build's median partition has to move by about 3.4x, worth roughly 1.4x
+/// on its own. The descriptor has since been trimmed to 20 bytes — everything the
+/// matcher reads and nothing else — so `FeaturePoint` is now the *larger* of the two and
+/// no longer pays for itself on size. What it still provides is the `i32` scalar the
+/// tree needs (the keys themselves are `i16`, whose squared distance would overflow),
+/// and a second point type for `matcher_bench` to measure the backends against.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FeaturePoint {
     key: [i32; 6],
@@ -75,7 +79,7 @@ impl FeaturePoint {
         let worst = infos
             .iter()
             .flat_map(|d| d.feature_vector.iter())
-            .fold(0i64, |acc, v| acc.max(v.abs()));
+            .fold(0i64, |acc, &v| acc.max((v as i64).abs()));
         assert!(
             worst <= KEY_LIMIT,
             "feature vector magnitude {worst} exceeds the i32 squared-distance budget of {KEY_LIMIT}"
@@ -93,7 +97,7 @@ impl FeaturePoint {
 /// baseline the others are measured against; see `crate::matcher_bench`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MatcherBackend {
-    /// Exact, serial, indexing the full 96-byte descriptor with `i64` keys.
+    /// Exact, serial, indexing the descriptor itself with `i64` keys.
     KdTreeLegacy,
     /// Indexes the compact [`FeaturePoint`], querying every `stride`-th descriptor of
     /// image 2. `parallel` is ignored unless the `parallel` feature is enabled, so a
@@ -101,10 +105,46 @@ pub(crate) enum MatcherBackend {
     KdTree { stride: usize, parallel: bool },
 }
 
+/// A clock that only runs under the `bench` feature.
+///
+/// `Instant::now()` compiles for `wasm32-unknown-unknown` and then *panics* — std maps
+/// that target's time module to `unsupported/time.rs`, whose body is
+/// `panic!("time not implemented on this platform")`. Timing the match on the main path
+/// therefore took the whole pipeline down in a browser. The measurements only ever feed
+/// `matcher_bench`, so outside that they are compiled away to nothing.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy)]
+struct Stopwatch(std::time::Instant);
+
+#[cfg(feature = "bench")]
+impl Stopwatch {
+    fn start() -> Self {
+        Stopwatch(std::time::Instant::now())
+    }
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
+#[cfg(not(feature = "bench"))]
+#[derive(Clone, Copy)]
+struct Stopwatch;
+
+#[cfg(not(feature = "bench"))]
+impl Stopwatch {
+    fn start() -> Self {
+        Stopwatch
+    }
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
 /// How long a backend spent building its index versus querying it.
 ///
 /// The index is built once per `match_areas` call and thrown away, so build time is
-/// fully on the critical path and has to be reported alongside query time.
+/// fully on the critical path and has to be reported alongside query time. Zero unless
+/// the `bench` feature is on; see [`Stopwatch`].
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MatchTiming {
     pub build: Duration,
@@ -193,11 +233,11 @@ impl CircularFeatureDescriptorMatcher {
         img1: &CircularFeatureGrid,
         img2: &CircularFeatureGrid,
     ) -> (Vec<FeatureMatch>, MatchTiming) {
-        let t0 = Instant::now();
+        let t0 = Stopwatch::start();
         let kdtree = KdTree::build(img1.get_infos().clone());
         let build = t0.elapsed();
 
-        let t1 = Instant::now();
+        let t1 = Stopwatch::start();
         let infos2 = img2.get_infos();
         let mut ans: Vec<FeatureMatch> = Vec::with_capacity(infos2.len());
         for cai2 in infos2 {
@@ -217,7 +257,7 @@ impl CircularFeatureDescriptorMatcher {
         let (infos1, infos2) = (img1.get_infos(), img2.get_infos());
         let parallel = parallel && parallelism_available();
 
-        let t0 = Instant::now();
+        let t0 = Stopwatch::start();
         let points = FeaturePoint::build_all(infos1);
         let kdtree = if parallel { par_build(points) } else { KdTree::build(points) };
         let build = t0.elapsed();
@@ -231,7 +271,7 @@ impl CircularFeatureDescriptorMatcher {
                 .map(|found| FeatureMatch::new(&infos1[found.item.idx as usize], cai2))
         };
 
-        let t1 = Instant::now();
+        let t1 = Stopwatch::start();
         let ans = if parallel {
             par_query(infos2.len(), stride, &query_at)
         } else {
