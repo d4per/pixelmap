@@ -1,3 +1,5 @@
+//! The pipeline driver behind [`crate::Correspondence`].
+
 use crate::ac_grid::ACGrid;
 use crate::circular_feature_descriptor_matcher::CircularFeatureDescriptorMatcher;
 use crate::circular_feature_grid;
@@ -5,21 +7,28 @@ use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+
+/// The seed [`PixelMapProcessor::new`] uses when the caller does not pick one.
+///
+/// A fixed value rather than OS entropy: a library that returns a different answer each
+/// time it is called is hard to test against and hard to build on, so reproducibility is
+/// the default and [`PixelMapProcessor::with_seed`] is the way to vary it.
+pub const DEFAULT_SEED: u64 = 0x5049_5845_4C4D_4150; // "PIXELMAP"
 
 /// Manages a pipeline for finding and refining a mapping between two images (`photo1` and `photo2`).
 ///
 /// The process typically involves:
 /// 1. **Circular feature extraction and matching** on scaled versions of the photos.
-/// 2. Initializing a [CorrespondenceMappingAlgorithm] with matched points.
+/// 2. Initializing a `CorrespondenceMappingAlgorithm` with matched points.
 /// 3. Iterative refinement steps that remove outliers, smooth the mappings, and further optimize.
 /// 4. Producing final [DensePhotoMap]s describing forward (`photo1` → `photo2`) and backward (`photo2` → `photo1`) transformations.
 pub struct PixelMapProcessor {
     /// The first image to be matched/registered.
-    photo1: Rc<Photo>,
+    photo1: Arc<Photo>,
 
     /// The second image to be matched/registered.
-    photo2: Rc<Photo>,
+    photo2: Arc<Photo>,
 
     /// An algorithm that manages local transformations and outlier filtering
     /// from `photo1` to `photo2`.
@@ -35,13 +44,21 @@ pub struct PixelMapProcessor {
     /// The initial width used for scaling the photos, if needed, during setup.
     initial_photo_width: usize,
 
+    /// Base seed for the two solvers' queue shuffling. See [`PixelMapProcessor::with_seed`].
+    seed: u64,
+
+    /// Counts the solvers built by *this* processor, so each gets a distinct RNG stream
+    /// without reaching for process-global state. Purely local, so the mapping depends
+    /// only on the inputs and `seed` — not on what the rest of the process has done.
+    algorithms_built: u64,
+
     /// Scaled copies of `photo1`/`photo2`, keyed by `(photo index, target width)`.
     ///
     /// Every `iterate()` builds two managers and each used to rescale both originals
     /// from full resolution, even though the schedule only ever asks for three distinct
     /// widths and the two managers of one iteration need the very same pair of images
     /// with their roles swapped. At `high` that was 52 resamples of a 4096x2304 source.
-    scaled: HashMap<(usize, usize), Rc<Photo>>,
+    scaled: HashMap<(usize, usize), Arc<Photo>>,
 }
 
 impl PixelMapProcessor {
@@ -60,40 +77,67 @@ impl PixelMapProcessor {
     ///
     /// # Returns
     /// A new `PixelMapProcessor` ready to be initialized.
-    pub fn new(photo1: Rc<Photo>, photo2: Rc<Photo>, photo_width: usize) -> Self {
+    pub fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, photo_width: usize) -> Self {
+        Self::with_seed(photo1, photo2, photo_width, DEFAULT_SEED)
+    }
+
+    /// Same as [`Self::new`], but pins the seed that drives the solvers' queue shuffling.
+    ///
+    /// The order in which the queue is drained decides which local optimum the relaxation
+    /// settles into, so the seed is what makes a run reproducible: the same photos, the
+    /// same schedule and the same seed give the same mapping. [`Self::new`] uses
+    /// [`DEFAULT_SEED`], so reproducibility is the default rather than something the
+    /// caller has to opt into.
+    pub fn with_seed(
+        photo1: Arc<Photo>,
+        photo2: Arc<Photo>,
+        photo_width: usize,
+        seed: u64,
+    ) -> Self {
         // Temporary dummy Photo, used only so that CorrespondenceMappingAlgorithm can be constructed.
         let dummy_photo = Photo::default();
 
-        let result = PixelMapProcessor {
+        PixelMapProcessor {
             photo1,
             photo2,
-            ocm_manager1: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5),
-            ocm_manager2: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5),
+            ocm_manager1: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5, seed),
+            ocm_manager2: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5, seed),
             total_comparisons: 0,
             initial_photo_width: photo_width,
+            seed,
+            algorithms_built: 0,
             scaled: HashMap::new(),
-        };
+        }
+    }
 
-        result
+    /// Hands out the next solver seed for this processor.
+    ///
+    /// Mixing a local counter in keeps the forward and backward passes on separate
+    /// streams (they would otherwise shuffle identically) while staying a pure function
+    /// of `seed` and the number of solvers built so far.
+    fn next_seed(&mut self) -> u64 {
+        let n = self.algorithms_built;
+        self.algorithms_built += 1;
+        self.seed ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
     /// Returns `photo1` (`which == 0`) or `photo2` (`which == 1`) scaled to `width`,
     /// computing it at most once per `(photo, width)` pair.
-    fn scaled(&mut self, which: usize, width: usize) -> Rc<Photo> {
+    fn scaled(&mut self, which: usize, width: usize) -> Arc<Photo> {
         if let Some(p) = self.scaled.get(&(which, width)) {
             return p.clone();
         }
         let src = if which == 0 { &self.photo1 } else { &self.photo2 };
-        let p = Rc::new(src.get_scaled_proportional(width));
+        let p = Arc::new(src.get_scaled_proportional(width));
         self.scaled.insert((which, width), p.clone());
         p
     }
 
     /// Performs the initial matching step:
     /// 1. Scales both `photo1` and `photo2` to `initial_photo_width` (if needed).
-    /// 2. Uses [circular_feature_grid::CircularFeatureGrid] to extract circular feature descriptors.
-    /// 3. Matches these descriptors with [CircularFeatureDescriptorMatcher].
-    /// 4. Initializes new [CorrespondenceMappingAlgorithm] instances with the matched points.
+    /// 2. Uses `CircularFeatureGrid` to extract circular feature descriptors.
+    /// 3. Matches these descriptors with `CircularFeatureDescriptorMatcher`.
+    /// 4. Initializes new `CorrespondenceMappingAlgorithm` instances with the matched points.
     /// 5. Runs both correspondence managers until completion.
     ///
     /// Upon completion, `total_comparisons` is updated with the sum of both managers' comparisons.
@@ -124,8 +168,9 @@ impl PixelMapProcessor {
         // Create new managers for the scaled images.
         let w = photo1scaled.width;
         let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
-        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5);
-        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, 5);
+        let (seed1, seed2) = (self.next_seed(), self.next_seed());
+        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5, seed1);
+        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, 5, seed2);
 
         // Add the initial matched points.
         for m in pairs {
@@ -141,7 +186,6 @@ impl PixelMapProcessor {
                 m.x2 as f32, m.y2 as f32, m.x1 as f32, m.y1 as f32, -vv,
             );
         }
-        println!("init points added");
 
         // Run both managers to completion.
         ocm_manager1.run_until_done();
@@ -158,7 +202,7 @@ impl PixelMapProcessor {
         self.total_comparisons
     }
 
-    /// Retrieves a pair of [ACGrid]s from the two correspondence managers
+    /// Retrieves a pair of `ACGrid`s from the two correspondence managers
     /// (forward and backward mappings).
     ///
     /// # Returns
@@ -191,7 +235,6 @@ impl PixelMapProcessor {
         smooth_iterations: usize,
         clean_max_dist: f32
     ) {
-        println!("{photo_width}");
         let mut pm1 = self.ocm_manager1.get_photo_mapping();
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
@@ -206,10 +249,11 @@ impl PixelMapProcessor {
 
         // Re-initialize managers with the smoothed maps.
         let (s1, s2) = (self.scaled(0, photo_width), self.scaled(1, photo_width));
+        let (seed1, seed2) = (self.next_seed(), self.next_seed());
         let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(
-                s1.clone(), s2.clone(), grid_cell_size, neighborhood_radius);
+                s1.clone(), s2.clone(), grid_cell_size, neighborhood_radius, seed1);
         let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(
-                s2, s1, grid_cell_size, neighborhood_radius);
+                s2, s1, grid_cell_size, neighborhood_radius, seed2);
         ocm_manager1.init_from_photomapping(&pm1_smooth);
         ocm_manager2.init_from_photomapping(&pm2_smooth);
 
@@ -237,8 +281,6 @@ impl PixelMapProcessor {
     /// A tuple of two [DensePhotoMap]s:
     /// - First: from `photo1` to `photo2`.
     /// - Second: from `photo2` to `photo1`.
-    ///
-    /// Additionally, prints the total number of comparisons made in the process.
     pub fn get_result(&mut self, clean_max_dist: f32) -> (DensePhotoMap, DensePhotoMap) {
         let mut pm1 = self.ocm_manager1.get_photo_mapping();
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
@@ -246,8 +288,6 @@ impl PixelMapProcessor {
         // Remove outliers in both directions.
         pm1.remove_outliers(&pm2, clean_max_dist);
         pm2.remove_outliers(&pm1, clean_max_dist);
-
-        println!("tot comparisons : {}", self.total_comparisons);
 
         (pm1, pm2)
     }

@@ -16,14 +16,14 @@ impl Frame {
     /// Converts a [`Photo`] (RGBA bytes) into a frame, dropping the alpha channel.
     pub fn from_photo(photo: &Photo) -> Frame {
         let pixels = photo
-            .img_data
-            .chunks_exact(4)
+            .as_rgba()
+            .as_chunks::<4>().0.iter()
             .map(|px| (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32)
             .collect();
 
         Frame {
-            width: photo.width,
-            height: photo.height,
+            width: photo.width(),
+            height: photo.height(),
             pixels,
         }
     }

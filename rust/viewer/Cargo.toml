@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pixelmap = { path = "../pixelmap", version = "0.1.0" }
+pixelmap = { path = "../pixelmap", version = "0.1.0", features = ["image"] }
 clap = { version = "4.5.27", features = ["derive"] }
-image = "0.24.9"
+# Only the codecs this tool actually reads and writes: the default feature set pulls in
+# every format image supports, including an AVIF encoder with a heavy C-adjacent tree.
+image = { version = ">=0.25, <0.25.10", default-features = false, features = ["jpeg", "png"] }
 minifb = "0.28.0"
 
 [[bin]]

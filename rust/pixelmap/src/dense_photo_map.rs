@@ -1,5 +1,7 @@
+//! The dense correspondence grid produced by a run, and the operations over it.
+
 use crate::photo::Photo;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Represents a dense 2D mapping between two photos (`photo1` and `photo2`).
 ///
@@ -10,10 +12,10 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub struct DensePhotoMap {
     /// Reference-counted handle to the first photo.
-    pub photo1: Rc<Photo>,
+    pub photo1: Arc<Photo>,
 
     /// Reference-counted handle to the second photo.
-    pub photo2: Rc<Photo>,
+    pub photo2: Arc<Photo>,
 
     /// The number of columns in the mapping grid.
     pub grid_width: usize,
@@ -27,6 +29,17 @@ pub struct DensePhotoMap {
 
     /// The size (in pixels) each grid cell spans in `photo1`, computed during creation.
     grid_cell_size: usize,
+}
+
+impl std::fmt::Debug for DensePhotoMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DensePhotoMap")
+            .field("grid_width", &self.grid_width)
+            .field("grid_height", &self.grid_height)
+            .field("grid_cell_size", &self.grid_cell_size)
+            .field("coverage", &self.calculate_used_area())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DensePhotoMap {
@@ -43,8 +56,8 @@ impl DensePhotoMap {
     /// # Panics
     /// May panic if `grid_width < 2` due to the calculation `photo1.width / (grid_width - 1)`.
     pub fn new(
-        photo1: Rc<Photo>,
-        photo2: Rc<Photo>,
+        photo1: Arc<Photo>,
+        photo2: Arc<Photo>,
         grid_width: usize,
         grid_height: usize,
     ) -> Self {
@@ -71,24 +84,33 @@ impl DensePhotoMap {
     /// # Parameters
     /// - `x1`, `y1`: Grid coordinate in the map (0 <= x1 < grid_width, 0 <= y1 < grid_height).
     /// - `x2`, `y2`: The mapped coordinate values stored in `map_data`.
+    ///
+    /// Out-of-range coordinates are ignored rather than written to a wrapped-around cell.
     pub fn set_grid_coordinates(&mut self, x1: usize, y1: usize, x2: f32, y2: f32) {
+        if x1 >= self.grid_width || y1 >= self.grid_height {
+            return;
+        }
         let index = (y1 * self.grid_width + x1) * 2;
-        let slice = &mut self.map_data[index..index + 2];
-        slice[0] = x2;
-        slice[1] = y2;
+        self.map_data[index] = x2;
+        self.map_data[index + 1] = y2;
     }
 
     /// Retrieves the mapped coordinates `(x2, y2)` from this map at grid location `(x1, y1)`.
     ///
     /// Returns `(NaN, NaN)` if the index is out of range or if the cell was
     /// never set (i.e., still contains `NaN`).
+    ///
+    /// `x1` is bounds-checked against `grid_width` in its own right, not just through the
+    /// flat index: testing only the flat index lets `x1 == grid_width` address the first
+    /// cell of the *next row*. Because [`Self::get_interpolated_point`] reads the corner
+    /// at `x1 + 1`, that made every interpolation along the right edge silently blend
+    /// with the far side of the image.
     pub fn get_grid_coordinates(&self, x1: usize, y1: usize) -> (f32, f32) {
-        let index = (y1 * self.grid_width + x1) * 2;
-        if index >= self.map_data.len() {
-            (f32::NAN, f32::NAN)
-        } else {
-            (self.map_data[index], self.map_data[index + 1])
+        if x1 >= self.grid_width || y1 >= self.grid_height {
+            return (f32::NAN, f32::NAN);
         }
+        let index = (y1 * self.grid_width + x1) * 2;
+        (self.map_data[index], self.map_data[index + 1])
     }
 
     /// Maps a pixel `(x1, y1)` from `photo1` to the corresponding location in `photo2`.
@@ -153,6 +175,30 @@ impl DensePhotoMap {
         let yt = yy1 * (1.0 - yr) + yy2 * yr;
 
         (xt, yt)
+    }
+
+    /// Where the pixel at `(x, y)` in this map's source photo ends up in its target
+    /// photo, or `None` if the algorithm could not map that point.
+    ///
+    /// Both the argument and the result are in *working-resolution* pixels — see
+    /// [`crate::Correspondence::lookup`] for the same query in the coordinates of the
+    /// photos you passed in.
+    ///
+    /// This is [`Self::map_photo_pixel`] with the `NaN` sentinel turned into a `None`, so
+    /// that "no mapping here" cannot be mistaken for a coordinate.
+    pub fn lookup(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (mx, my) = self.map_photo_pixel(x, y);
+        if mx.is_nan() || my.is_nan() {
+            None
+        } else {
+            Some((mx, my))
+        }
+    }
+
+    /// The dimensions, in working-resolution pixels, that [`Self::lookup`] takes and
+    /// returns coordinates in.
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.photo1.width(), self.photo1.height())
     }
 
     /// Removes "outlier" mappings by checking consistency:
@@ -343,7 +389,7 @@ impl DensePhotoMap {
     /// # Returns
     ///
     /// A new `DensePhotoMap` instance.
-    pub fn deserialize(data: &[u8], photo1: Rc<Photo>, photo2: Rc<Photo>) -> Self {
+    pub fn deserialize(data: &[u8], photo1: Arc<Photo>, photo2: Arc<Photo>) -> Self {
         let mut offset = 0;
 
         let grid_width = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;

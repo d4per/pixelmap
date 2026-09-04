@@ -11,7 +11,7 @@
 ///   X = (dx * a11) + (dy * a12) + translate_x;
 ///   Y = (dx * a21) + (dy * a22) + translate_y;
 /// ```
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct AffineTransform {
     /// Integer reference x-coordinate (the "origin" in the input space).
     pub origin_x: u16,
@@ -53,8 +53,7 @@ impl AffineTransform {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # use pixelmap::affine_transform::AffineTransform;
+    /// ```text
     /// let t = AffineTransform {
     ///     origin_x: 0,
     ///     origin_y: 0,
@@ -96,7 +95,7 @@ impl AffineTransform {
     ///
     /// # Returns
     /// A tuple `(X, Y)`, which is the result of:
-    /// ```
+    /// ```text
     /// dx = x - origin_x;
     /// dy = y - origin_y;
     /// X = (dx * a11) + (dy * a12) + translate_x;
@@ -104,8 +103,7 @@ impl AffineTransform {
     /// ```
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::affine_transform::AffineTransform;
+    /// ```text
     /// let t = AffineTransform {
     ///     origin_x: 10,
     ///     origin_y: 10,
@@ -145,8 +143,7 @@ impl AffineTransform {
     /// - The same `a11`, `a12`, `a21`, `a22` values as the original.
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::affine_transform::AffineTransform;
+    /// ```text
     /// let t_old = AffineTransform {
     ///     origin_x: 0,
     ///     origin_y: 0,

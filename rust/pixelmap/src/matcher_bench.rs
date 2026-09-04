@@ -18,6 +18,10 @@
 //!
 //! Compiled only under the `bench` feature.
 
+// A dev harness, not API: it documents itself in terms of the private matcher it
+// exercises, and those links are useful to whoever is tuning it.
+#![allow(rustdoc::private_intra_doc_links)]
+
 use std::time::Duration;
 
 use crate::circular_feature_descriptor::CircularFeatureDescriptor;

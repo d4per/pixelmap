@@ -1,7 +1,7 @@
-use std::rc::Rc;
+use std::sync::Arc;
 use crate::photo::Photo;
 use crate::dense_photo_map::DensePhotoMap;
-use nalgebra::{DMatrix, DVector, SVD};
+use nalgebra::{DMatrix, SVD};
 
 /// A 3D model built from a 2D grid of correspondences. Each cell in the grid has a
 /// position in 3D space (`x, y, z`) plus texture coordinates (`u, v`) mapping it
@@ -14,7 +14,7 @@ pub struct Model3D {
     pub grid_height: usize,
 
     /// A reference-counted handle to the source `Photo` used for texturing.
-    pub photo: Rc<Photo>,
+    pub photo: Arc<Photo>,
 
     /// A flat storage of [`TexturePoint`]s, of length `grid_width * grid_height`,
     /// describing each cell's 3D location and texture coordinates.
@@ -103,7 +103,7 @@ impl Model3D {
         let grid_cell_size = photo_mapping.get_grid_cell_size();
 
         // Perform two passes of cleanup and SVD-based embedding.
-        for cleanup_iteration in 0..2 {
+        for _ in 0..2 {
             // Collect valid points (non-NaN) into a vector for SVD.
             let valid_points: Vec<_> = (0..photo_mapping.grid_height)
                 .flat_map(|y| {
@@ -126,11 +126,6 @@ impl Model3D {
                 })
                 .collect();
 
-            println!(
-                "valid points size: {} iteration {}",
-                valid_points.len(),
-                cleanup_iteration
-            );
 
             // Build a DMatrix from the valid points: each row is [X, Y, dataX, dataY].
             let mut matrix = DMatrix::from_fn(valid_points.len(), 4, |i, j| match j {
@@ -231,7 +226,7 @@ impl Model3D {
     /// - Texture coordinates and 3D positions are embedded in the X3D output.
     ///
     /// Replace `"[photo_placeholder]"` in the string with a real texture file URL if needed.
-    pub fn get_X3D(&self) -> String {
+    pub fn to_x3d(&self) -> String {
         let mut result = String::new();
         result.push_str(
             r#"<X3D width="1000px" height="1000px">

@@ -22,6 +22,7 @@ impl CircularFeatureGrid {
     /// - `width`, `height` define the grid size in pixels.
     /// - `circle_radius` sets how large each neighborhood is.
     /// - `rotation` indicates whether advanced rotation alignment is used.
+    ///
     /// Creates a new `CircularFeatureGrid`, optionally using rotation-based computations.
     ///
     /// - `photo` holds the pixel data.
@@ -284,7 +285,7 @@ impl AbsSums {
     }
 
     #[inline(always)]
-    fn to_disc_sums(&self, x: isize, y: isize) -> DiscSums {
+    fn to_disc_sums(self, x: isize, y: isize) -> DiscSums {
         let (xi, yi) = (x as i64, y as i64);
         let rel = |c: usize| {
             (

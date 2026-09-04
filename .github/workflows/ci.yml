@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The committed config sets `target-cpu=native`, which is right for local benchmarking
+  # and wrong for a CI runner that may differ from whatever executes the artifacts.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.90 is the crate's declared MSRV; it has to keep building.
+        rust: [stable, "1.90"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install viewer system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      # The serial fallback has to stay correct: it is what wasm builds use.
+      - run: cargo test -p pixelmap --no-default-features
+      - run: cargo test -p pixelmap --all-features
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install viewer system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p pixelmap --all-features --all-targets -- -D warnings
+      - run: cargo clippy -p pixelmap --no-default-features --all-targets -- -D warnings
+
+  wasm:
+    name: wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # No threads there, so the matcher's serial fallback is the only option.
+      - run: cargo build -p pixelmap --no-default-features --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: ""
+
+  docs:
+    name: docs + publish check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Document with warnings denied
+        run: cargo doc -p pixelmap --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: Verify the crate is publishable
+        run: cargo publish --dry-run -p pixelmap

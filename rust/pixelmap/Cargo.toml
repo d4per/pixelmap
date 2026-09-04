@@ -2,34 +2,52 @@
 name = "pixelmap"
 version = "0.1.0"
 edition = "2021"
+# Set by kd-tree's `ordered-float` dependency, not by this crate's own source.
+rust-version = "1.90"
+description = "Dense image correspondence by swarm-inspired iterative refinement of an affine correspondence grid (the PIXELMAP framework)"
+repository = "https://github.com/d4per/pixelmap"
+homepage = "https://pixelmap.dogduck.com"
+documentation = "https://docs.rs/pixelmap"
+readme = "README.md"
+license = "MIT"
+keywords = ["computer-vision", "correspondence", "optical-flow", "registration", "stereo"]
+categories = ["computer-vision", "algorithms", "multimedia::images"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-rand = "0.9.0-alpha.2"
 kd-tree = "0.6.0"
 typenum = "1.17.0"
-nalgebra = "0.30.0"
+# Only `model_3d` uses this (for the SVD), so it is optional: a caller who wants the
+# correspondence field should not pay for a linear-algebra dependency.
+nalgebra = { version = "0.33", optional = true }
 
 # Multi-threaded feature matching. Optional because wasm32-unknown-unknown has no
 # threads to hand out without SharedArrayBuffer and cross-origin isolation; build with
 # --no-default-features for wasm and the matcher falls back to a serial search.
 rayon = { version = "1.10", optional = true }
 
-# `rand::random` (the unseeded fallback in `base_seed`) reaches OS entropy through
-# getrandom, which refuses to build for wasm32-unknown-unknown unless it is told to use
-# the browser's crypto API. Depending on it directly, for wasm only, is the documented
-# way to turn that backend on; see .cargo/config.toml for the matching --cfg.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+# Conversions from the `image` crate's types, for callers that already decode with it.
+# Optional so the default build stays free of image codecs.
+# Upper-bounded: image 0.25.10 depends on a `zune-core` release that does not exist.
+image = { version = ">=0.25, <0.25.10", optional = true, default-features = false }
 
 [features]
 default = ["parallel"]
 parallel = ["dep:rayon", "kd-tree/rayon"]
+# 3D reconstruction from a finished mapping. Pulls in nalgebra.
+model-3d = ["dep:nalgebra"]
+# `From<image::RgbaImage>` and `From<image::DynamicImage>` for `Photo`.
+image = ["dep:image"]
 # Compiles `matcher_bench`, used to tune the match stride and to re-check the
 # search backends against each other.
 bench = []
 
+# Needs image decoding, so it is only built when the `image` feature is on.
+[[example]]
+name = "morph"
+required-features = ["image"]
+
 [lib]
 name = "pixelmap"
-
-[profile.release]
-codegen-units = 1

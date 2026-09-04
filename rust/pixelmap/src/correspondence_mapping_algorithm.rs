@@ -3,34 +3,8 @@ use crate::affine_transform::AffineTransform;
 use crate::correspondence_scoring::CorrespondenceScoring;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
-use rand::seq::SliceRandom;
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-
-/// Process-wide base seed for the queue shuffling.
-///
-/// The order in which the queue is drained decides which local optimum the
-/// relaxation settles into, so an unseeded run is not reproducible — the final
-/// mapping differs measurably between two runs of the same binary. Setting
-/// `PIXELMAP_SEED` pins it, which is what makes before/after comparisons of a
-/// change to the algorithm meaningful. Unset, the behaviour is as before: seeded
-/// from OS entropy.
-fn base_seed() -> u64 {
-    static BASE: OnceLock<u64> = OnceLock::new();
-    *BASE.get_or_init(|| {
-        std::env::var("PIXELMAP_SEED")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or_else(rand::random)
-    })
-}
-
-/// Distinguishes the RNGs of the managers created during one run, so the forward
-/// and backward passes do not share a stream.
-static INSTANCE: AtomicU64 = AtomicU64::new(0);
+use crate::rng::Rng;
+use std::sync::Arc;
 
 /// Edge length, in pixels, of the region the queue is grouped by between passes.
 ///
@@ -57,9 +31,9 @@ const QUEUE_TILE: usize = 10;
 ///    describing the best transforms found for each cell.
 pub struct CorrespondenceMappingAlgorithm {
     /// Reference-counted handle to the first (scaled) photo.
-    photo1: Rc<Photo>,
+    photo1: Arc<Photo>,
     /// Reference-counted handle to the second (scaled) photo.
-    photo2: Rc<Photo>,
+    photo2: Arc<Photo>,
     /// Size of each grid cell in pixels.
     grid_cell_size: usize,
     /// A queue of candidate [AffineTransform] objects to evaluate and refine.
@@ -68,8 +42,12 @@ pub struct CorrespondenceMappingAlgorithm {
     scorer: CorrespondenceScoring,
     /// A 2D grid that stores the best-known transform for each cell (and its score).
     ac_grid: ACGrid,
-    /// Shuffles the queue between passes. See [`base_seed`].
-    rng: SmallRng,
+    /// Shuffles the queue between passes.
+    ///
+    /// The order in which the queue is drained decides which local optimum the
+    /// relaxation settles into, so the stream has to be reproducible from the caller's
+    /// seed for two runs of the same input to agree.
+    rng: Rng,
     /// Reused buffer for the tile-ordering counting sort.
     sort_scratch: Vec<AffineTransform>,
     /// Reused bucket boundaries for the tile-ordering counting sort.
@@ -84,6 +62,8 @@ impl CorrespondenceMappingAlgorithm {
     /// - `photo1`, `photo2`: References to the original images.
     /// - `grid_cell_size`: Size of each cell in the grid (in pixels).
     /// - `neighborhood_radius`: Radius (in pixels) for the circular neighborhood scoring.
+    /// - `seed`: Seeds the queue shuffling. The same seed on the same input reproduces
+    ///   the same mapping.
     ///
     /// # Returns
     /// A new `CorrespondenceMappingAlgorithm` with scaled images, an empty queue, and
@@ -93,22 +73,24 @@ impl CorrespondenceMappingAlgorithm {
         photo1: &Photo,
         photo2: &Photo,
         grid_cell_size: usize,
-        neighborhood_radius: usize
+        neighborhood_radius: usize,
+        seed: u64,
     ) -> Self {
         // Scale the original photos to the specified width.
-        let photo1a = Rc::new(photo1.get_scaled_proportional(photo_width));
-        let photo2a = Rc::new(photo2.get_scaled_proportional(photo_width));
-        Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius)
+        let photo1a = Arc::new(photo1.get_scaled_proportional(photo_width));
+        let photo2a = Arc::new(photo2.get_scaled_proportional(photo_width));
+        Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius, seed)
     }
 
     /// Same as [`Self::new`], but takes photos that have already been scaled to the
     /// working width. Callers that build several algorithms over the same pair of
     /// images can then scale once instead of once per algorithm.
     pub fn with_scaled(
-        photo1a: Rc<Photo>,
-        photo2a: Rc<Photo>,
+        photo1a: Arc<Photo>,
+        photo2a: Arc<Photo>,
         grid_cell_size: usize,
         neighborhood_radius: usize,
+        seed: u64,
     ) -> Self {
         // Determine how many cells fit in the scaled images.
         let grid_width = photo1a.width / grid_cell_size + 1;
@@ -125,11 +107,7 @@ impl CorrespondenceMappingAlgorithm {
                 neighborhood_radius as isize
             ),
             ac_grid: ACGrid::new(grid_width, grid_height),
-            rng: SmallRng::seed_from_u64(
-                base_seed() ^ INSTANCE
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            ),
+            rng: Rng::seed_from_u64(seed),
             sort_scratch: Vec::new(),
             tile_offsets: Vec::new(),
         }
@@ -220,7 +198,7 @@ impl CorrespondenceMappingAlgorithm {
         for w in offsets.windows(2) {
             let (a, b) = (w[0] as usize, w[1] as usize);
             if b - a > 1 {
-                sorted[a..b].shuffle(&mut self.rng);
+                self.rng.shuffle(&mut sorted[a..b]);
             }
         }
 
@@ -328,26 +306,6 @@ impl CorrespondenceMappingAlgorithm {
         }
     }
 
-    /// Initializes the queue with the "identity" transform for each cell. This means
-    /// each `(x, y)` in `photo1` initially maps to the same `(x, y)` in `photo2`,
-    /// with no rotation or scaling.
-    pub fn init_identity(&mut self) {
-        for y in (0 .. self.photo1.height).step_by(self.grid_cell_size) {
-            for x in (0 .. self.photo1.width).step_by(self.grid_cell_size) {
-                let cm = AffineTransform {
-                    origin_x: x as u16,
-                    origin_y: y as u16,
-                    translate_x: x as f32,
-                    translate_y: y as f32,
-                    a11: 1.0,
-                    a12: 0.0,
-                    a21: 0.0,
-                    a22: 1.0,
-                };
-                self.queue.push(cm);
-            }
-        }
-    }
 
     /// Processes the current queue of transforms. For each transform:
     /// 1. Validates its scale and position (no out-of-bounds).
@@ -436,10 +394,6 @@ impl CorrespondenceMappingAlgorithm {
         self.queue.is_empty()
     }
 
-    /// Returns the current length of the queue (for debugging or monitoring).
-    pub fn queue_length(&self) -> usize {
-        self.queue.len()
-    }
 
     /// Performs a simple local search by checking a few neighboring translations
     /// (±1 pixel in x or y) to see if they improve the score.
@@ -484,8 +438,8 @@ impl CorrespondenceMappingAlgorithm {
                 // If the cell has a transform, set it in the DensePhotoMap.
                 grid.get_affine_transform().iter().for_each(|cmm| {
                     pm.set_grid_coordinates(
-                        (cmm.origin_x as usize / self.grid_cell_size),
-                        (cmm.origin_y as usize / self.grid_cell_size),
+                        cmm.origin_x as usize / self.grid_cell_size,
+                        cmm.origin_y as usize / self.grid_cell_size,
                         cmm.translate_x,
                         cmm.translate_y
                     );

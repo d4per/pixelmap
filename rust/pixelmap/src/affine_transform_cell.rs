@@ -26,8 +26,7 @@ impl AffineTransformCell {
     /// (`None`) and the `best_score` initialized to [`f32::MAX`].
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::affine_transform_cell::AffineTransformCell;
+    /// ```text
     /// let cell = AffineTransformCell::new_empty();
     /// assert_eq!(cell.get_affine_transform(), None);
     /// assert_eq!(cell.get_score(), f32::MAX);
@@ -48,9 +47,7 @@ impl AffineTransformCell {
     ///   or optimal this transform is (lower or higher depending on usage).
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::affine_transform::AffineTransform;
-    /// # use pixelmap::affine_transform_cell::AffineTransformCell;
+    /// ```text
     /// let cell = AffineTransformCell::new_empty();
     /// let transform = AffineTransform {
     ///     origin_x: 0,
@@ -76,7 +73,7 @@ impl AffineTransformCell {
     /// The floating-point “best score” stored in this cell.
     ///
     /// # Examples
-    /// ```
+    /// ```text
     /// use pixelmap::affine_transform_cell::AffineTransformCell;
     /// use pixelmap::affine_transform::AffineTransform;
     /// let cell = AffineTransformCell::new_empty();
@@ -93,7 +90,7 @@ impl AffineTransformCell {
     /// has been set, or `None` if this cell is still empty.
     ///
     /// # Examples
-    /// ```
+    /// ```text
     /// use pixelmap::affine_transform::AffineTransform;
     /// use pixelmap::affine_transform_cell::AffineTransformCell;
     /// let cell = AffineTransformCell::new_empty();

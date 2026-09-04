@@ -1,13 +1,11 @@
 use clap::Parser;
-use pixelmap::dense_photo_map::DensePhotoMap;
-use pixelmap::pixelmap_processor::PixelMapProcessor;
-use pixelmap::processing_mode::ProcessingMode;
-use std::rc::Rc;
+use pixelmap::{Correspondence, DensePhotoMap, ProcessingMode, DEFAULT_SEED};
+use std::sync::Arc;
 
 use std::fs::File;
 use std::io::Write;
-use image::{open, GenericImageView};
-use pixelmap::photo::Photo;
+use image::open;
+use pixelmap::Photo;
 
 /// Command line arguments structure.
 #[derive(Parser, Debug)]
@@ -56,13 +54,8 @@ fn main() {
     let args = Args::parse();
 
     // Load the two input photos (adjust these calls to match your actual I/O).
-    let photo1 = Rc::new(read_photo(&args.photo1));
-    let photo2 = Rc::new(read_photo(&args.photo2));
-
-    if photo1.width != photo2.width || photo1.height != photo2.height {
-        println!("Err: Photos must have the same dimensions");
-        return;
-    }
+    let photo1 = Arc::new(read_photo(&args.photo1));
+    let photo2 = Arc::new(read_photo(&args.photo2));
 
     #[cfg(feature = "bench")]
     if args.bench_matchers {
@@ -72,25 +65,26 @@ fn main() {
         return;
     }
 
-    // Example parameters (you can expose these via command line if desired).
-    let clean_max_dist = 2.0;
-    // Use the processing mode specified by the user.
-    let processing_mode = args.processing_mode;
+    // Run the pipeline, reporting each schedule step as it completes. The library itself
+    // prints nothing; progress is something the application decides to show.
+    let mapping = Correspondence::builder()
+        .quality(args.processing_mode)
+        .seed(seed())
+        .run_with_progress(photo1, photo2, |p| {
+            eprintln!("step {}/{} ({:.0}%)", p.step, p.total, p.fraction() * 100.0);
+        });
 
-    // Create a processor and perform the main matching/iteration steps.
-    let mut processor = PixelMapProcessor::new(photo1, photo2, processing_mode.photo_width());
-    processor.init();
-    processing_mode.run(&mut processor);
+    let mapping = match mapping {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
 
-    #[cfg(feature = "bench")]
-    println!("matched area: {:.4}", processor.get_matched_area());
+    println!("matched area: {:.4}", mapping.coverage());
 
-    // Obtain the result as a pair of DensePhotoMaps (one for each image).
-    let (map1, map2) = processor.get_result(clean_max_dist);
-
-    // Decide which map to work with for subsequent processing.
-    // Here, we’re choosing `map1` as an example.
-    let final_map: DensePhotoMap = map1;
+    let final_map: DensePhotoMap = mapping.into_parts().0;
 
     // If the user requested JSON output for the DensePhotoMap, write it out.
     if let Some(dense_map_path) = args.output_dense_map {
@@ -122,10 +116,30 @@ fn main() {
     println!("Done.");
 }
 
+/// The seed to run the solver with.
+///
+/// The library defaults to [`pixelmap::pixelmap_processor::DEFAULT_SEED`] and takes the
+/// seed as an argument; reading the environment is the *application's* job, so this lives
+/// here rather than in the library, where an ambient process-wide setting would be
+/// invisible to a caller and impossible for two callers to disagree on.
+fn seed() -> u64 {
+    match std::env::var("PIXELMAP_SEED") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("Ignoring PIXELMAP_SEED={raw:?}: not an unsigned integer.");
+                DEFAULT_SEED
+            }
+        },
+        Err(_) => DEFAULT_SEED,
+    }
+}
+
 fn to_dense_map(dense_photo_map: &DensePhotoMap) -> String {
     let mut out = String::with_capacity(1000000);
-    for y in 0..dense_photo_map.photo1.height {
-        for x in 0..dense_photo_map.photo1.width {
+    let (width, height) = dense_photo_map.dimensions();
+    for y in 0..height {
+        for x in 0..width {
             let (x2, y2) = dense_photo_map.map_photo_pixel(x as f32, y as f32);
             if x2.is_nan() {
                 continue;
@@ -138,17 +152,14 @@ fn to_dense_map(dense_photo_map: &DensePhotoMap) -> String {
 
 pub fn save_photo(photo: Photo, filename: &str) {
     println!("Writing image {filename}");
-    let img = image::RgbaImage::from_raw(photo.width as u32, photo.height as u32, photo.img_data).unwrap();
+    let (width, height) = (photo.width() as u32, photo.height() as u32);
+    let img = image::RgbaImage::from_raw(width, height, photo.into_rgba())
+        .expect("the buffer came from a Photo of exactly these dimensions");
     img.save(filename).unwrap();
 }
 
 pub fn read_photo(filename: &str) -> Photo {
     println!("Reading image file: {filename}");
-    let img = open(filename).expect("Could not load image");
-    let pixel_data = img.to_rgba8().into_raw();
-    Photo {
-        img_data: pixel_data,
-        width: img.width() as usize,
-        height: img.height() as usize
-    }
+    // `Photo: From<DynamicImage>` comes from the library's `image` feature.
+    Photo::from(open(filename).expect("Could not load image"))
 }

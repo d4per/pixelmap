@@ -2,9 +2,23 @@
 
 The workspace contains three crates:
 
-- `pixelmap` — the library implementing the framework.
+- `pixelmap` — the library implementing the framework. This is the part published to
+  [crates.io](https://crates.io/crates/pixelmap); see [pixelmap/README.md](pixelmap/README.md)
+  for the API.
 - `command_line_tool` — the `pixelmap` binary, which writes interpolated images to disc.
 - `viewer` — the `pixelmap-viewer` binary, which animates the interpolation in a window.
+
+## Using the library
+
+```rust
+use pixelmap::{Correspondence, Photo, Quality};
+
+let mapping = Correspondence::builder()
+    .quality(Quality::Low)
+    .run(photo1, photo2)?;
+
+let (x, y) = mapping.lookup(120.0, 84.0).expect("mapped here");
+```
 
 ## Clone and build the project
 
@@ -18,11 +32,15 @@ The workspace contains three crates:
 
 Replace photo1 and photo2 with your own images. Use --help for more options. Note that the two photos must have the same dimensions.
 
-The order in which the solver relaxes its queue is randomised, so two runs on the same
-input do not produce exactly the same mapping. Set `PIXELMAP_SEED` to pin it when you need
-a reproducible result — for example to compare two builds:
+The order in which the solver relaxes its queue decides which local optimum the relaxation
+settles into, so it is seeded. The library seeds from a fixed default, which makes runs
+reproducible out of the box; the command line tool reads `PIXELMAP_SEED` to override it —
+for example to check that a change to the algorithm is the only thing that moved:
 
     PIXELMAP_SEED=1 cargo run --release --bin pixelmap -- photo1.jpg photo2.jpg
+
+(The library itself never reads the environment. `Correspondence::builder().seed(n)` is the
+programmatic equivalent.)
 
 ## Animating the result
 

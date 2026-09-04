@@ -1,71 +1,112 @@
-//! # PixelMap Library
+//! Dense image correspondence: given two photographs of the same scene, work out where
+//! each pixel of the first one went in the second.
 //!
-//! The `pixelmap` library provides a set of tools for image processing, feature matching,
-//! and 2D/3D correspondence mapping. It is designed to handle tasks such as
-//! finding local alignments between two images (e.g., for stitching, registration, or
-//! morphing), computing dense transformation fields, and performing a light 3D
-//! reconstruction via dimensionality reduction.
+//! This is the reference implementation of the **PIXELMAP** framework ([white
+//! paper](https://doi.org/10.36227/techrxiv.173749998.89779329/v1)). Every cell of an
+//! *affine correspondence grid* acts as an autonomous agent holding its own local affine
+//! transform; agents refine their transform against the image data and propagate what
+//! they find to their neighbours, and a forward/backward consistency check culls the ones
+//! that disagree. Repeating that coarse-to-fine yields a dense, geometrically consistent
+//! mapping.
 //!
-//! ## Overview of Modules
+//! Useful for optical flow, image registration and stitching, stereo matching, morphing,
+//! and as the front half of a 3D reconstruction.
 //!
-//! - **`pixelmap_processor`**: Orchestrates the high-level workflow of matching two images
-//!   by creating feature descriptors, matching them, and refining local transforms.
+//! # Quick start
 //!
-//! - **`photo`**: Defines a basic `Photo` struct for storing pixel data (RGBA format) along
-//!   with methods for scaling, pixel access, and other common image operations.
+//! ```no_run
+//! use pixelmap::{Correspondence, Photo, Quality};
 //!
-//! - **`correspondence_mapping_algorithm`**: Implements a grid-based method to iteratively
-//!   refine an affine transformation for each cell, guided by a scoring function that measures
-//!   how well one region of an image aligns with another.
+//! # fn decode(_: &str) -> (usize, usize, Vec<u8>) { (0, 0, Vec::new()) }
+//! let (w, h, rgba) = decode("a.jpg");
+//! let a = Photo::from_rgba(w, h, rgba)?;
+//! let (w, h, rgba) = decode("b.jpg");
+//! let b = Photo::from_rgba(w, h, rgba)?;
 //!
-//! - **`correspondence_scoring`** (private): Contains logic to compare corresponding regions
-//!   in two photos (e.g., color differences), returning a similarity score for an affine
-//!   mapping.
+//! let mapping = Correspondence::builder().quality(Quality::Low).run(a, b)?;
 //!
-//! - **`affine_transform`**: Provides the `AffineTransform` struct for 2D transformations,
-//!   including translation, rotation, and scale, along with utility methods.
+//! // Where did the pixel at (120, 84) end up?
+//! match mapping.lookup(120.0, 84.0) {
+//!     Some((x, y)) => println!("({x:.1}, {y:.1})"),
+//!     None => println!("not mapped here"),
+//! }
+//! # Ok::<(), pixelmap::Error>(())
+//! ```
 //!
-//! - **`affine_transform_cell`**: Wraps an `AffineTransform` and its score in a cell-like
-//!   structure, allowing interior mutability and easy storage in grids.
+//! # The contract
 //!
-//! - **`dense_photo_map`**: Stores a dense mapping between two photos, in which each cell
-//!   in a grid maps a coordinate from `photo1` to a corresponding coordinate in `photo2`.
-//!   Supports methods for smoothing, outlier removal, and interpolation of the dense mapping.
+//! **Input.** Both photos must have the same dimensions and be at least
+//! [`MIN_DIMENSION`] on each side. Violations come back as an [`Error`], never a panic.
 //!
-//! - **`circular_feature_grid`** (private): Builds a grid of local circular descriptors
-//!   for an image, typically used for initial matching or feature extraction.
+//! **Output.** [`Correspondence::lookup`] answers in the coordinates of the photos you
+//! passed in. Underneath, the solver works at a reduced resolution and the two
+//! [`DensePhotoMap`]s reached through [`Correspondence::forward`] and
+//! [`Correspondence::backward`] are in *that* space; [`Correspondence::working_scale`]
+//! relates the two. Regions the algorithm could not map — occlusions, featureless sky,
+//! anything the consistency check rejected — are reported as `None` rather than as a
+//! sentinel value.
 //!
-//! - **`circular_feature_descriptor`** (private): Defines the structure of a circular descriptor
-//!   capturing color and orientation data around a region of an image.
+//! **Determinism.** The order in which the solver drains its queue decides which local
+//! optimum the relaxation settles into, so it is seeded, and the seed defaults to
+//! [`DEFAULT_SEED`]. The same photos, schedule and seed give the same mapping — run to
+//! run, thread to thread, and machine to machine. Use [`Builder::seed`] to vary it.
+//! Enabling or disabling the `parallel` feature does not change the result.
 //!
-//! - **`circular_feature_descriptor_matcher`** (private): Matches circular feature descriptors
-//!   between two images, providing candidate correspondences for initialization or refinement.
+//! **Threading.** Everything the caller holds is `Send + Sync`, so a mapping can be
+//! computed on a worker thread and the result shared afterwards.
 //!
-//! - **`model_3d`**: Creates a 3D mesh/model from a dense mapping (e.g., after PCA-like
-//!   dimensionality reduction), along with texture coordinates referencing the original `Photo`.
+//! **Cost.** Roughly linear in pixels at the working resolution, times the number of
+//! schedule steps. See [`Quality`].
 //!
-//! - **`ac_grid`**: Implements a grid of `AffineTransformCell`s, used by the correspondence
-//!   mapping algorithm to store and update the best transform found for each grid cell.
+//! # Feature flags
 //!
-//! - **`processing_mode`**: Ready-made iteration schedules (`low`, `medium`, `high`) that
-//!   drive a `PixelMapProcessor` from initialization to a finished mapping.
+//! - **`parallel`** *(default)* — multi-threaded feature matching via rayon. Turn it off
+//!   for `wasm32-unknown-unknown`, which has no threads to hand out; the matcher falls
+//!   back to a serial search with the same result.
+//! - **`image`** — `From<image::RgbaImage>` and `From<image::DynamicImage>` for [`Photo`].
+//! - **`model-3d`** — 3D reconstruction from a finished mapping. Pulls in `nalgebra`.
+//! - **`bench`** — compiles the matcher benchmark harness. Not part of the pipeline.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
+pub mod correspondence;
+pub mod dense_photo_map;
+pub mod error;
+pub mod photo;
 pub mod pixelmap_processor;
 pub mod processing_mode;
 
-pub mod photo;
-pub mod correspondence_mapping_algorithm;
-mod correspondence_scoring;
-pub mod affine_transform;
-pub mod affine_transform_cell;
-pub mod dense_photo_map;
-mod circular_feature_grid;
+// Internal machinery. These are the parts most likely to change as the solver is tuned,
+// so they stay private: publishing them would freeze implementation details into the
+// crate's semver contract for no one's benefit.
+mod ac_grid;
+mod affine_transform;
+mod affine_transform_cell;
 mod circular_feature_descriptor;
 mod circular_feature_descriptor_matcher;
+mod circular_feature_grid;
+mod correspondence_mapping_algorithm;
+mod correspondence_scoring;
+mod rng;
+
+/// Builds a 3D mesh from a dense mapping. Off by default: it is the only thing in the
+/// crate that needs `nalgebra`, and most callers want the correspondence field, not a
+/// reconstruction.
+#[cfg(feature = "model-3d")]
 pub mod model_3d;
-pub mod ac_grid;
 
 /// Head-to-head benchmark of the matcher's nearest-neighbour backends.
-/// Enabled by the `bench` feature; not part of the pipeline.
+/// Enabled by the `bench` feature; not part of the pipeline, and not part of the crate's
+/// public contract — hidden from the docs so it does not read as something to build on.
 #[cfg(feature = "bench")]
+#[doc(hidden)]
 pub mod matcher_bench;
+
+pub use correspondence::{correspond, Builder, Correspondence, Progress};
+pub use dense_photo_map::DensePhotoMap;
+pub use error::{DecodeError, Error};
+pub use photo::{Photo, MIN_DIMENSION};
+pub use pixelmap_processor::{PixelMapProcessor, DEFAULT_SEED};
+pub use processing_mode::{IterationParams, ProcessingMode, Quality};

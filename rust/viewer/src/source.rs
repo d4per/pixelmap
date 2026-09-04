@@ -6,14 +6,12 @@
 //! and can be animated while later ones are still being produced.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 use image::open;
-use pixelmap::photo::Photo;
-use pixelmap::pixelmap_processor::PixelMapProcessor;
-use pixelmap::processing_mode::ProcessingMode;
+use pixelmap::{Correspondence, Photo, ProcessingMode};
 
 use crate::frame::Frame;
 
@@ -92,17 +90,11 @@ fn produce_morph(request: &MorphRequest, tx: &Sender<ViewerMsg>) -> Result<(), A
     let mut photo1 = read_photo(&request.photo1)?;
     let mut photo2 = read_photo(&request.photo2)?;
 
-    if photo1.width != photo2.width || photo1.height != photo2.height {
-        return Err(Abort::Failed(format!(
-            "Photos must have the same dimensions ({}x{} vs {}x{})",
-            photo1.width, photo1.height, photo2.width, photo2.height
-        )));
-    }
 
     // Warping happens at the resolution of the input photos, which is wasteful
     // (and memory hungry) far above the width the algorithm works at internally.
     if let Some(max_width) = request.max_width {
-        if photo1.width > max_width {
+        if photo1.width() > max_width {
             println!("Scaling photos down to {max_width} px wide");
             photo1 = photo1.get_scaled_proportional(max_width);
             photo2 = photo2.get_scaled_proportional(max_width);
@@ -110,13 +102,13 @@ fn produce_morph(request: &MorphRequest, tx: &Sender<ViewerMsg>) -> Result<(), A
     }
 
     tx.send(ViewerMsg::Init {
-        width: photo1.width,
-        height: photo1.height,
+        width: photo1.width(),
+        height: photo1.height(),
         frame_count: request.frame_count,
     })?;
 
-    let photo1 = Rc::new(photo1);
-    let photo2 = Rc::new(photo2);
+    let photo1 = Arc::new(photo1);
+    let photo2 = Arc::new(photo2);
 
     // Show the first photo right away, so there is something to look at while
     // the mapping is computed.
@@ -125,22 +117,23 @@ fn produce_morph(request: &MorphRequest, tx: &Sender<ViewerMsg>) -> Result<(), A
         fraction: 0.0,
     })?;
 
-    let mut processor = PixelMapProcessor::new(photo1, photo2, request.mode.photo_width());
-    processor.init();
-
-    // The schedule is the bulk of the work, and each step reports back.
+    // The mapping is the bulk of the work, and each step reports back. Mismatched or
+    // unusable photos come back as an error rather than a panic.
     let mut progress = Ok(());
-    request.mode.run_with_progress(&mut processor, |done, total| {
-        if progress.is_ok() {
-            progress = tx.send(ViewerMsg::Progress {
-                label: format!("refining mapping (step {done}/{total})"),
-                fraction: done as f32 / total as f32,
-            });
-        }
-    });
+    let mapping = Correspondence::builder()
+        .quality(request.mode)
+        .run_with_progress(photo1, photo2, |p| {
+            if progress.is_ok() {
+                progress = tx.send(ViewerMsg::Progress {
+                    label: format!("refining mapping (step {}/{})", p.step, p.total),
+                    fraction: p.fraction(),
+                });
+            }
+        })
+        .map_err(|e| Abort::Failed(e.to_string()))?;
     progress?;
 
-    let (final_map, _reverse_map) = processor.get_result(2.0);
+    let final_map = mapping.into_parts().0;
 
     for i in 0..request.frame_count {
         let alpha = if request.frame_count > 1 {
@@ -167,8 +160,8 @@ fn produce_files(paths: &[PathBuf], tx: &Sender<ViewerMsg>) -> Result<(), Abort>
         let photo = read_photo(path)?;
         if !initialized {
             tx.send(ViewerMsg::Init {
-                width: photo.width,
-                height: photo.height,
+                width: photo.width(),
+                height: photo.height(),
                 frame_count: paths.len(),
             })?;
             initialized = true;
@@ -188,9 +181,5 @@ fn read_photo(path: &Path) -> Result<Photo, Abort> {
     println!("Reading image file: {}", path.display());
     let img = open(path)
         .map_err(|e| Abort::Failed(format!("Could not load {}: {e}", path.display())))?;
-    Ok(Photo {
-        width: img.width() as usize,
-        height: img.height() as usize,
-        img_data: img.to_rgba8().into_raw(),
-    })
+    Ok(Photo::from(img))
 }

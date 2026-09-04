@@ -18,7 +18,7 @@ mod frame;
 mod player;
 mod source;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -157,7 +157,7 @@ fn sort_numerically(paths: &mut [PathBuf]) {
     });
 }
 
-fn trailing_number(path: &PathBuf) -> Option<u64> {
+fn trailing_number(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     let digits: String = stem
         .chars()
@@ -167,7 +167,7 @@ fn trailing_number(path: &PathBuf) -> Option<u64> {
     digits.chars().rev().collect::<String>().parse().ok()
 }
 
-fn file_label(path: &PathBuf) -> String {
+fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())

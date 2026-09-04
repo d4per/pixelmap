@@ -32,7 +32,7 @@ impl ACGrid {
     /// a default/empty `AffineTransformCell`.
     ///
     /// # Examples
-    /// ```
+    /// ```text
     /// use pixelmap::ac_grid::ACGrid;
     /// let my_grid = ACGrid::new(10, 5);
     /// assert_eq!(my_grid.get_grid_width(), 10);
@@ -57,9 +57,7 @@ impl ACGrid {
     /// Panics if `(x, y)` is out of bounds (i.e., if `x >= grid_width` or `y >= grid_height`).
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::ac_grid::ACGrid;
-    /// # use pixelmap::ac_grid::AffineTransformCell;
+    /// ```text
     /// let my_grid = ACGrid::new(10, 5);
     /// let cell_ref = my_grid.get_grid_square(2, 3);
     /// // `cell_ref` is an &AffineTransformCell; you can call its methods, e.g.:
@@ -72,8 +70,7 @@ impl ACGrid {
     /// Returns the width of the grid (the number of columns).
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::ac_grid::ACGrid;
+    /// ```text
     /// let my_grid = ACGrid::new(10, 5);
     /// assert_eq!(my_grid.get_grid_width(), 10);
     /// ```
@@ -84,8 +81,7 @@ impl ACGrid {
     /// Returns the height of the grid (the number of rows).
     ///
     /// # Examples
-    /// ```
-    /// # use pixelmap::ac_grid::ACGrid;
+    /// ```text
     /// let my_grid = ACGrid::new(10, 5);
     /// assert_eq!(my_grid.get_grid_height(), 5);
     /// ```

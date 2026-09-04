@@ -9,11 +9,11 @@
 //! - [`ProcessingMode::High`]: slowest, but likely the best result.
 //!
 //! ```no_run
-//! # use std::rc::Rc;
+//! # use std::sync::Arc;
 //! # use pixelmap::photo::Photo;
 //! # use pixelmap::pixelmap_processor::PixelMapProcessor;
 //! # use pixelmap::processing_mode::ProcessingMode;
-//! # let (photo1, photo2) = (Rc::new(Photo::default()), Rc::new(Photo::default()));
+//! # let (photo1, photo2) = (Arc::new(Photo::default()), Arc::new(Photo::default()));
 //! let mode = ProcessingMode::Low;
 //! let mut processor = PixelMapProcessor::new(photo1, photo2, mode.photo_width());
 //! processor.init();
@@ -25,6 +25,12 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::pixelmap_processor::PixelMapProcessor;
+
+/// How much work the correspondence mapping should put into a photo pair.
+///
+/// The name this is exported under at the crate root; `ProcessingMode` is the historical
+/// spelling and remains an alias for it.
+pub type Quality = ProcessingMode;
 
 /// The parameters of a single [`PixelMapProcessor::iterate`] call.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -103,7 +109,12 @@ const HIGH_STEPS: [IterationParams; 13] = [
 ];
 
 /// How much work the correspondence mapping should put into a photo pair.
+///
+/// Each preset is a coarse-to-fine schedule of [`IterationParams`]. Higher settings both
+/// run more iterations and finish at a higher working resolution, so cost grows faster
+/// than the step count suggests.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProcessingMode {
     /// Fast, but may be less accurate.
     Low,

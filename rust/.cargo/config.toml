@@ -11,8 +11,3 @@
 # them ("'skylake' is not a recognized processor for this target").
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]
-
-# getrandom 0.3 needs this cfg *and* the "wasm_js" feature (the feature alone is
-# insufficient) before it will provide a backend on wasm32-unknown-unknown.
-[target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

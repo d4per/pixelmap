@@ -96,6 +96,7 @@ impl FeaturePoint {
 /// [`MatcherBackend::KdTreeLegacy`] is kept verbatim as the correctness and performance
 /// baseline the others are measured against; see `crate::matcher_bench`.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub(crate) enum MatcherBackend {
     /// Exact, serial, indexing the descriptor itself with `i64` keys.
     KdTreeLegacy,
@@ -146,6 +147,7 @@ impl Stopwatch {
 /// fully on the critical path and has to be reported alongside query time. Zero unless
 /// the `bench` feature is on; see [`Stopwatch`].
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub(crate) struct MatchTiming {
     pub build: Duration,
     pub query: Duration,

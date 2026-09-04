@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use crate::affine_transform::AffineTransform;
 use crate::photo::Photo;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Number of fractional bits used by the fixed-point coordinate walk.
 const FRAC: u32 = 16;
@@ -30,9 +30,9 @@ struct Samples {
 /// differences between corresponding regions of the photos.
 pub struct CorrespondenceScoring {
     /// A shared reference to the first photo.
-    photo1: Rc<Photo>,
+    photo1: Arc<Photo>,
     /// A shared reference to the second photo.
-    photo2: Rc<Photo>,
+    photo2: Arc<Photo>,
     /// `photo1` and `photo2` with one packed `0x00BBGGRR` word per pixel.
     ///
     /// Sampling a pixel is then a single aligned 32-bit load instead of three byte loads
@@ -114,7 +114,7 @@ impl CorrespondenceScoring {
     /// This method precomputes a `sqrt_table` to optimize calculations of maximum x-offsets
     /// for each y-offset in the circular neighborhood, packs both images into one word per
     /// pixel, and sizes the sample scratch to the largest disc that can occur.
-    pub fn new(photo1: Rc<Photo>, photo2: Rc<Photo>, neighborhood_radius: isize) -> Self {
+    pub fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, neighborhood_radius: isize) -> Self {
         let neighborhood_radius = neighborhood_radius as i32;
         let diameter = (2 * neighborhood_radius + 1) as usize;
         let mut sqrt_table = vec![0i32; diameter];
@@ -136,7 +136,7 @@ impl CorrespondenceScoring {
 
         let pack = |p: &Photo| -> Vec<u32> {
             p.img_data
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|q| u32::from_le_bytes([q[0], q[1], q[2], 0]))
                 .collect()
         };
@@ -466,17 +466,17 @@ mod tests {
         }
     }
 
-    fn noise_photo(width: usize, height: usize, seed: u64) -> Rc<Photo> {
+    fn noise_photo(width: usize, height: usize, seed: u64) -> Arc<Photo> {
         let mut rng = Rng(seed);
         let mut img_data = vec![0u8; width * height * 4];
-        for px in img_data.chunks_exact_mut(4) {
+        for px in img_data.as_chunks_mut::<4>().0 {
             let v = rng.next_u32();
             px[0] = v as u8;
             px[1] = (v >> 8) as u8;
             px[2] = (v >> 16) as u8;
             px[3] = 255;
         }
-        Rc::new(Photo { img_data, width, height })
+        Arc::new(Photo { img_data, width, height })
     }
 
     fn empty_samples(radius: usize) -> Samples {
