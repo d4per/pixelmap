@@ -15,7 +15,9 @@ find to their neighbours, and a forward/backward consistency check culls the one
 disagree. Repeating that coarse-to-fine yields a dense, geometrically consistent mapping.
 
 Useful for optical flow, image registration and stitching, stereo matching, morphing, and
-as the front half of a 3D reconstruction.
+as the front half of a 3D reconstruction — the `pixelmap_model_3d` crate in the
+[repository](https://github.com/d4per/pixelmap) lifts a finished mapping into a textured
+3D mesh.
 
 ## Example
 
@@ -86,10 +88,10 @@ a pixel buffer does not match the dimensions it claims.
 | Feature | Default | Effect |
 |---|:---:|---|
 | `parallel` | ✅ | Multi-threaded feature matching via rayon. Turn it off for `wasm32-unknown-unknown`, which has no threads to hand out; the matcher falls back to a serial search that produces the same result. |
-| `model-3d` | | 3D reconstruction from a finished mapping. Pulls in `nalgebra`. |
 | `bench` | | Compiles the matcher benchmark harness. Not part of the pipeline. |
 
-Default dependencies are just `kd-tree`, `typenum` and `rayon`. The crate does no file or
+The only default dependency is `rayon`, and with `--no-default-features` there are **no
+dependencies at all**. The crate does no file or
 network I/O and never writes to stdout — a `Photo` is a plain RGBA byte buffer, decoding
 images is the caller's business, and progress is reported through
 `Builder::run_with_progress` rather than printed.
@@ -110,8 +112,8 @@ binary that will not run on older hardware.
 
 ## Minimum supported Rust version
 
-1.90, set by `kd-tree`'s `ordered-float` dependency rather than by this crate's own
-source. Treated as a breaking change if raised.
+1.80, set by `rayon`. The crate's own source builds on 1.74, which is what
+`--no-default-features` needs. Treated as a breaking change if raised.
 
 ## License
 

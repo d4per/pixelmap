@@ -203,7 +203,7 @@ pub fn run(photo1: &Photo, photo2: &Photo, width: usize) -> Vec<BackendReport> {
     let matcher = CircularFeatureDescriptorMatcher::new();
 
     let mut backends: Vec<(String, MatcherBackend, usize)> = vec![
-        ("kdtree-legacy (baseline)".into(), MatcherBackend::KdTreeLegacy, 1),
+        ("brute force (ground truth)".into(), MatcherBackend::BruteForce, 1),
     ];
     // Serial is the configuration a wasm build actually runs, so it is measured first
     // and on equal terms; the parallel rows only exist where threads are available.

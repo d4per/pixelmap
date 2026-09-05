@@ -2,8 +2,7 @@
 name = "pixelmap"
 version = "0.1.0"
 edition = "2021"
-# Set by kd-tree's `ordered-float` dependency, not by this crate's own source.
-rust-version = "1.90"
+rust-version = "1.80"
 description = "Dense image correspondence by swarm-inspired iterative refinement of an affine correspondence grid (the PIXELMAP framework)"
 repository = "https://github.com/d4per/pixelmap"
 homepage = "https://pixelmap.dogduck.com"
@@ -17,12 +16,6 @@ categories = ["computer-vision", "algorithms", "multimedia::images"]
 all-features = true
 
 [dependencies]
-kd-tree = "0.6.0"
-typenum = "1.17.0"
-# Only `model_3d` uses this (for the SVD), so it is optional: a caller who wants the
-# correspondence field should not pay for a linear-algebra dependency.
-nalgebra = { version = "0.33", optional = true }
-
 # Multi-threaded feature matching. Optional because wasm32-unknown-unknown has no
 # threads to hand out without SharedArrayBuffer and cross-origin isolation; build with
 # --no-default-features for wasm and the matcher falls back to a serial search.
@@ -35,9 +28,7 @@ image = { version = ">=0.25, <0.25.10", optional = true, default-features = fals
 
 [features]
 default = ["parallel"]
-parallel = ["dep:rayon", "kd-tree/rayon"]
-# 3D reconstruction from a finished mapping. Pulls in nalgebra.
-model-3d = ["dep:nalgebra"]
+parallel = ["dep:rayon"]
 # `From<image::RgbaImage>` and `From<image::DynamicImage>` for `Photo`.
 image = ["dep:image"]
 # Compiles `matcher_bench`, used to tune the match stride and to re-check the

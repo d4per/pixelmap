@@ -10,7 +10,12 @@
 //! mapping.
 //!
 //! Useful for optical flow, image registration and stitching, stereo matching, morphing,
-//! and as the front half of a 3D reconstruction.
+//! and as the front half of a 3D reconstruction — the `pixelmap_model_3d` crate in the
+//! repository lifts a finished mapping into a textured 3D mesh.
+//!
+//! # What it produces
+//!
+#![doc = include_str!("../doc/results.md")]
 //!
 //! # Quick start
 //!
@@ -64,7 +69,6 @@
 //!   for `wasm32-unknown-unknown`, which has no threads to hand out; the matcher falls
 //!   back to a serial search with the same result.
 //! - **`image`** — `From<image::RgbaImage>` and `From<image::DynamicImage>` for [`Photo`].
-//! - **`model-3d`** — 3D reconstruction from a finished mapping. Pulls in `nalgebra`.
 //! - **`bench`** — compiles the matcher benchmark harness. Not part of the pipeline.
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -89,13 +93,8 @@ mod circular_feature_descriptor_matcher;
 mod circular_feature_grid;
 mod correspondence_mapping_algorithm;
 mod correspondence_scoring;
+mod kdtree;
 mod rng;
-
-/// Builds a 3D mesh from a dense mapping. Off by default: it is the only thing in the
-/// crate that needs `nalgebra`, and most callers want the correspondence field, not a
-/// reconstruction.
-#[cfg(feature = "model-3d")]
-pub mod model_3d;
 
 /// Head-to-head benchmark of the matcher's nearest-neighbour backends.
 /// Enabled by the `bench` feature; not part of the pipeline, and not part of the crate's

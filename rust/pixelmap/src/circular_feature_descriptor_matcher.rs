@@ -1,55 +1,10 @@
 use crate::circular_feature_descriptor::CircularFeatureDescriptor;
 use crate::circular_feature_grid::CircularFeatureGrid;
-use kd_tree::{KdPoint, KdTree};
+use crate::kdtree::{KdTree, Point};
 use std::time::Duration;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-
-/// Retained so that [`MatcherBackend::KdTreeLegacy`] can index the descriptor directly,
-/// exactly as the original implementation did. Every other backend uses [`FeaturePoint`].
-///
-/// The keys are `i16` in the descriptor; widening them to `i64` here keeps this backend
-/// bit-for-bit the baseline it was, whatever the storage type underneath.
-impl KdPoint for CircularFeatureDescriptor {
-    type Scalar = i64;
-    type Dim = typenum::U6;
-    fn at(&self, k: usize) -> i64 {
-        self.feature_vector[k] as i64
-    }
-}
-
-/// The 6-D search key of a descriptor, packed next to the index of the descriptor
-/// it came from.
-///
-/// This was introduced when [`CircularFeatureDescriptor`] was 96 bytes and carried a
-/// pile of intermediate values the tree never looked at: indexing 28 bytes instead cut
-/// the bytes the build's median partition has to move by about 3.4x, worth roughly 1.4x
-/// on its own. The descriptor has since been trimmed to 20 bytes — everything the
-/// matcher reads and nothing else — so `FeaturePoint` is now the *larger* of the two and
-/// no longer pays for itself on size. What it still provides is the `i32` scalar the
-/// tree needs (the keys themselves are `i16`, whose squared distance would overflow),
-/// and a second point type for `matcher_bench` to measure the backends against.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FeaturePoint {
-    key: [i32; 6],
-    idx: u32,
-}
-
-impl KdPoint for FeaturePoint {
-    type Scalar = i32;
-    type Dim = typenum::U6;
-    fn at(&self, k: usize) -> i32 {
-        self.key[k]
-    }
-}
-
-/// Largest coordinate magnitude for which a 6-axis squared distance still fits in `i32`.
-///
-/// `6 * (2 * KEY_LIMIT)^2 < i32::MAX` holds for `KEY_LIMIT = 9000`. The real values are
-/// far smaller: an aligned centre of mass cannot exceed the disc radius (10), and the
-/// feature vector scales it by 100, so |key| stays around 1000.
-const KEY_LIMIT: i64 = 9_000;
 
 /// How many of image 2's descriptors are queried, by default: every `n`-th one.
 ///
@@ -60,49 +15,20 @@ const KEY_LIMIT: i64 = 9_000;
 /// queue that consumes it.
 pub const DEFAULT_MATCH_STRIDE: usize = 4;
 
-impl FeaturePoint {
-    #[inline]
-    fn new(idx: usize, descriptor: &CircularFeatureDescriptor) -> Self {
-        let mut key = [0i32; 6];
-        for (k, slot) in key.iter_mut().enumerate() {
-            *slot = descriptor.feature_vector[k] as i32;
-        }
-        FeaturePoint { key, idx: idx as u32 }
-    }
-
-    /// Checks the whole descriptor set against [`KEY_LIMIT`] once, in release too.
-    ///
-    /// An out-of-range key would not fail loudly — it would silently truncate to `i32`
-    /// and overflow the squared distance, returning wrong neighbours. One O(n) pass of
-    /// comparisons is far too cheap to skip next to the O(n log n) tree build it guards.
-    fn assert_key_range(infos: &[CircularFeatureDescriptor]) {
-        let worst = infos
-            .iter()
-            .flat_map(|d| d.feature_vector.iter())
-            .fold(0i64, |acc, &v| acc.max((v as i64).abs()));
-        assert!(
-            worst <= KEY_LIMIT,
-            "feature vector magnitude {worst} exceeds the i32 squared-distance budget of {KEY_LIMIT}"
-        );
-    }
-
-    fn build_all(infos: &[CircularFeatureDescriptor]) -> Vec<FeaturePoint> {
-        infos.iter().enumerate().map(|(i, d)| FeaturePoint::new(i, d)).collect()
-    }
-}
-
 /// Which nearest-neighbour strategy [`CircularFeatureDescriptorMatcher`] should use.
 ///
-/// [`MatcherBackend::KdTreeLegacy`] is kept verbatim as the correctness and performance
-/// baseline the others are measured against; see `crate::matcher_bench`.
+/// [`MatcherBackend::BruteForce`] is the ground truth the others are measured against;
+/// see `crate::matcher_bench`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub(crate) enum MatcherBackend {
-    /// Exact, serial, indexing the descriptor itself with `i64` keys.
-    KdTreeLegacy,
-    /// Indexes the compact [`FeaturePoint`], querying every `stride`-th descriptor of
-    /// image 2. `parallel` is ignored unless the `parallel` feature is enabled, so a
-    /// wasm build silently and correctly falls back to a single thread.
+    /// Exhaustive scan: for every queried descriptor, compare against every descriptor of
+    /// image 1. Quadratic and far too slow for real use, which is exactly why it makes a
+    /// good baseline — it cannot be wrong, so any disagreement is the other backend's.
+    BruteForce,
+    /// The kd-tree, querying every `stride`-th descriptor of image 2. `parallel` is
+    /// ignored unless the `parallel` feature is enabled, so a wasm build silently and
+    /// correctly falls back to a single thread.
     KdTree { stride: usize, parallel: bool },
 }
 
@@ -219,37 +145,50 @@ impl CircularFeatureDescriptorMatcher {
         backend: MatcherBackend,
     ) -> (Vec<FeatureMatch>, MatchTiming) {
         match backend {
-            MatcherBackend::KdTreeLegacy => Self::kdtree_legacy(img1, img2),
+            MatcherBackend::BruteForce => Self::brute_force(img1, img2),
             MatcherBackend::KdTree { stride, parallel } => {
-                // The legacy backend keeps the original i64 keys and needs no check.
-                FeaturePoint::assert_key_range(img1.get_infos());
-                FeaturePoint::assert_key_range(img2.get_infos());
                 Self::kdtree_search(img1, img2, stride.max(1), parallel)
             }
         }
     }
 
-    /// The original implementation: clone every descriptor into an owned kd-tree and
-    /// query it serially. Retained as the baseline the other backends are compared to.
-    fn kdtree_legacy(
+    /// Ground truth for `matcher_bench`: every query against every candidate.
+    ///
+    /// Ties break by lowest image-1 index, matching [`crate::kdtree`], so the two agree
+    /// exactly rather than merely equivalently.
+    fn brute_force(
         img1: &CircularFeatureGrid,
         img2: &CircularFeatureGrid,
     ) -> (Vec<FeatureMatch>, MatchTiming) {
-        let t0 = Stopwatch::start();
-        let kdtree = KdTree::build(img1.get_infos().clone());
-        let build = t0.elapsed();
+        let (infos1, infos2) = (img1.get_infos(), img2.get_infos());
 
-        let t1 = Stopwatch::start();
-        let infos2 = img2.get_infos();
-        let mut ans: Vec<FeatureMatch> = Vec::with_capacity(infos2.len());
-        for cai2 in infos2 {
-            if let Some(found) = kdtree.nearest(cai2) {
-                ans.push(FeatureMatch::new(found.item, cai2));
+        let query_at = |i: usize| -> Option<FeatureMatch> {
+            let cai2 = &infos2[i];
+            let mut best: Option<(u64, usize)> = None;
+            for (j, cai1) in infos1.iter().enumerate() {
+                let mut sum = 0i64;
+                for k in 0..6 {
+                    let d = cai1.feature_vector[k] as i64 - cai2.feature_vector[k] as i64;
+                    sum += d * d;
+                }
+                let d2 = sum as u64;
+                if best.map_or(true, |(bd, _)| d2 < bd) {
+                    best = Some((d2, j));
+                }
             }
-        }
-        (ans, MatchTiming { build, query: t1.elapsed() })
+            best.map(|(_, j)| FeatureMatch::new(&infos1[j], cai2))
+        };
+
+        let t = Stopwatch::start();
+        let ans = par_query(infos2.len(), 1, &query_at);
+        (ans, MatchTiming { build: Duration::ZERO, query: t.elapsed() })
     }
 
+    /// Indexes image 1 into a [`crate::kdtree`] and queries every `stride`-th descriptor
+    /// of image 2 against it.
+    ///
+    /// No key-range guard and no widening pass: the tree accumulates in `i64`, so the
+    /// descriptor's `i16` key is indexed exactly as it is stored.
     fn kdtree_search(
         img1: &CircularFeatureGrid,
         img2: &CircularFeatureGrid,
@@ -260,17 +199,20 @@ impl CircularFeatureDescriptorMatcher {
         let parallel = parallel && parallelism_available();
 
         let t0 = Stopwatch::start();
-        let points = FeaturePoint::build_all(infos1);
-        let kdtree = if parallel { par_build(points) } else { KdTree::build(points) };
+        let points = infos1
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Point { v: d.feature_vector, id: i as u32 })
+            .collect();
+        let tree =
+            if parallel { KdTree::build(points) } else { KdTree::build_serial(points) };
         let build = t0.elapsed();
 
         // One query, shared by the serial and parallel drivers so they cannot drift.
         let query_at = |i: usize| -> Option<FeatureMatch> {
             let cai2 = &infos2[i];
-            let query = FeaturePoint::new(i, cai2);
-            kdtree
-                .nearest(&query)
-                .map(|found| FeatureMatch::new(&infos1[found.item.idx as usize], cai2))
+            tree.nearest(&cai2.feature_vector)
+                .map(|found| FeatureMatch::new(&infos1[found.id as usize], cai2))
         };
 
         let t1 = Stopwatch::start();
@@ -281,16 +223,8 @@ impl CircularFeatureDescriptorMatcher {
         };
         (ans, MatchTiming { build, query: t1.elapsed() })
     }
-}
 
-#[cfg(feature = "parallel")]
-fn par_build(points: Vec<FeaturePoint>) -> KdTree<FeaturePoint> {
-    KdTree::par_build(points)
-}
 
-#[cfg(not(feature = "parallel"))]
-fn par_build(points: Vec<FeaturePoint>) -> KdTree<FeaturePoint> {
-    KdTree::build(points)
 }
 
 /// `par_iter().step_by().filter_map().collect()` preserves source order, so a parallel

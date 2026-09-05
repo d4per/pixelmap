@@ -80,7 +80,7 @@ impl Photo {
             return Err(Error::BufferLength { expected, actual: data.len() });
         }
         let mut rgba = Vec::with_capacity(width * height * 4);
-        for pixel in data.as_chunks::<3>().0 {
+        for pixel in data.chunks_exact(3) {
             rgba.extend_from_slice(pixel);
             rgba.push(255);
         }

@@ -27,6 +27,7 @@ pub struct CircularFeatureDescriptor {
     /// `i16` because an aligned centre of mass cannot leave the disc, so at radius 10 the
     /// magnitude stays around 1000 — two orders of magnitude inside the type. A value
     /// that somehow did overflow saturates rather than wraps (Rust's float-to-int `as`),
-    /// so `FeaturePoint::assert_key_range` still catches it loudly.
+    /// and [`crate::kdtree`] accumulates squared distances in `i64`, so even the widest
+    /// `i16` pair it could produce is still exact.
     pub feature_vector: [i16; 6],
 }

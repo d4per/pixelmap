@@ -1,7 +1,20 @@
+//! Turning a correspondence map into 3D geometry.
+//!
+//! A dense correspondence between two views of a static scene constrains the shape of
+//! that scene. [`Model3D::new`] solves for it, yielding a grid of points that each carry
+//! the texture coordinates they came from, and [`Model3D::to_x3d`] writes that grid out
+//! as an X3D mesh.
+//!
+//! The correspondence itself comes from the [`pixelmap`] crate; this one only reads the
+//! finished [`DensePhotoMap`], so nothing here is on the algorithm's hot path.
+//!
+#![doc = include_str!("../doc/model-3d.md")]
+#![warn(missing_docs)]
+
 use std::sync::Arc;
-use crate::photo::Photo;
-use crate::dense_photo_map::DensePhotoMap;
+
 use nalgebra::{DMatrix, SVD};
+use pixelmap::{DensePhotoMap, Photo};
 
 /// A 3D model built from a 2D grid of correspondences. Each cell in the grid has a
 /// position in 3D space (`x, y, z`) plus texture coordinates (`u, v`) mapping it

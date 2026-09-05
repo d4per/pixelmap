@@ -136,7 +136,7 @@ impl CorrespondenceScoring {
 
         let pack = |p: &Photo| -> Vec<u32> {
             p.img_data
-                .as_chunks::<4>().0.iter()
+                .chunks_exact(4)
                 .map(|q| u32::from_le_bytes([q[0], q[1], q[2], 0]))
                 .collect()
         };
@@ -469,7 +469,7 @@ mod tests {
     fn noise_photo(width: usize, height: usize, seed: u64) -> Arc<Photo> {
         let mut rng = Rng(seed);
         let mut img_data = vec![0u8; width * height * 4];
-        for px in img_data.as_chunks_mut::<4>().0 {
+        for px in img_data.chunks_exact_mut(4) {
             let v = rng.next_u32();
             px[0] = v as u8;
             px[1] = (v >> 8) as u8;

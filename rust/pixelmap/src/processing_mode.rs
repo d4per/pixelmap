@@ -8,6 +8,8 @@
 //! - [`ProcessingMode::Medium`]: slower, but more accurate.
 //! - [`ProcessingMode::High`]: slowest, but likely the best result.
 //!
+#![doc = include_str!("../doc/quality-scales.md")]
+//!
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use pixelmap::photo::Photo;

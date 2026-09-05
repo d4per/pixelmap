@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "command_line_tool",
+    "model_3d",
     "pixelmap",
     "viewer",
 ]

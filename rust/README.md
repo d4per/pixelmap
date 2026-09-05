@@ -1,10 +1,14 @@
 # Rust implementation of the PIXELMAP framework
 
-The workspace contains three crates:
+The workspace contains four crates:
 
 - `pixelmap` — the library implementing the framework. This is the part published to
   [crates.io](https://crates.io/crates/pixelmap); see [pixelmap/README.md](pixelmap/README.md)
   for the API.
+- `model_3d` — `pixelmap_model_3d`, which lifts a finished mapping into a textured 3D
+  mesh and writes it as X3D. Kept out of the published library: it consumes the
+  algorithm rather than being part of it, and it is the only crate here that needs a
+  linear-algebra dependency.
 - `command_line_tool` — the `pixelmap` binary, which writes interpolated images to disc.
 - `viewer` — the `pixelmap-viewer` binary, which animates the interpolation in a window.
 
