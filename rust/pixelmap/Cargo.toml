@@ -14,9 +14,6 @@ categories = ["computer-vision", "algorithms", "multimedia::images"]
 
 [package.metadata.docs.rs]
 all-features = true
-# docs.rs sets this itself, but stating it keeps the `doc_cfg` feature gate in
-# lib.rs reproducible locally with the same one flag.
-rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Multi-threaded feature matching. Optional because wasm32-unknown-unknown has no

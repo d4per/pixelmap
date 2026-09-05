@@ -47,9 +47,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - run: cargo build -p pixelmap
-      - run: cargo test -p pixelmap
-      - run: cargo build -p pixelmap --no-default-features
+      # `+1.80` is load-bearing, not decoration. Every step runs in `rust/` (see
+      # `defaults` above), where rust-toolchain.toml pins the channel to stable, and a
+      # rustup directory override beats the `rustup default` the action just set. Without
+      # naming the toolchain per command this job builds on stable and checks nothing.
+      - run: cargo +1.80 build -p pixelmap
+      - run: cargo +1.80 test -p pixelmap
+      - run: cargo +1.80 build -p pixelmap --no-default-features
 
   lint:
     name: fmt + clippy
@@ -101,19 +105,3 @@ jobs:
       - name: Verify the crate is publishable
         run: cargo publish --dry-run -p pixelmap
 
-  docsrs:
-    name: docs.rs simulation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # docs.rs builds on nightly with `--cfg docsrs`, which is the only configuration
-      # that compiles the `feature(doc_cfg)` gate in lib.rs. The stable `docs` job above
-      # never sees it, so without this a removed rustdoc feature reaches a release as a
-      # crate with no documentation at all.
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - run: cargo doc -p pixelmap --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: "--cfg docsrs -D warnings"

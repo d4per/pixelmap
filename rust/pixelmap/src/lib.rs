@@ -73,7 +73,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod correspondence;
 pub mod dense_photo_map;
