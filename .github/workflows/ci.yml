@@ -17,18 +17,11 @@ defaults:
 
 jobs:
   test:
-    name: test (${{ matrix.rust }})
+    name: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 1.90 is the crate's declared MSRV; it has to keep building.
-        rust: [stable, "1.90"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -39,6 +32,24 @@ jobs:
       # The serial fallback has to stay correct: it is what wasm builds use.
       - run: cargo test -p pixelmap --no-default-features
       - run: cargo test -p pixelmap --all-features
+
+  msrv:
+    name: MSRV (library)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Only the library is published and only the library declares an MSRV. The two
+      # binaries depend on `image`, whose tree needs edition 2024, so they follow
+      # rust-toolchain.toml instead.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.80"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo build -p pixelmap
+      - run: cargo test -p pixelmap
+      - run: cargo build -p pixelmap --no-default-features
 
   lint:
     name: fmt + clippy

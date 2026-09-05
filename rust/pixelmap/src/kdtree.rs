@@ -104,7 +104,10 @@ impl KdTree {
         if self.points.is_empty() {
             return None;
         }
-        let mut best = Nearest { id: u32::MAX, distance_squared: u64::MAX };
+        let mut best = Nearest {
+            id: u32::MAX,
+            distance_squared: u64::MAX,
+        };
         search_recursive(&self.points, query, 0, &mut best);
         Some(best)
     }
@@ -247,7 +250,10 @@ mod tests {
 
     /// The answer the tree has to reproduce: look at everything, same tie-break.
     fn brute_force(points: &[Point], query: &[i16; D]) -> Option<Nearest> {
-        let mut best = Nearest { id: u32::MAX, distance_squared: u64::MAX };
+        let mut best = Nearest {
+            id: u32::MAX,
+            distance_squared: u64::MAX,
+        };
         for p in points {
             consider(&mut best, p, distance_squared(query, &p.v));
         }
@@ -345,7 +351,10 @@ mod tests {
             rng.shuffle(&mut shuffled);
             let tree = KdTree::build(shuffled);
             let got: Vec<_> = queries.iter().map(|q| tree.nearest(q)).collect();
-            assert_eq!(got, expected, "a reordered build produced different answers");
+            assert_eq!(
+                got, expected,
+                "a reordered build produced different answers"
+            );
         }
     }
 
@@ -356,7 +365,10 @@ mod tests {
         let points = random_points(&mut rng, 5000, 400);
         let parallel = KdTree::build(points.clone());
         let serial = KdTree::build_serial(points);
-        assert_eq!(parallel.points, serial.points, "the two builds produced different trees");
+        assert_eq!(
+            parallel.points, serial.points,
+            "the two builds produced different trees"
+        );
     }
 
     #[test]
@@ -366,24 +378,47 @@ mod tests {
         assert_eq!(empty.len(), 0);
         assert_eq!(empty.nearest(&[0; D]), None);
 
-        let single = KdTree::build(vec![Point { v: [1, 2, 3, 4, 5, 6], id: 42 }]);
+        let single = KdTree::build(vec![Point {
+            v: [1, 2, 3, 4, 5, 6],
+            id: 42,
+        }]);
         assert!(!single.is_empty());
-        let found = single.nearest(&[1, 2, 3, 4, 5, 6]).expect("tree is not empty");
-        assert_eq!(found, Nearest { id: 42, distance_squared: 0 });
+        let found = single
+            .nearest(&[1, 2, 3, 4, 5, 6])
+            .expect("tree is not empty");
+        assert_eq!(
+            found,
+            Nearest {
+                id: 42,
+                distance_squared: 0
+            }
+        );
     }
 
     /// The widest keys the type allows, where an `i32` accumulator would overflow.
     #[test]
     fn extreme_keys_do_not_overflow() {
         let points = vec![
-            Point { v: [i16::MIN; D], id: 0 },
-            Point { v: [i16::MAX; D], id: 1 },
+            Point {
+                v: [i16::MIN; D],
+                id: 0,
+            },
+            Point {
+                v: [i16::MAX; D],
+                id: 1,
+            },
         ];
         let tree = KdTree::build(points.clone());
 
         let query = [i16::MAX; D];
         let found = tree.nearest(&query).expect("tree is not empty");
-        assert_eq!(found, Nearest { id: 1, distance_squared: 0 });
+        assert_eq!(
+            found,
+            Nearest {
+                id: 1,
+                distance_squared: 0
+            }
+        );
 
         // 6 * 65535^2 = 25_769_017_350, which needs more than 32 bits.
         let far = distance_squared(&[i16::MIN; D], &[i16::MAX; D]);

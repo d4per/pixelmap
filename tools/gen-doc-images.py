@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Generate the figures embedded in pixelmap's rustdoc.
+"""Generate the figures embedded in the crates' rustdoc.
 
 Reads the full-size PNGs in images/, writes web-sized WebP derivatives to
-images/docs/, and emits one markdown fragment per figure into
-rust/pixelmap/doc/. Each fragment carries the image inline as a data: URI so the
-published crate is self-contained: the docs render on docs.rs, in an offline
-`cargo doc`, and in every archived version, with nothing fetched over the network.
+images/docs/, and emits one markdown fragment per figure into the doc/ directory
+of the crate that includes it. Each fragment carries the image inline as a data:
+URI so the published crate is self-contained: the docs render on docs.rs, in an
+offline `cargo doc`, and in every archived version, with nothing fetched over the
+network.
 
-This script lives outside rust/pixelmap/ on purpose, so it is not packaged into
-the crate. Re-run it after changing a source image, then commit both the .webp
-under images/docs/ and the regenerated .md under rust/pixelmap/doc/.
+This script lives outside the crates on purpose, so it is not packaged into any of
+them. Re-run it after changing a source image, then commit both the .webp under
+images/docs/ and the regenerated .md under the crate's doc/.
 """
 
 import base64
@@ -20,7 +21,6 @@ from PIL import Image, ImageChops
 ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "images"
 WEBP_DIR = ROOT / "images" / "docs"
-DOC_DIR = ROOT / "rust" / "pixelmap" / "doc"
 
 # Anything above this is too heavy to embed; see the size budget in the README.
 MAX_WEBP_BYTES = 200 * 1024
@@ -29,7 +29,7 @@ FIGURES = [
     {
         "source": "apa_3.png",
         "stem": "apa",
-        "doc": "results.md",
+        "doc": "rust/pixelmap/doc/results.md",
         "width": 1400,
         "alt": (
             "Two photographs of a monkey statue taken from different positions, above "
@@ -44,7 +44,7 @@ FIGURES = [
     {
         "source": "tree_scale.png",
         "stem": "tree_scale",
-        "doc": "quality-scales.md",
+        "doc": "rust/pixelmap/doc/quality-scales.md",
         "width": 900,
         "alt": (
             "The same photo pair solved at several correspondence grid sizes, coarse "
@@ -59,14 +59,14 @@ FIGURES = [
     {
         "source": "model3D.png",
         "stem": "model_3d",
-        "doc": "model-3d.md",
+        "doc": "rust/model_3d/doc/model-3d.md",
         "width": 750,
         "alt": (
             "A shaded 3D surface of a monkey statue reconstructed from a single "
             "correspondence map"
         ),
         "caption": (
-            "The surface [`Model3D`](crate::model_3d::Model3D) recovers from one "
+            "The surface [`Model3D`](crate::Model3D) recovers from one "
             "correspondence map, shaded to show the geometry alone. Each grid point "
             "also carries the texture coordinates it came from."
         ),
@@ -122,7 +122,8 @@ def write_fragment(fig, data):
     #[doc = include_str!(..)] has its code blocks compiled as doctests.
     """
     uri = "data:image/webp;base64," + base64.b64encode(data).decode("ascii")
-    path = DOC_DIR / fig["doc"]
+    path = ROOT / fig["doc"]
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f'<img src="{uri}"\n'
         f'     alt="{fig["alt"]}"\n'
@@ -135,7 +136,6 @@ def write_fragment(fig, data):
 
 def main():
     WEBP_DIR.mkdir(parents=True, exist_ok=True)
-    DOC_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Encoding figures:")
     encoded = [(fig, encode(fig)) for fig in FIGURES]
@@ -150,7 +150,7 @@ def main():
         if len(data) > MAX_WEBP_BYTES:
             oversized.append((fig["stem"], len(data)))
 
-    print(f"\nTotal embedded in the crate: {total / 1024:.1f} KiB")
+    print(f"\nTotal embedded in the crates: {total / 1024:.1f} KiB")
     for stem, size in oversized:
         print(f"WARNING: {stem}.webp is {size / 1024:.1f} KiB, over the {MAX_WEBP_BYTES / 1024:.0f} KiB budget")
 
