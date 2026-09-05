@@ -121,7 +121,9 @@ impl CircularFeatureDescriptorMatcher {
     /// through every caller; unset, it is [`DEFAULT_MATCH_STRIDE`].
     #[cfg(feature = "bench")]
     fn stride_override() -> Option<usize> {
-        std::env::var("PIXELMAP_MATCH_STRIDE").ok().and_then(|v| v.parse().ok())
+        std::env::var("PIXELMAP_MATCH_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
     }
 
     pub fn match_areas_with_stride(
@@ -132,7 +134,10 @@ impl CircularFeatureDescriptorMatcher {
     ) -> Vec<FeatureMatch> {
         #[cfg(feature = "bench")]
         let stride = Self::stride_override().unwrap_or(stride);
-        let backend = MatcherBackend::KdTree { stride: stride.max(1), parallel: true };
+        let backend = MatcherBackend::KdTree {
+            stride: stride.max(1),
+            parallel: true,
+        };
         self.match_areas_timed(img1, img2, backend).0
     }
 
@@ -181,7 +186,13 @@ impl CircularFeatureDescriptorMatcher {
 
         let t = Stopwatch::start();
         let ans = par_query(infos2.len(), 1, &query_at);
-        (ans, MatchTiming { build: Duration::ZERO, query: t.elapsed() })
+        (
+            ans,
+            MatchTiming {
+                build: Duration::ZERO,
+                query: t.elapsed(),
+            },
+        )
     }
 
     /// Indexes image 1 into a [`crate::kdtree`] and queries every `stride`-th descriptor
@@ -202,10 +213,16 @@ impl CircularFeatureDescriptorMatcher {
         let points = infos1
             .iter()
             .enumerate()
-            .map(|(i, d)| Point { v: d.feature_vector, id: i as u32 })
+            .map(|(i, d)| Point {
+                v: d.feature_vector,
+                id: i as u32,
+            })
             .collect();
-        let tree =
-            if parallel { KdTree::build(points) } else { KdTree::build_serial(points) };
+        let tree = if parallel {
+            KdTree::build(points)
+        } else {
+            KdTree::build_serial(points)
+        };
         let build = t0.elapsed();
 
         // One query, shared by the serial and parallel drivers so they cannot drift.
@@ -219,12 +236,19 @@ impl CircularFeatureDescriptorMatcher {
         let ans = if parallel {
             par_query(infos2.len(), stride, &query_at)
         } else {
-            (0..infos2.len()).step_by(stride).filter_map(query_at).collect()
+            (0..infos2.len())
+                .step_by(stride)
+                .filter_map(query_at)
+                .collect()
         };
-        (ans, MatchTiming { build, query: t1.elapsed() })
+        (
+            ans,
+            MatchTiming {
+                build,
+                query: t1.elapsed(),
+            },
+        )
     }
-
-
 }
 
 /// `par_iter().step_by().filter_map().collect()` preserves source order, so a parallel
@@ -235,7 +259,11 @@ fn par_query<F>(len: usize, stride: usize, query_at: &F) -> Vec<FeatureMatch>
 where
     F: Fn(usize) -> Option<FeatureMatch> + Sync,
 {
-    (0..len).into_par_iter().step_by(stride).filter_map(query_at).collect()
+    (0..len)
+        .into_par_iter()
+        .step_by(stride)
+        .filter_map(query_at)
+        .collect()
 }
 
 #[cfg(not(feature = "parallel"))]

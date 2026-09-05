@@ -88,7 +88,11 @@ fn rss_bytes() -> i64 {
     let Ok(s) = std::fs::read_to_string("/proc/self/statm") else {
         return 0;
     };
-    let pages: i64 = s.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let pages: i64 = s
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     pages * 4096
 }
 
@@ -117,9 +121,8 @@ fn score(
 ) -> (f64, f64, f64, f64, f64, f64, f64) {
     // The grid is filled row-major (`out[x + y * w]`), so a centre maps straight back to
     // the descriptor that produced it.
-    let descriptor_at = |x: u16, y: u16| -> &CircularFeatureDescriptor {
-        &infos1[x as usize + y as usize * width]
-    };
+    let descriptor_at =
+        |x: u16, y: u16| -> &CircularFeatureDescriptor { &infos1[x as usize + y as usize * width] };
 
     let mut same_point = 0usize;
     let mut same_distance = 0usize;
@@ -164,7 +167,10 @@ fn score(
         ratios.iter().sum::<f64>() / ratios.len() as f64
     };
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99 = ratios.get((ratios.len() as f64 * 0.99) as usize).copied().unwrap_or(1.0);
+    let p99 = ratios
+        .get((ratios.len() as f64 * 0.99) as usize)
+        .copied()
+        .unwrap_or(1.0);
     let max = ratios.last().copied().unwrap_or(1.0);
 
     (
@@ -182,8 +188,8 @@ fn score(
 /// report per backend. The first entry is always the exact baseline.
 pub fn run(photo1: &Photo, photo2: &Photo, width: usize) -> Vec<BackendReport> {
     let width = usize::min(width, photo1.width);
-    let p1 = photo1.get_scaled_proportional(width);
-    let p2 = photo2.get_scaled_proportional(width);
+    let p1 = photo1.scaled_to_width(width);
+    let p2 = photo2.scaled_to_width(width);
 
     println!(
         "grid {}x{} = {} descriptors per image ({} threads)",
@@ -202,15 +208,20 @@ pub fn run(photo1: &Photo, photo2: &Photo, width: usize) -> Vec<BackendReport> {
 
     let matcher = CircularFeatureDescriptorMatcher::new();
 
-    let mut backends: Vec<(String, MatcherBackend, usize)> = vec![
-        ("brute force (ground truth)".into(), MatcherBackend::BruteForce, 1),
-    ];
+    let mut backends: Vec<(String, MatcherBackend, usize)> = vec![(
+        "brute force (ground truth)".into(),
+        MatcherBackend::BruteForce,
+        1,
+    )];
     // Serial is the configuration a wasm build actually runs, so it is measured first
     // and on equal terms; the parallel rows only exist where threads are available.
     for stride in [1usize, 2, 4, 8, 16] {
         backends.push((
             format!("kdtree serial stride{stride}"),
-            MatcherBackend::KdTree { stride, parallel: false },
+            MatcherBackend::KdTree {
+                stride,
+                parallel: false,
+            },
             stride,
         ));
     }
@@ -218,7 +229,10 @@ pub fn run(photo1: &Photo, photo2: &Photo, width: usize) -> Vec<BackendReport> {
         for stride in [1usize, 2, 4, 8, 16] {
             backends.push((
                 format!("kdtree parallel stride{stride}"),
-                MatcherBackend::KdTree { stride, parallel: true },
+                MatcherBackend::KdTree {
+                    stride,
+                    parallel: true,
+                },
                 stride,
             ));
         }

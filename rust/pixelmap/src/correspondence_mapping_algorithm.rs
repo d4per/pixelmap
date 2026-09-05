@@ -77,8 +77,8 @@ impl CorrespondenceMappingAlgorithm {
         seed: u64,
     ) -> Self {
         // Scale the original photos to the specified width.
-        let photo1a = Arc::new(photo1.get_scaled_proportional(photo_width));
-        let photo2a = Arc::new(photo2.get_scaled_proportional(photo_width));
+        let photo1a = Arc::new(photo1.scaled_to_width(photo_width));
+        let photo2a = Arc::new(photo2.scaled_to_width(photo_width));
         Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius, seed)
     }
 
@@ -104,7 +104,7 @@ impl CorrespondenceMappingAlgorithm {
             scorer: CorrespondenceScoring::new(
                 photo1a.clone(),
                 photo2a.clone(),
-                neighborhood_radius as isize
+                neighborhood_radius as isize,
             ),
             ac_grid: ACGrid::new(grid_width, grid_height),
             rng: Rng::seed_from_u64(seed),
@@ -113,15 +113,9 @@ impl CorrespondenceMappingAlgorithm {
         }
     }
 
-    /// Retrieves a clone of the internal [ACGrid], which stores the best-known transforms
-    /// for each cell.
-    pub fn get_ac_grid(&self) -> ACGrid {
-        self.ac_grid.clone()
-    }
-
     /// Returns the total number of scoring function invocations
     /// performed so far (for diagnostic or debugging purposes).
-    pub fn get_total_comparisons(&self) -> usize {
+    pub fn total_comparisons(&self) -> usize {
         self.scorer.get_num_comparisons()
     }
 
@@ -232,7 +226,7 @@ impl CorrespondenceMappingAlgorithm {
         // Snap transform to the nearest grid cell.
         let snap_to_grid_cm = cm.extrapolate_mapping(
             (x1 as usize / self.grid_cell_size * self.grid_cell_size) as u16,
-            (y1 as usize / self.grid_cell_size * self.grid_cell_size) as u16
+            (y1 as usize / self.grid_cell_size * self.grid_cell_size) as u16,
         );
         self.queue.push(snap_to_grid_cm);
     }
@@ -243,24 +237,22 @@ impl CorrespondenceMappingAlgorithm {
     /// # Parameters
     /// - `pm`: A [`DensePhotoMap`] containing approximate mappings from `photo1` to `photo2`.
     pub fn init_from_photomapping(&mut self, pm: &DensePhotoMap) {
-        let pm_grid_cell_size = pm.get_grid_cell_size();
+        let pm_grid_cell_size = pm.grid_cell_size();
 
         // For each cell in the DensePhotoMap, create an AffineTransform
         // and push it into the queue for refinement.
-        for y in 0 .. pm.grid_height {
-            for x in 0 .. pm.grid_width {
-                let (x2a, y2a) = pm.get_grid_coordinates(x, y);
+        for y in 0..pm.grid_height {
+            for x in 0..pm.grid_width {
+                let (x2a, y2a) = pm.grid_coordinates(x, y);
                 if x2a.is_nan() {
                     continue;
                 }
                 // Compute the origin in the scaled photo1.
                 let x1 = f32::round(
-                    ((x * pm_grid_cell_size * self.photo1.width) as f32)
-                        / pm.photo1.width as f32
+                    ((x * pm_grid_cell_size * self.photo1.width) as f32) / pm.photo1.width as f32,
                 ) as usize;
                 let y1 = f32::round(
-                    ((y * pm_grid_cell_size * self.photo1.width) as f32)
-                        / pm.photo1.width as f32
+                    ((y * pm_grid_cell_size * self.photo1.width) as f32) / pm.photo1.width as f32,
                 ) as usize;
 
                 // Compute the mapped position in scaled photo2.
@@ -280,14 +272,14 @@ impl CorrespondenceMappingAlgorithm {
 
                 // Approximate local scaling from neighbors (left/up).
                 if x > 0 {
-                    let (left_x, left_y) = pm.get_grid_coordinates(x - 1, y);
+                    let (left_x, left_y) = pm.grid_coordinates(x - 1, y);
                     if !left_x.is_nan() {
                         cm.a11 = (x2a - left_x) / pm_grid_cell_size as f32;
                         cm.a21 = (y2a - left_y) / pm_grid_cell_size as f32;
                     }
                 }
                 if y > 0 {
-                    let (up_x, up_y) = pm.get_grid_coordinates(x, y - 1);
+                    let (up_x, up_y) = pm.grid_coordinates(x, y - 1);
                     if !up_x.is_nan() {
                         cm.a22 = (y2a - up_y) / pm_grid_cell_size as f32;
                         cm.a12 = (x2a - up_x) / pm_grid_cell_size as f32;
@@ -295,17 +287,16 @@ impl CorrespondenceMappingAlgorithm {
                 }
 
                 // Snap the transform to the nearest grid coordinates.
-                let snap_to_grid_x = f32::round(x1 as f32 / self.grid_cell_size as f32) as usize * self.grid_cell_size;
-                let snap_to_grid_y = f32::round(y1 as f32 / self.grid_cell_size as f32) as usize * self.grid_cell_size;
-                let snap_to_grid_cm = cm.extrapolate_mapping(
-                    snap_to_grid_x as u16,
-                    snap_to_grid_y as u16
-                );
+                let snap_to_grid_x = f32::round(x1 as f32 / self.grid_cell_size as f32) as usize
+                    * self.grid_cell_size;
+                let snap_to_grid_y = f32::round(y1 as f32 / self.grid_cell_size as f32) as usize
+                    * self.grid_cell_size;
+                let snap_to_grid_cm =
+                    cm.extrapolate_mapping(snap_to_grid_x as u16, snap_to_grid_y as u16);
                 self.queue.push(snap_to_grid_cm);
             }
         }
     }
-
 
     /// Processes the current queue of transforms. For each transform:
     /// 1. Validates its scale and position (no out-of-bounds).
@@ -362,28 +353,28 @@ impl CorrespondenceMappingAlgorithm {
                 // transform raises the matched area from 0.384 to 0.408 for about 14%
                 // more time, the extra time being spent converging to the larger result.
                 if grid_x > 0 {
-                    out_queue.push(
-                        cm_out.extrapolate_mapping(((grid_x - 1) * self.grid_cell_size) as u16,
-                                                   (grid_y * self.grid_cell_size) as u16)
-                    );
+                    out_queue.push(cm_out.extrapolate_mapping(
+                        ((grid_x - 1) * self.grid_cell_size) as u16,
+                        (grid_y * self.grid_cell_size) as u16,
+                    ));
                 }
                 if grid_x < ac_grid.get_grid_width() - 1 {
-                    out_queue.push(
-                        cm_out.extrapolate_mapping(((grid_x + 1) * self.grid_cell_size) as u16,
-                                                   (grid_y * self.grid_cell_size) as u16)
-                    );
+                    out_queue.push(cm_out.extrapolate_mapping(
+                        ((grid_x + 1) * self.grid_cell_size) as u16,
+                        (grid_y * self.grid_cell_size) as u16,
+                    ));
                 }
                 if grid_y > 0 {
-                    out_queue.push(
-                        cm_out.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
-                                                   ((grid_y - 1) * self.grid_cell_size) as u16)
-                    );
+                    out_queue.push(cm_out.extrapolate_mapping(
+                        (grid_x * self.grid_cell_size) as u16,
+                        ((grid_y - 1) * self.grid_cell_size) as u16,
+                    ));
                 }
                 if grid_y < ac_grid.get_grid_height() - 1 {
-                    out_queue.push(
-                        cm_out.extrapolate_mapping((grid_x * self.grid_cell_size) as u16,
-                                                   ((grid_y + 1) * self.grid_cell_size) as u16)
-                    );
+                    out_queue.push(cm_out.extrapolate_mapping(
+                        (grid_x * self.grid_cell_size) as u16,
+                        ((grid_y + 1) * self.grid_cell_size) as u16,
+                    ));
                 }
             }
         }
@@ -393,7 +384,6 @@ impl CorrespondenceMappingAlgorithm {
         // If it's empty, the algorithm is done (no further improvements).
         self.queue.is_empty()
     }
-
 
     /// Performs a simple local search by checking a few neighboring translations
     /// (±1 pixel in x or y) to see if they improve the score.
@@ -429,11 +419,11 @@ impl CorrespondenceMappingAlgorithm {
             self.photo1.clone(),
             self.photo2.clone(),
             ac_grid.get_grid_width(),
-            ac_grid.get_grid_height()
+            ac_grid.get_grid_height(),
         );
 
-        for y in 0 .. ac_grid.get_grid_height() {
-            for x in 0 .. ac_grid.get_grid_width() {
+        for y in 0..ac_grid.get_grid_height() {
+            for x in 0..ac_grid.get_grid_width() {
                 let grid = self.ac_grid.get_grid_square(x, y);
                 // If the cell has a transform, set it in the DensePhotoMap.
                 grid.get_affine_transform().iter().for_each(|cmm| {
@@ -441,7 +431,7 @@ impl CorrespondenceMappingAlgorithm {
                         cmm.origin_x as usize / self.grid_cell_size,
                         cmm.origin_y as usize / self.grid_cell_size,
                         cmm.translate_x,
-                        cmm.translate_y
+                        cmm.translate_y,
                     );
                 });
             }

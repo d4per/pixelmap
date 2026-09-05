@@ -20,7 +20,7 @@
 //! let mut processor = PixelMapProcessor::new(photo1, photo2, mode.photo_width());
 //! processor.init();
 //! mode.run(&mut processor);
-//! let (map1, map2) = processor.get_result(2.0);
+//! let (map1, map2) = processor.finish(2.0);
 //! ```
 
 use std::fmt;
@@ -128,8 +128,11 @@ pub enum ProcessingMode {
 
 impl ProcessingMode {
     /// All modes, in increasing order of processing time.
-    pub const ALL: [ProcessingMode; 3] =
-        [ProcessingMode::Low, ProcessingMode::Medium, ProcessingMode::High];
+    pub const ALL: [ProcessingMode; 3] = [
+        ProcessingMode::Low,
+        ProcessingMode::Medium,
+        ProcessingMode::High,
+    ];
 
     /// The lowercase name of this mode, as accepted on the command line.
     pub fn name(&self) -> &'static str {
@@ -178,15 +181,46 @@ impl ProcessingMode {
     }
 }
 
+/// The string handed to [`ProcessingMode::from_str`] did not name a mode.
+///
+/// A distinct type rather than a `String`, so that a caller can match on the failure and
+/// so that the impl satisfies [`std::error::Error`] like the rest of the crate's errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseProcessingModeError {
+    /// The input that could not be parsed.
+    input: String,
+}
+
+impl ParseProcessingModeError {
+    /// The string that was not a mode name.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+impl fmt::Display for ParseProcessingModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid processing mode: {}. Use 'low', 'medium', or 'high'.",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for ParseProcessingModeError {}
+
 impl FromStr for ProcessingMode {
-    type Err = String;
+    type Err = ParseProcessingModeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let name = s.trim().to_lowercase();
         ProcessingMode::ALL
             .into_iter()
             .find(|mode| mode.name() == name)
-            .ok_or_else(|| format!("invalid processing mode: {s}. Use 'low', 'medium', or 'high'."))
+            .ok_or_else(|| ParseProcessingModeError {
+                input: s.to_owned(),
+            })
     }
 }
 

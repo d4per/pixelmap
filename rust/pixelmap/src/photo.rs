@@ -59,11 +59,21 @@ impl Photo {
         let expected = width
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(Error::BufferLength { expected: usize::MAX, actual: data.len() })?;
+            .ok_or(Error::BufferLength {
+                expected: usize::MAX,
+                actual: data.len(),
+            })?;
         if data.len() != expected {
-            return Err(Error::BufferLength { expected, actual: data.len() });
+            return Err(Error::BufferLength {
+                expected,
+                actual: data.len(),
+            });
         }
-        Ok(Photo { img_data: data, width, height })
+        Ok(Photo {
+            img_data: data,
+            width,
+            height,
+        })
     }
 
     /// Builds a photo from a tightly packed RGB buffer, 3 bytes per pixel, filling in an
@@ -75,16 +85,26 @@ impl Photo {
         let expected = width
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or(Error::BufferLength { expected: usize::MAX, actual: data.len() })?;
+            .ok_or(Error::BufferLength {
+                expected: usize::MAX,
+                actual: data.len(),
+            })?;
         if data.len() != expected {
-            return Err(Error::BufferLength { expected, actual: data.len() });
+            return Err(Error::BufferLength {
+                expected,
+                actual: data.len(),
+            });
         }
         let mut rgba = Vec::with_capacity(width * height * 4);
         for pixel in data.chunks_exact(3) {
             rgba.extend_from_slice(pixel);
             rgba.push(255);
         }
-        Ok(Photo { img_data: rgba, width, height })
+        Ok(Photo {
+            img_data: rgba,
+            width,
+            height,
+        })
     }
 
     /// The width of the image, in pixels.
@@ -139,9 +159,12 @@ impl Photo {
         Ok(())
     }
 
-    /// Returns the `(R, G, B)` components at the pixel coordinate `(x, y)`.
+    /// Returns the `(R, G, B)` components at the pixel coordinate `(x, y)`, or
+    /// `(0, 0, 255)` — an opaque blue — when `(x, y)` is out of bounds.
     ///
-    /// If `(x, y)` is out of bounds, this method returns `(0, 0, 255)`, effectively a blue pixel.
+    /// Crate-internal: the out-of-bounds blue is a sentinel, which is exactly what the
+    /// public API promises not to hand out. Callers outside the crate use
+    /// [`Photo::pixel`], which reports the same condition as `None`.
     ///
     /// # Parameters
     /// - `x`: The x-coordinate of the pixel.
@@ -149,7 +172,7 @@ impl Photo {
     ///
     /// # Returns
     /// A tuple `(r, g, b)` representing the red, green, and blue channels of the pixel.
-    pub fn get_rgb(&self, x: usize, y: usize) -> (u8, u8, u8) {
+    pub(crate) fn get_rgb(&self, x: usize, y: usize) -> (u8, u8, u8) {
         // Rust doesn't allow negative indices, so `x < 0 || y < 0` is redundant, but was in the original code.
         // For clarity, we keep the index checks for completeness.
         if x >= self.width || y >= self.height {
@@ -182,7 +205,7 @@ impl Photo {
     ///
     /// # Panics
     /// Panics if `new_width` is zero, since that would lead to a division by zero.
-    pub fn get_scaled_proportional(&self, new_width: usize) -> Photo {
+    pub fn scaled_to_width(&self, new_width: usize) -> Photo {
         // Check that the new width is not zero to avoid division by zero
         if new_width == 0 {
             panic!("The new width must be greater than 0");
@@ -268,7 +291,11 @@ impl Photo {
 impl From<image::RgbaImage> for Photo {
     fn from(source: image::RgbaImage) -> Photo {
         let (width, height) = (source.width() as usize, source.height() as usize);
-        Photo { img_data: source.into_raw(), width, height }
+        Photo {
+            img_data: source.into_raw(),
+            width,
+            height,
+        }
     }
 }
 

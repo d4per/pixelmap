@@ -73,7 +73,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod correspondence;
 pub mod dense_photo_map;
@@ -108,4 +108,4 @@ pub use dense_photo_map::DensePhotoMap;
 pub use error::{DecodeError, Error};
 pub use photo::{Photo, MIN_DIMENSION};
 pub use pixelmap_processor::{PixelMapProcessor, DEFAULT_SEED};
-pub use processing_mode::{IterationParams, ProcessingMode, Quality};
+pub use processing_mode::{IterationParams, ParseProcessingModeError, ProcessingMode, Quality};

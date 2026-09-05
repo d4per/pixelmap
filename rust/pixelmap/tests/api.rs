@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use pixelmap::{
-    correspond, Correspondence, DensePhotoMap, Error, Photo, Quality, DEFAULT_SEED,
+    correspond, Correspondence, DecodeError, DensePhotoMap, Error, Photo, Quality, DEFAULT_SEED,
 };
 
 /// Deterministic xorshift, so a failure is reproducible.
@@ -32,7 +32,12 @@ fn texture(width: usize, height: usize) -> Vec<[u8; 4]> {
                 + (rng.next_u32() % 70) as f32
                 - 35.0;
             let v = wave.clamp(0.0, 255.0) as u8;
-            pixels.push([v, (v as f32 * 0.7 + 40.0).clamp(0.0, 255.0) as u8, 255 - v, 255]);
+            pixels.push([
+                v,
+                (v as f32 * 0.7 + 40.0).clamp(0.0, 255.0) as u8,
+                255 - v,
+                255,
+            ]);
         }
     }
     pixels
@@ -94,7 +99,11 @@ fn recovers_a_known_translation() {
 
     let sampled = (0..h).step_by(3).len() * (0..w).step_by(3).len();
     let coverage = mapped as f32 / sampled as f32;
-    assert!(coverage > 0.8, "only {:.1}% of the image was mapped", coverage * 100.0);
+    assert!(
+        coverage > 0.8,
+        "only {:.1}% of the image was mapped",
+        coverage * 100.0
+    );
 
     let (mean_dx, mean_dy) = (sum_dx / mapped as f64, sum_dy / mapped as f64);
     assert!(
@@ -116,7 +125,10 @@ fn the_same_seed_reproduces_the_same_mapping() {
     let first = run(a1, b1, 4242).forward().serialize();
     let second = run(a2, b2, 4242).forward().serialize();
 
-    assert_eq!(first, second, "identical inputs and seed produced different mappings");
+    assert_eq!(
+        first, second,
+        "identical inputs and seed produced different mappings"
+    );
 }
 
 /// ...and that the seed is actually load-bearing, so the test above is not passing for
@@ -187,21 +199,148 @@ fn serialization_round_trips() {
         .into_parts()
         .0;
 
-    let restored = DensePhotoMap::deserialize(&map.serialize(), p1, p2);
+    let restored = DensePhotoMap::deserialize(&map.serialize(), p1, p2)
+        .expect("a freshly serialized mapping round trips");
 
-    assert_eq!(restored.grid_width, map.grid_width);
-    assert_eq!(restored.grid_height, map.grid_height);
-    assert_eq!(restored.get_grid_cell_size(), map.get_grid_cell_size());
-    for y in 0..map.grid_height {
-        for x in 0..map.grid_width {
-            let (ax, ay) = map.get_grid_coordinates(x, y);
-            let (bx, by) = restored.get_grid_coordinates(x, y);
+    assert_eq!(restored.grid_dimensions(), map.grid_dimensions());
+    assert_eq!(restored.grid_cell_size(), map.grid_cell_size());
+    let (grid_width, grid_height) = map.grid_dimensions();
+    for y in 0..grid_height {
+        for x in 0..grid_width {
+            let (ax, ay) = map.grid_coordinates(x, y);
+            let (bx, by) = restored.grid_coordinates(x, y);
             assert_eq!(ax.is_nan(), bx.is_nan(), "validity differs at ({x}, {y})");
             if !ax.is_nan() {
                 assert_eq!((ax, ay), (bx, by), "coordinates differ at ({x}, {y})");
             }
         }
     }
+}
+
+/// A small hand-built mapping, cheap enough to serialize in every decoder test below.
+fn tiny_map() -> DensePhotoMap {
+    let photo = Arc::new(Photo::from_rgba(64, 48, vec![0; 64 * 48 * 4]).unwrap());
+    let mut map = DensePhotoMap::new(photo.clone(), photo, 5, 4);
+    map.set_grid_coordinates(1, 1, 12.0, 34.0);
+    map
+}
+
+fn photos() -> (Arc<Photo>, Arc<Photo>) {
+    let photo = Arc::new(Photo::from_rgba(64, 48, vec![0; 64 * 48 * 4]).unwrap());
+    (photo.clone(), photo)
+}
+
+fn decode(bytes: &[u8]) -> Result<DensePhotoMap, Error> {
+    let (p1, p2) = photos();
+    DensePhotoMap::deserialize(bytes, p1, p2)
+}
+
+/// The error from decoding `bytes`, which every test here expects there to be.
+fn decode_err(bytes: &[u8]) -> Error {
+    decode(bytes).expect_err("expected a decode error")
+}
+
+/// The serialized bytes must be self-describing: anything that is not a mapping written
+/// by this crate has to be rejected before it is read as a grid dimension.
+#[test]
+fn decoding_rejects_data_that_is_not_a_mapping() {
+    assert_eq!(decode_err(b""), Error::Decode(DecodeError::NotAMapping));
+    assert_eq!(decode_err(b"PX"), Error::Decode(DecodeError::NotAMapping));
+    assert_eq!(
+        decode_err(b"not a mapping at all, but long enough to hold a header"),
+        Error::Decode(DecodeError::NotAMapping)
+    );
+
+    // The old headerless format, which began directly with the grid width.
+    let mut headerless = Vec::new();
+    headerless.extend_from_slice(&5u64.to_le_bytes());
+    headerless.extend_from_slice(&4u64.to_le_bytes());
+    headerless.extend_from_slice(&16u64.to_le_bytes());
+    assert_eq!(
+        decode_err(&headerless),
+        Error::Decode(DecodeError::NotAMapping)
+    );
+}
+
+/// A future version of the format must be refused by name, not misread as this one.
+#[test]
+fn decoding_rejects_an_unsupported_version() {
+    let mut bytes = tiny_map().serialize();
+    bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+
+    assert_eq!(
+        decode_err(&bytes),
+        Error::Decode(DecodeError::UnsupportedVersion {
+            found: 99,
+            supported: 1,
+        })
+    );
+}
+
+/// Every truncation of a valid encoding must come back as an error. This is the property
+/// `DecodeError`'s documentation promises: no input, however malformed, can panic.
+#[test]
+fn decoding_never_panics_on_a_truncated_mapping() {
+    let bytes = tiny_map().serialize();
+
+    for len in 0..bytes.len() {
+        let err = decode(&bytes[..len]).expect_err("a truncated mapping is not decodable");
+        assert!(
+            matches!(
+                err,
+                Error::Decode(DecodeError::NotAMapping | DecodeError::Truncated { .. })
+            ),
+            "truncating to {len} bytes gave {err}"
+        );
+    }
+
+    // Whole and untruncated, it still decodes.
+    assert!(decode(&bytes).is_ok());
+}
+
+/// Trailing bytes mean the payload does not match the header that describes it, which is
+/// a corrupt stream rather than a mapping with something appended.
+#[test]
+fn decoding_rejects_a_payload_that_does_not_match_the_header() {
+    let mut bytes = tiny_map().serialize();
+    bytes.push(0);
+
+    assert!(matches!(
+        decode_err(&bytes),
+        Error::Decode(DecodeError::InvalidHeader { .. })
+    ));
+}
+
+/// A header can be complete and still describe a grid that cannot exist. Those dimensions
+/// are used for indexing, so they are validated before anything is allocated from them.
+#[test]
+fn decoding_rejects_impossible_grid_dimensions() {
+    let with_dimensions = |width: u64, height: u64| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PXMP");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes
+    };
+
+    for (width, height) in [(0, 4), (1, 4), (5, 0)] {
+        assert!(
+            matches!(
+                decode_err(&with_dimensions(width, height)),
+                Error::Decode(DecodeError::InvalidHeader { .. })
+            ),
+            "a {width}x{height} grid was accepted"
+        );
+    }
+
+    // A grid whose cell count overflows must be rejected on the header alone, without
+    // trying to allocate for it.
+    assert!(matches!(
+        decode_err(&with_dimensions(u64::MAX, u64::MAX)),
+        Error::Decode(DecodeError::InvalidHeader { .. })
+    ));
 }
 
 /// Reading past the right edge of the grid must report "no mapping", not the first cell
@@ -215,12 +354,16 @@ fn the_right_edge_does_not_wrap_onto_the_next_row() {
     // A distinctive value in the first cell of row 1 — the cell a wrapped read lands on.
     map.set_grid_coordinates(0, 1, 1234.0, 5678.0);
 
-    let (x, y) = map.get_grid_coordinates(map.grid_width, 0);
-    assert!(x.is_nan() && y.is_nan(), "reading past the right edge returned ({x}, {y})");
+    let (grid_width, _) = map.grid_dimensions();
+    let (x, y) = map.grid_coordinates(grid_width, 0);
+    assert!(
+        x.is_nan() && y.is_nan(),
+        "reading past the right edge returned ({x}, {y})"
+    );
 
     // Out-of-range writes are dropped rather than corrupting a wrapped cell.
-    map.set_grid_coordinates(map.grid_width, 0, -1.0, -1.0);
-    assert_eq!(map.get_grid_coordinates(0, 1), (1234.0, 5678.0));
+    map.set_grid_coordinates(grid_width, 0, -1.0, -1.0);
+    assert_eq!(map.grid_coordinates(0, 1), (1234.0, 5678.0));
 }
 
 /// Bad input is reported, not panicked on. These are the paths a caller is most likely to
@@ -232,26 +375,38 @@ fn invalid_input_is_reported_as_an_error() {
     // A buffer that does not match the dimensions it claims.
     assert_eq!(
         Photo::from_rgba(4, 4, vec![0; 10]),
-        Err(Error::BufferLength { expected: 64, actual: 10 })
+        Err(Error::BufferLength {
+            expected: 64,
+            actual: 10
+        })
     );
 
     // Photos of different sizes have no common grid to map over.
     let (other, _) = shifted_pair(80, 64, 2, 2);
     assert_eq!(
         correspond(good.clone(), other).unwrap_err(),
-        Error::SizeMismatch { first: (64, 64), second: (80, 64) }
+        Error::SizeMismatch {
+            first: (64, 64),
+            second: (80, 64)
+        }
     );
 
     // Too small for the feature detector's sampling disc.
     let tiny = Photo::from_rgba(8, 8, vec![0; 8 * 8 * 4]).unwrap();
     assert_eq!(
         correspond(tiny.clone(), tiny).unwrap_err(),
-        Error::PhotoTooSmall { dimensions: (8, 8), minimum: pixelmap::MIN_DIMENSION }
+        Error::PhotoTooSmall {
+            dimensions: (8, 8),
+            minimum: pixelmap::MIN_DIMENSION
+        }
     );
 
     // A photo with no pixels at all.
     let empty = Photo::from_rgba(0, 0, Vec::new()).unwrap();
-    assert_eq!(correspond(empty.clone(), empty).unwrap_err(), Error::EmptyPhoto);
+    assert_eq!(
+        correspond(empty.clone(), empty).unwrap_err(),
+        Error::EmptyPhoto
+    );
 
     // Errors are worth printing.
     assert!(!Error::EmptyPhoto.to_string().is_empty());
@@ -263,7 +418,11 @@ fn rgb_input_gains_an_opaque_alpha_channel() {
     let photo = Photo::from_rgb(2, 1, &[1, 2, 3, 4, 5, 6]).unwrap();
     assert_eq!(photo.as_rgba(), &[1, 2, 3, 255, 4, 5, 6, 255]);
     assert_eq!(photo.pixel(1, 0), Some([4, 5, 6, 255]));
-    assert_eq!(photo.pixel(2, 0), None, "out-of-bounds reads are None, not a sentinel");
+    assert_eq!(
+        photo.pixel(2, 0),
+        None,
+        "out-of-bounds reads are None, not a sentinel"
+    );
     assert!(Photo::from_rgb(2, 1, &[1, 2, 3]).is_err());
 }
 
@@ -273,7 +432,10 @@ fn rgb_input_gains_an_opaque_alpha_channel() {
 fn small_photos_do_not_panic_when_the_schedule_upscales_them() {
     let (photo1, photo2) = shifted_pair(64, 48, 3, 2);
     let mapping = correspond(photo1, photo2).expect("small photos are still valid input");
-    assert!(mapping.working_scale() > 1.0, "this case should be an upscale");
+    assert!(
+        mapping.working_scale() > 1.0,
+        "this case should be an upscale"
+    );
 }
 
 /// The progress callback fires once per schedule step, and reaches 1.0.
@@ -282,11 +444,24 @@ fn progress_is_reported_for_every_step() {
     let (photo1, photo2) = shifted_pair(64, 48, 3, 2);
     let mut seen = Vec::new();
     Correspondence::builder()
-        .run_with_progress(photo1, photo2, |p| seen.push((p.step, p.total, p.fraction())))
+        .run_with_progress(photo1, photo2, |p| {
+            seen.push((p.step, p.total, p.fraction()))
+        })
         .unwrap();
 
-    assert_eq!(seen.len(), seen[0].1, "expected one callback per reported step");
+    assert_eq!(
+        seen.len(),
+        seen[0].1,
+        "expected one callback per reported step"
+    );
     assert_eq!(seen.first().unwrap().0, 1);
-    assert_eq!(seen.last().unwrap().2, 1.0, "the last callback should report completion");
-    assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "steps must increase");
+    assert_eq!(
+        seen.last().unwrap().2,
+        1.0,
+        "the last callback should report completion"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 < w[1].0),
+        "steps must increase"
+    );
 }

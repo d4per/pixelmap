@@ -1,7 +1,18 @@
 //! The dense correspondence grid produced by a run, and the operations over it.
 
+use crate::error::{DecodeError, Error};
 use crate::photo::Photo;
 use std::sync::Arc;
+
+/// Marks a byte stream as a serialized mapping, so that arbitrary data is rejected
+/// before any of it is interpreted as a grid dimension.
+const MAGIC: &[u8; 4] = b"PXMP";
+
+/// The encoding this build writes and is willing to read.
+const FORMAT_VERSION: u16 = 1;
+
+/// Magic, version, then `grid_width`, `grid_height` and `grid_cell_size` as `u64`s.
+const HEADER_LEN: usize = MAGIC.len() + 2 + 3 * 8;
 
 /// Represents a dense 2D mapping between two photos (`photo1` and `photo2`).
 ///
@@ -9,19 +20,25 @@ use std::sync::Arc;
 /// containing two floats describing how a point in `photo1` maps into coordinates
 /// for `photo2`. This allows tasks like warp transformations, morphing, or alignment
 /// between two images.
+///
+/// The fields are not public. `map_data.len() == grid_width * grid_height * 2` is an
+/// invariant every read relies on, so letting a caller assign a new `grid_width` would
+/// turn later lookups into out-of-bounds panics. Read them through
+/// [`Self::grid_dimensions`], [`Self::grid_cell_size`], [`Self::photo1`] and
+/// [`Self::photo2`] instead.
 #[derive(Clone)]
 pub struct DensePhotoMap {
     /// Reference-counted handle to the first photo.
-    pub photo1: Arc<Photo>,
+    pub(crate) photo1: Arc<Photo>,
 
     /// Reference-counted handle to the second photo.
-    pub photo2: Arc<Photo>,
+    pub(crate) photo2: Arc<Photo>,
 
     /// The number of columns in the mapping grid.
-    pub grid_width: usize,
+    pub(crate) grid_width: usize,
 
     /// The number of rows in the mapping grid.
-    pub grid_height: usize,
+    pub(crate) grid_height: usize,
 
     /// Internal storage for the mapping data, of length `grid_width * grid_height * 2`.
     /// Each cell stores (x2, y2) in consecutive slots. If a cell is empty, it holds `NaN`.
@@ -54,13 +71,18 @@ impl DensePhotoMap {
     /// `grid_cell_size` is calculated from `photo1`’s width and `grid_width`.
     ///
     /// # Panics
-    /// May panic if `grid_width < 2` due to the calculation `photo1.width / (grid_width - 1)`.
+    /// Panics if `grid_width < 2`. The cell size is `photo1.width / (grid_width - 1)`,
+    /// which divides by zero at one column and underflows at none.
     pub fn new(
         photo1: Arc<Photo>,
         photo2: Arc<Photo>,
         grid_width: usize,
         grid_height: usize,
     ) -> Self {
+        assert!(
+            grid_width >= 2,
+            "a mapping grid needs at least 2 columns, got {grid_width}"
+        );
         let grid_cell_size = photo1.width / (grid_width - 1);
         DensePhotoMap {
             photo1,
@@ -73,8 +95,26 @@ impl DensePhotoMap {
     }
 
     /// Returns the pixel size each grid cell covers horizontally in `photo1`.
-    pub fn get_grid_cell_size(&self) -> usize {
+    pub fn grid_cell_size(&self) -> usize {
         self.grid_cell_size
+    }
+
+    /// The size of the mapping grid, as `(columns, rows)`.
+    ///
+    /// This is the resolution of the correspondence field itself, not of the photos; see
+    /// [`Self::dimensions`] for the pixel dimensions the coordinates are expressed in.
+    pub fn grid_dimensions(&self) -> (usize, usize) {
+        (self.grid_width, self.grid_height)
+    }
+
+    /// The photo this mapping maps *from*.
+    pub fn photo1(&self) -> &Arc<Photo> {
+        &self.photo1
+    }
+
+    /// The photo this mapping maps *into*.
+    pub fn photo2(&self) -> &Arc<Photo> {
+        &self.photo2
     }
 
     /// Sets the mapped coordinates `(x2, y2)` in this map at grid location `(x1, y1)`.
@@ -102,10 +142,10 @@ impl DensePhotoMap {
     ///
     /// `x1` is bounds-checked against `grid_width` in its own right, not just through the
     /// flat index: testing only the flat index lets `x1 == grid_width` address the first
-    /// cell of the *next row*. Because [`Self::get_interpolated_point`] reads the corner
+    /// cell of the *next row*. Because [`Self::interpolated_point`] reads the corner
     /// at `x1 + 1`, that made every interpolation along the right edge silently blend
     /// with the far side of the image.
-    pub fn get_grid_coordinates(&self, x1: usize, y1: usize) -> (f32, f32) {
+    pub fn grid_coordinates(&self, x1: usize, y1: usize) -> (f32, f32) {
         if x1 >= self.grid_width || y1 >= self.grid_height {
             return (f32::NAN, f32::NAN);
         }
@@ -124,9 +164,9 @@ impl DensePhotoMap {
     /// If any of the involved cells contain `NaN`, or the interpolation is invalid,
     /// returns `(NaN, NaN)`.
     pub fn map_photo_pixel(&self, x1: f32, y1: f32) -> (f32, f32) {
-        self.get_interpolated_point(
+        self.interpolated_point(
             x1 / self.grid_cell_size as f32,
-            y1 / self.grid_cell_size as f32
+            y1 / self.grid_cell_size as f32,
         )
     }
 
@@ -135,17 +175,17 @@ impl DensePhotoMap {
     ///
     /// Valid only if all four corner cells are set (non-NaN) and pass distance checks.
     /// Returns `(NaN, NaN)` if interpolation fails or data is missing.
-    pub fn get_interpolated_point(&self, xin: f32, yin: f32) -> (f32, f32) {
+    pub fn interpolated_point(&self, xin: f32, yin: f32) -> (f32, f32) {
         let xxx = xin as usize;
         let yyy = yin as usize;
         let xr = xin - xxx as f32;
         let yr = yin - yyy as f32;
 
         // Get the four corner mappings.
-        let (x1, y1) = self.get_grid_coordinates(xxx, yyy);
-        let (x2, y2) = self.get_grid_coordinates(xxx + 1, yyy);
-        let (x3, y3) = self.get_grid_coordinates(xxx + 1, yyy + 1);
-        let (x4, y4) = self.get_grid_coordinates(xxx, yyy + 1);
+        let (x1, y1) = self.grid_coordinates(xxx, yyy);
+        let (x2, y2) = self.grid_coordinates(xxx + 1, yyy);
+        let (x3, y3) = self.grid_coordinates(xxx + 1, yyy + 1);
+        let (x4, y4) = self.grid_coordinates(xxx, yyy + 1);
 
         // If any corner is NaN, we cannot interpolate.
         if x1.is_nan() || x2.is_nan() || x3.is_nan() || x4.is_nan() {
@@ -213,8 +253,10 @@ impl DensePhotoMap {
         for y in 0..self.grid_height {
             for x in 0..self.grid_width {
                 // Map forward
-                let mapped = self.map_photo_pixel((x * self.grid_cell_size) as f32,
-                                                  (y * self.grid_cell_size) as f32);
+                let mapped = self.map_photo_pixel(
+                    (x * self.grid_cell_size) as f32,
+                    (y * self.grid_cell_size) as f32,
+                );
                 if mapped.0.is_nan() {
                     // Already invalid; set again to be sure
                     self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
@@ -243,7 +285,7 @@ impl DensePhotoMap {
         let mut count = 0usize;
         for y in 0..self.grid_height {
             for x in 0..self.grid_width {
-                let mapped = self.get_grid_coordinates(x, y);
+                let mapped = self.grid_coordinates(x, y);
                 if !mapped.0.is_nan() {
                     count += 1;
                 }
@@ -341,10 +383,10 @@ impl DensePhotoMap {
         // Only average interior cells (1..width-1, 1..height-1).
         for y in 1..self.grid_height - 1 {
             for x in 1..self.grid_width - 1 {
-                let a1 = self.get_grid_coordinates(x - 1, y);
-                let a2 = self.get_grid_coordinates(x + 1, y);
-                let b1 = self.get_grid_coordinates(x, y - 1);
-                let b2 = self.get_grid_coordinates(x, y + 1);
+                let a1 = self.grid_coordinates(x - 1, y);
+                let a2 = self.grid_coordinates(x + 1, y);
+                let b1 = self.grid_coordinates(x, y - 1);
+                let b2 = self.grid_coordinates(x, y + 1);
 
                 let center_x = (a1.0 + a2.0 + b1.0 + b2.0) / 4.0;
                 let center_y = (a1.1 + a2.1 + b1.1 + b2.1) / 4.0;
@@ -378,55 +420,17 @@ impl DensePhotoMap {
         result
     }
 
-    /// Deserializes the `DensePhotoMap` from a byte slice.
+    /// Serializes the mapping to a byte vector, excluding the photos.
     ///
-    /// # Parameters
-    ///
-    /// * `data`: The byte slice to deserialize from.
-    /// * `photo1`: The first photo.
-    /// * `photo2`: The second photo.
-    ///
-    /// # Returns
-    ///
-    /// A new `DensePhotoMap` instance.
-    pub fn deserialize(data: &[u8], photo1: Arc<Photo>, photo2: Arc<Photo>) -> Self {
-        let mut offset = 0;
-
-        let grid_width = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
-        offset += 8;
-
-        let grid_height = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
-        offset += 8;
-
-        let grid_cell_size =
-            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
-        offset += 8;
-
-        let map_data_len = (data.len() - offset) / 4;
-        let mut map_data = Vec::with_capacity(map_data_len);
-        for i in 0..map_data_len {
-            let start = offset + i * 4;
-            let end = start + 4;
-            map_data.push(f32::from_le_bytes(data[start..end].try_into().unwrap()));
-        }
-
-        Self {
-            photo1,
-            photo2,
-            grid_width,
-            grid_height,
-            map_data,
-            grid_cell_size,
-        }
-    }
-
-    /// Serializes the `DensePhotoMap` to a byte vector, excluding the photos.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<u8>` containing the serialized data.
+    /// The encoding is a header — the magic number `PXMP`, a `u16` format version, and
+    /// the grid dimensions and cell size as `u64`s — followed by the grid itself as
+    /// little-endian `f32` pairs. Empty cells are stored as `NaN`, exactly as they are
+    /// held in memory. Read it back with [`DensePhotoMap::deserialize`], which pairs it
+    /// with the two photos again.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(HEADER_LEN + self.map_data.len() * 4);
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&(self.grid_width as u64).to_le_bytes());
         data.extend_from_slice(&(self.grid_height as u64).to_le_bytes());
         data.extend_from_slice(&(self.grid_cell_size as u64).to_le_bytes());
@@ -434,5 +438,119 @@ impl DensePhotoMap {
             data.extend_from_slice(&val.to_le_bytes());
         }
         data
+    }
+
+    /// Reads back a mapping written by [`DensePhotoMap::serialize`], pairing it with the
+    /// photos it describes.
+    ///
+    /// The two photos are not part of the encoding, so the caller supplies them; nothing
+    /// checks that they are the ones the mapping was computed from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Decode`] if `data` is not a mapping this build can read. The
+    /// bytes may have come from a file or off a network, so every field is validated
+    /// before it is used: no input, however malformed, makes this function panic.
+    pub fn deserialize(data: &[u8], photo1: Arc<Photo>, photo2: Arc<Photo>) -> Result<Self, Error> {
+        if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
+            return Err(DecodeError::NotAMapping.into());
+        }
+
+        // Every read below goes through `get`, so a truncated input is an error rather
+        // than a slice index panic.
+        let version = data
+            .get(MAGIC.len()..MAGIC.len() + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or(DecodeError::Truncated {
+                expected: HEADER_LEN,
+                actual: data.len(),
+            })?;
+        if version != FORMAT_VERSION {
+            return Err(DecodeError::UnsupportedVersion {
+                found: version,
+                supported: FORMAT_VERSION,
+            }
+            .into());
+        }
+
+        let header = data
+            .get(MAGIC.len() + 2..HEADER_LEN)
+            .ok_or(DecodeError::Truncated {
+                expected: HEADER_LEN,
+                actual: data.len(),
+            })?;
+        let field = |i: usize| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&header[i * 8..i * 8 + 8]);
+            u64::from_le_bytes(bytes)
+        };
+        // A grid dimension wider than `usize` cannot be indexed on this target, whatever
+        // the writer's word size was.
+        let as_usize =
+            |v: u64, reason| usize::try_from(v).map_err(|_| DecodeError::InvalidHeader { reason });
+        let grid_width = as_usize(field(0), "grid width does not fit in a usize")?;
+        let grid_height = as_usize(field(1), "grid height does not fit in a usize")?;
+        let grid_cell_size = as_usize(field(2), "grid cell size does not fit in a usize")?;
+
+        // `new` derives the cell size from `grid_width - 1`, so a grid narrower than two
+        // columns is not something this type can represent.
+        if grid_width < 2 {
+            return Err(DecodeError::InvalidHeader {
+                reason: "grid width must be at least 2",
+            }
+            .into());
+        }
+        if grid_height == 0 {
+            return Err(DecodeError::InvalidHeader {
+                reason: "grid height must be at least 1",
+            }
+            .into());
+        }
+
+        let floats = grid_width
+            .checked_mul(grid_height)
+            .and_then(|cells| cells.checked_mul(2))
+            .ok_or(DecodeError::InvalidHeader {
+                reason: "grid dimensions overflow",
+            })?;
+        let payload_len = floats.checked_mul(4).ok_or(DecodeError::InvalidHeader {
+            reason: "grid dimensions overflow",
+        })?;
+        let expected = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(DecodeError::InvalidHeader {
+                reason: "grid dimensions overflow",
+            })?;
+
+        match data.len().cmp(&expected) {
+            std::cmp::Ordering::Less => {
+                return Err(DecodeError::Truncated {
+                    expected,
+                    actual: data.len(),
+                }
+                .into())
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(DecodeError::InvalidHeader {
+                    reason: "trailing bytes after the declared grid",
+                }
+                .into())
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+
+        let map_data = data[HEADER_LEN..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        Ok(Self {
+            photo1,
+            photo2,
+            grid_width,
+            grid_height,
+            map_data,
+            grid_cell_size,
+        })
     }
 }

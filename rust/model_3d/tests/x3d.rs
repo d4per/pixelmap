@@ -30,7 +30,7 @@ fn photo() -> Arc<Photo> {
 /// out to `NaN` when it is rescaled.
 fn bulging_surface() -> DensePhotoMap {
     let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
-    let cell = map.get_grid_cell_size() as f32;
+    let cell = map.grid_cell_size() as f32;
 
     for y in 0..GRID_HEIGHT {
         for x in 0..GRID_WIDTH {

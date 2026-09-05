@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use crate::affine_transform::AffineTransform;
+use std::cell::Cell;
 
 /// A container for storing an [`AffineTransform`] along with its
 /// associated “best score”. Internally uses [`Cell`], allowing for

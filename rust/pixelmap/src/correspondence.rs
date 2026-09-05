@@ -229,8 +229,10 @@ impl Builder {
             });
         }
 
-        let steps: &[IterationParams] =
-            self.schedule.as_deref().unwrap_or_else(|| self.quality.steps());
+        let steps: &[IterationParams] = self
+            .schedule
+            .as_deref()
+            .unwrap_or_else(|| self.quality.steps());
         // The initial matching pass counts as a step, so the reported total matches the
         // number of callbacks.
         let total = steps.len() + 1;
@@ -242,12 +244,20 @@ impl Builder {
 
         for (index, params) in steps.iter().enumerate() {
             params.apply(&mut processor);
-            on_progress(Progress { step: index + 2, total });
+            on_progress(Progress {
+                step: index + 2,
+                total,
+            });
         }
 
-        let comparisons = processor.get_total_comparisons();
-        let (forward, backward) = processor.get_result(self.final_max_dist);
-        Ok(Correspondence { forward, backward, comparisons, source_size })
+        let comparisons = processor.total_comparisons();
+        let (forward, backward) = processor.finish(self.final_max_dist);
+        Ok(Correspondence {
+            forward,
+            backward,
+            comparisons,
+            source_size,
+        })
     }
 }
 

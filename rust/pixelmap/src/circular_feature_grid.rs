@@ -35,7 +35,7 @@ impl CircularFeatureGrid {
         width: usize,
         height: usize,
         circle_radius: usize,
-        _rotation: bool
+        _rotation: bool,
     ) -> Self {
         let radius = circle_radius as isize;
 
@@ -45,8 +45,7 @@ impl CircularFeatureGrid {
             .map(|dy| (((radius * radius) as f64 - (dy * dy) as f64).sqrt().round()) as isize)
             .collect();
 
-        let mut feature_descriptors =
-            vec![CircularFeatureDescriptor::default(); width * height];
+        let mut feature_descriptors = vec![CircularFeatureDescriptor::default(); width * height];
 
         Self::populate_feature_descriptors(
             &photo.img_data,
@@ -57,7 +56,9 @@ impl CircularFeatureGrid {
             &mut feature_descriptors,
         );
 
-        CircularFeatureGrid { feature_descriptors }
+        CircularFeatureGrid {
+            feature_descriptors,
+        }
     }
 
     /// Returns a reference to the vector of `CircularFeatureDescriptor` objects.
@@ -116,8 +117,7 @@ impl CircularFeatureGrid {
                         acc.add(x + half, py, data, w);
                     }
                 }
-                out[(x + y * w) as usize] =
-                    Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
+                out[(x + y * w) as usize] = Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
             }
             for x in (w - radius)..w {
                 let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
@@ -144,11 +144,7 @@ impl CircularFeatureGrid {
             for dx in -half..=half {
                 let wrapped_x = (center_x + dx + w) % w;
                 let p = ((wrapped_x + row) * 4) as usize;
-                let (r, g, b) = (
-                    data[p] as isize,
-                    data[p + 1] as isize,
-                    data[p + 2] as isize,
-                );
+                let (r, g, b) = (data[p] as isize, data[p + 1] as isize, data[p + 2] as isize);
                 s.add(dx, dy, r, g, b);
             }
         }
@@ -157,7 +153,11 @@ impl CircularFeatureGrid {
 
     /// Turns accumulated disc sums into a `CircularFeatureDescriptor`, computing the
     /// per-channel "centre of mass" and aligning each channel to the combined angle.
-    fn finish_descriptor(center_x: isize, center_y: isize, s: DiscSums) -> CircularFeatureDescriptor {
+    fn finish_descriptor(
+        center_x: isize,
+        center_y: isize,
+        s: DiscSums,
+    ) -> CircularFeatureDescriptor {
         let mut descriptor = CircularFeatureDescriptor::default();
 
         let (sum_red, sum_green, sum_blue) = (s.sum_red, s.sum_green, s.sum_blue);
@@ -177,7 +177,11 @@ impl CircularFeatureGrid {
         let total_cm_y = (s.wy_red + s.wy_green + s.wy_blue) as f32 * ia;
         let total_radius = (total_cm_x * total_cm_x + total_cm_y * total_cm_y).sqrt();
 
-        descriptor.total_angle = if sum_all == 0 { 0.0 } else { total_cm_y.atan2(total_cm_x) };
+        descriptor.total_angle = if sum_all == 0 {
+            0.0
+        } else {
+            total_cm_y.atan2(total_cm_x)
+        };
 
         // Rotating a channel's centre of mass by -total_angle needs no trigonometry:
         // cos(total_angle) and sin(total_angle) are total_cm_x/total_radius and

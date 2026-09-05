@@ -83,11 +83,17 @@ Bad input is reported, never panicked on: `Error::SizeMismatch` when the photos 
 on dimensions, `Error::PhotoTooSmall`, `Error::EmptyPhoto`, and `Error::BufferLength` when
 a pixel buffer does not match the dimensions it claims.
 
+A finished mapping can be written out with `DensePhotoMap::serialize` and read back with
+`DensePhotoMap::deserialize`. The encoding carries a magic number and a version, and the
+decoder validates every field before using it, so bytes off a disc or a network come back
+as `Error::Decode` rather than as a panic.
+
 ## Features
 
 | Feature | Default | Effect |
 |---|:---:|---|
 | `parallel` | ✅ | Multi-threaded feature matching via rayon. Turn it off for `wasm32-unknown-unknown`, which has no threads to hand out; the matcher falls back to a serial search that produces the same result. |
+| `image` | | `From<image::RgbaImage>` and `From<image::DynamicImage>` for `Photo`, for callers that already decode with the [`image`](https://crates.io/crates/image) crate. |
 | `bench` | | Compiles the matcher benchmark harness. Not part of the pipeline. |
 
 The only default dependency is `rayon`, and with `--no-default-features` there are **no
@@ -112,8 +118,7 @@ binary that will not run on older hardware.
 
 ## Minimum supported Rust version
 
-1.80, set by `rayon`. The crate's own source builds on 1.74, which is what
-`--no-default-features` needs. Treated as a breaking change if raised.
+1.80, set by `rayon`, and checked by CI. Treated as a breaking change if raised.
 
 ## License
 

@@ -6,8 +6,8 @@
 //! and can be animated while later ones are still being produced.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use image::open;
@@ -90,14 +90,13 @@ fn produce_morph(request: &MorphRequest, tx: &Sender<ViewerMsg>) -> Result<(), A
     let mut photo1 = read_photo(&request.photo1)?;
     let mut photo2 = read_photo(&request.photo2)?;
 
-
     // Warping happens at the resolution of the input photos, which is wasteful
     // (and memory hungry) far above the width the algorithm works at internally.
     if let Some(max_width) = request.max_width {
         if photo1.width() > max_width {
             println!("Scaling photos down to {max_width} px wide");
-            photo1 = photo1.get_scaled_proportional(max_width);
-            photo2 = photo2.get_scaled_proportional(max_width);
+            photo1 = photo1.scaled_to_width(max_width);
+            photo2 = photo2.scaled_to_width(max_width);
         }
     }
 
@@ -179,7 +178,7 @@ fn produce_files(paths: &[PathBuf], tx: &Sender<ViewerMsg>) -> Result<(), Abort>
 
 fn read_photo(path: &Path) -> Result<Photo, Abort> {
     println!("Reading image file: {}", path.display());
-    let img = open(path)
-        .map_err(|e| Abort::Failed(format!("Could not load {}: {e}", path.display())))?;
+    let img =
+        open(path).map_err(|e| Abort::Failed(format!("Could not load {}: {e}", path.display())))?;
     Ok(Photo::from(img))
 }

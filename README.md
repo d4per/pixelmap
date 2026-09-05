@@ -10,9 +10,23 @@ Explore PIXELMAP in action with our **[Interactive Demo](https://pixelmap.dogduc
 
 
 ## Open source implementation in Rust
-The source code is present in this repository in the [rust](rust) folder. It contains both a
-command line tool that writes the interpolated images to disc, and a viewer that animates
-them in a window.
+
+[![crates.io](https://img.shields.io/crates/v/pixelmap.svg)](https://crates.io/crates/pixelmap)
+[![docs.rs](https://docs.rs/pixelmap/badge.svg)](https://docs.rs/pixelmap)
+
+The algorithm is published as the **[`pixelmap`](https://crates.io/crates/pixelmap)**
+crate — a dependency-light library that takes two photos and returns the dense mapping
+between them ([API docs](https://docs.rs/pixelmap), and
+[rust/pixelmap/README.md](rust/pixelmap/README.md)).
+
+```toml
+[dependencies]
+pixelmap = "0.1"
+```
+
+The rest of the [rust](rust) folder builds on it: a command line tool that writes the
+interpolated images to disc, a viewer that animates them in a window, and
+`pixelmap_model_3d`, which lifts a finished mapping into a textured 3D mesh.
 
 
 ---

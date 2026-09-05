@@ -57,7 +57,10 @@ impl fmt::Display for Error {
                 "photos must have the same dimensions, got {}x{} and {}x{}",
                 first.0, first.1, second.0, second.1
             ),
-            Error::PhotoTooSmall { dimensions, minimum } => write!(
+            Error::PhotoTooSmall {
+                dimensions,
+                minimum,
+            } => write!(
                 f,
                 "photo is {}x{}, but correspondence mapping needs at least {minimum}x{minimum}",
                 dimensions.0, dimensions.1
@@ -121,7 +124,10 @@ impl fmt::Display for DecodeError {
         match self {
             DecodeError::NotAMapping => f.write_str("missing magic number"),
             DecodeError::UnsupportedVersion { found, supported } => {
-                write!(f, "format version {found}, but this build reads version {supported}")
+                write!(
+                    f,
+                    "format version {found}, but this build reads version {supported}"
+                )
             }
             DecodeError::Truncated { expected, actual } => {
                 write!(f, "expected {expected} bytes, found {actual}")

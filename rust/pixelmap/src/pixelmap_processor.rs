@@ -1,6 +1,5 @@
 //! The pipeline driver behind [`crate::Correspondence`].
 
-use crate::ac_grid::ACGrid;
 use crate::circular_feature_descriptor_matcher::CircularFeatureDescriptorMatcher;
 use crate::circular_feature_grid;
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
@@ -100,8 +99,22 @@ impl PixelMapProcessor {
         PixelMapProcessor {
             photo1,
             photo2,
-            ocm_manager1: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5, seed),
-            ocm_manager2: CorrespondenceMappingAlgorithm::new(photo_width, &dummy_photo, &dummy_photo, 5, 5, seed),
+            ocm_manager1: CorrespondenceMappingAlgorithm::new(
+                photo_width,
+                &dummy_photo,
+                &dummy_photo,
+                5,
+                5,
+                seed,
+            ),
+            ocm_manager2: CorrespondenceMappingAlgorithm::new(
+                photo_width,
+                &dummy_photo,
+                &dummy_photo,
+                5,
+                5,
+                seed,
+            ),
             total_comparisons: 0,
             initial_photo_width: photo_width,
             seed,
@@ -127,8 +140,12 @@ impl PixelMapProcessor {
         if let Some(p) = self.scaled.get(&(which, width)) {
             return p.clone();
         }
-        let src = if which == 0 { &self.photo1 } else { &self.photo2 };
-        let p = Arc::new(src.get_scaled_proportional(width));
+        let src = if which == 0 {
+            &self.photo1
+        } else {
+            &self.photo2
+        };
+        let p = Arc::new(src.scaled_to_width(width));
         self.scaled.insert((which, width), p.clone());
         p
     }
@@ -152,13 +169,13 @@ impl PixelMapProcessor {
             &photo1scaled,
             photo1scaled.width,
             photo1scaled.height,
-            10
+            10,
         );
         let image2 = circular_feature_grid::CircularFeatureGrid::new(
             &photo2scaled,
             photo2scaled.width,
             photo2scaled.height,
-            10
+            10,
         );
 
         // Match features across the two scaled images.
@@ -169,7 +186,8 @@ impl PixelMapProcessor {
         let w = photo1scaled.width;
         let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
         let (seed1, seed2) = (self.next_seed(), self.next_seed());
-        let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5, seed1);
+        let mut ocm_manager1 =
+            CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5, seed1);
         let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, 5, seed2);
 
         // Add the initial matched points.
@@ -177,14 +195,10 @@ impl PixelMapProcessor {
             let vv = -m.angle_delta;
 
             // Add forward mapping: (photo1 → photo2)
-            ocm_manager1.add_init_point(
-                m.x1 as f32, m.y1 as f32, m.x2 as f32, m.y2 as f32, vv,
-            );
+            ocm_manager1.add_init_point(m.x1 as f32, m.y1 as f32, m.x2 as f32, m.y2 as f32, vv);
 
             // Add reverse mapping: (photo2 → photo1)
-            ocm_manager2.add_init_point(
-                m.x2 as f32, m.y2 as f32, m.x1 as f32, m.y1 as f32, -vv,
-            );
+            ocm_manager2.add_init_point(m.x2 as f32, m.y2 as f32, m.x1 as f32, m.y1 as f32, -vv);
         }
 
         // Run both managers to completion.
@@ -192,24 +206,15 @@ impl PixelMapProcessor {
         ocm_manager2.run_until_done();
 
         // Update total comparisons, store the managers.
-        self.total_comparisons = ocm_manager1.get_total_comparisons() + ocm_manager2.get_total_comparisons();
+        self.total_comparisons =
+            ocm_manager1.total_comparisons() + ocm_manager2.total_comparisons();
         self.ocm_manager1 = ocm_manager1;
         self.ocm_manager2 = ocm_manager2;
     }
 
     /// Returns the total number of comparisons made so far by the two correspondence managers.
-    pub fn get_total_comparisons(&self) -> usize {
+    pub fn total_comparisons(&self) -> usize {
         self.total_comparisons
-    }
-
-    /// Retrieves a pair of `ACGrid`s from the two correspondence managers
-    /// (forward and backward mappings).
-    ///
-    /// # Returns
-    /// A tuple `(ACGrid, ACGrid)`, where the first corresponds to `ocm_manager1`
-    /// and the second to `ocm_manager2`.
-    pub fn get_ac_grids(&self) -> (ACGrid, ACGrid) {
-        (self.ocm_manager1.get_ac_grid(), self.ocm_manager2.get_ac_grid())
     }
 
     /// Performs an **iteration** of the mapping refinement process:
@@ -233,13 +238,13 @@ impl PixelMapProcessor {
         grid_cell_size: usize,
         neighborhood_radius: usize,
         smooth_iterations: usize,
-        clean_max_dist: f32
+        clean_max_dist: f32,
     ) {
         let mut pm1 = self.ocm_manager1.get_photo_mapping();
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
         // Remove outliers by forward-backward consistency check.
-        
+
         pm1.remove_outliers(&pm2, clean_max_dist);
         pm2.remove_outliers(&pm1, clean_max_dist);
 
@@ -251,9 +256,19 @@ impl PixelMapProcessor {
         let (s1, s2) = (self.scaled(0, photo_width), self.scaled(1, photo_width));
         let (seed1, seed2) = (self.next_seed(), self.next_seed());
         let mut ocm_manager1 = CorrespondenceMappingAlgorithm::with_scaled(
-                s1.clone(), s2.clone(), grid_cell_size, neighborhood_radius, seed1);
+            s1.clone(),
+            s2.clone(),
+            grid_cell_size,
+            neighborhood_radius,
+            seed1,
+        );
         let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(
-                s2, s1, grid_cell_size, neighborhood_radius, seed2);
+            s2,
+            s1,
+            grid_cell_size,
+            neighborhood_radius,
+            seed2,
+        );
         ocm_manager1.init_from_photomapping(&pm1_smooth);
         ocm_manager2.init_from_photomapping(&pm2_smooth);
 
@@ -263,7 +278,7 @@ impl PixelMapProcessor {
 
         // Accumulate total comparisons.
         self.total_comparisons +=
-            ocm_manager1.get_total_comparisons() + ocm_manager2.get_total_comparisons();
+            ocm_manager1.total_comparisons() + ocm_manager2.total_comparisons();
 
         // Store the new managers.
         self.ocm_manager1 = ocm_manager1;
@@ -281,7 +296,7 @@ impl PixelMapProcessor {
     /// A tuple of two [DensePhotoMap]s:
     /// - First: from `photo1` to `photo2`.
     /// - Second: from `photo2` to `photo1`.
-    pub fn get_result(&mut self, clean_max_dist: f32) -> (DensePhotoMap, DensePhotoMap) {
+    pub fn finish(&mut self, clean_max_dist: f32) -> (DensePhotoMap, DensePhotoMap) {
         let mut pm1 = self.ocm_manager1.get_photo_mapping();
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
@@ -297,7 +312,7 @@ impl PixelMapProcessor {
     ///
     /// # Returns
     /// The fraction of valid cells in the forward map, a value between 0.0 and 1.0.
-    pub fn get_matched_area(& self) -> f32 {
+    pub fn matched_area(&self) -> f32 {
         let pm1 = self.ocm_manager1.get_photo_mapping();
         let pm2 = self.ocm_manager2.get_photo_mapping();
 

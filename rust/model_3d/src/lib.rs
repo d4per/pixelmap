@@ -102,28 +102,26 @@ impl Model3D {
     /// A `Model3D` whose grid cells now store `(x, y, z)` in 3D space, plus `(u, v)` texture coordinates.
     pub fn new(photo_mapping: &DensePhotoMap) -> Self {
         let mut photo_mapping = photo_mapping.clone();
+        let (map_width, map_height) = photo_mapping.grid_dimensions();
 
         let mut result = Model3D {
-            grid_width: photo_mapping.grid_width,
-            grid_height: photo_mapping.grid_height,
-            photo: photo_mapping.photo1.clone(),
-            grid: vec![
-                TexturePoint::default();
-                photo_mapping.grid_width * photo_mapping.grid_height
-            ],
+            grid_width: map_width,
+            grid_height: map_height,
+            photo: photo_mapping.photo1().clone(),
+            grid: vec![TexturePoint::default(); map_width * map_height],
         };
 
-        let grid_cell_size = photo_mapping.get_grid_cell_size();
+        let grid_cell_size = photo_mapping.grid_cell_size();
 
         // Perform two passes of cleanup and SVD-based embedding.
         for _ in 0..2 {
             // Collect valid points (non-NaN) into a vector for SVD.
-            let valid_points: Vec<_> = (0..photo_mapping.grid_height)
+            let valid_points: Vec<_> = (0..map_height)
                 .flat_map(|y| {
-                    (0..photo_mapping.grid_width).filter_map({
+                    (0..map_width).filter_map({
                         let value = photo_mapping.clone();
                         move |x| {
-                            let (data_x, data_y) = value.get_grid_coordinates(x, y);
+                            let (data_x, data_y) = value.grid_coordinates(x, y);
                             if !data_x.is_nan() {
                                 Some((
                                     (x * grid_cell_size) as f64,
@@ -138,7 +136,6 @@ impl Model3D {
                     })
                 })
                 .collect();
-
 
             // Build a DMatrix from the valid points: each row is [X, Y, dataX, dataY].
             let mut matrix = DMatrix::from_fn(valid_points.len(), 4, |i, j| match j {
@@ -166,9 +163,9 @@ impl Model3D {
             let (min_values, max_values) = compute_min_max(&reduced_data, 0.1, 0.9);
 
             // Now update every cell in the DensePhotoMap with a 3D coordinate, or invalidate it.
-            for y in 0..photo_mapping.grid_height {
-                for x in 0..photo_mapping.grid_width {
-                    let (x2, y2) = photo_mapping.get_grid_coordinates(x, y);
+            for y in 0..map_height {
+                for x in 0..map_width {
+                    let (x2, y2) = photo_mapping.grid_coordinates(x, y);
                     if x2.is_nan() {
                         continue;
                     }
@@ -177,7 +174,12 @@ impl Model3D {
                     let mut point_row = DMatrix::from_row_slice(
                         1,
                         4,
-                        &[(x * grid_cell_size) as f64, (y * grid_cell_size) as f64, x2 as f64, y2 as f64],
+                        &[
+                            (x * grid_cell_size) as f64,
+                            (y * grid_cell_size) as f64,
+                            x2 as f64,
+                            y2 as f64,
+                        ],
                     );
 
                     // Apply centering (subtract the same col_means).
@@ -201,12 +203,12 @@ impl Model3D {
                         && yy.abs() < 3.0
                         && zz.abs() < 3.0
                     {
-                        result.grid[y * photo_mapping.grid_width + x] = TexturePoint {
+                        result.grid[y * map_width + x] = TexturePoint {
                             x: xx as f32,
                             y: yy as f32,
                             z: zz as f32,
-                            u: x as f32 / photo_mapping.grid_width as f32,
-                            v: 1f32 - (y as f32 / photo_mapping.grid_height as f32),
+                            u: x as f32 / map_width as f32,
+                            v: 1f32 - (y as f32 / map_height as f32),
                             grid_x: x,
                             grid_y: y,
                         };

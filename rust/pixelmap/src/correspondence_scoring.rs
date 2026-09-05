@@ -1,6 +1,6 @@
-use std::cell::{Cell, RefCell};
 use crate::affine_transform::AffineTransform;
 use crate::photo::Photo;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// Number of fractional bits used by the fixed-point coordinate walk.
@@ -476,12 +476,20 @@ mod tests {
             px[2] = (v >> 16) as u8;
             px[3] = 255;
         }
-        Arc::new(Photo { img_data, width, height })
+        Arc::new(Photo {
+            img_data,
+            width,
+            height,
+        })
     }
 
     fn empty_samples(radius: usize) -> Samples {
         let capacity = (2 * radius + 1) * (2 * radius + 1);
-        Samples { p1: vec![0u32; capacity], p2_idx: vec![0i32; capacity], len: 0 }
+        Samples {
+            p1: vec![0u32; capacity],
+            p2_idx: vec![0i32; capacity],
+            len: 0,
+        }
     }
 
     /// Random transforms spanning the range the solver actually produces: origins over
@@ -526,7 +534,11 @@ mod tests {
         let mut general = empty_samples(radius);
         let mut fast_path_taken = 0usize;
         let mut samples_seen = 0usize;
-        let full_disc: usize = scoring.sqrt_table.iter().map(|xx| (2 * xx + 1) as usize).sum();
+        let full_disc: usize = scoring
+            .sqrt_table
+            .iter()
+            .map(|xx| (2 * xx + 1) as usize)
+            .sum();
 
         for cm in random_transforms(w, h, 4000, 0xdead_beef_0bad_f00d) {
             scoring.resolve_disc_inner(&cm, &mut fast, true);
@@ -552,7 +564,10 @@ mod tests {
         }
 
         assert!(samples_seen > 0, "no samples were resolved at all");
-        assert!(fast_path_taken > 100, "fast path almost never ran ({fast_path_taken} of 4000)");
+        assert!(
+            fast_path_taken > 100,
+            "fast path almost never ran ({fast_path_taken} of 4000)"
+        );
     }
 
     /// `score_taps` reads every sample shifted by ±1 pixel and ±one row with no bounds
@@ -573,8 +588,14 @@ mod tests {
             for &idx in &s.p2_idx[..s.len] {
                 assert!(idx >= 0, "negative index {idx} for {cm:?}");
                 let (px, py) = (idx % w as i32, idx / w as i32);
-                assert!(px >= 1 && px <= w as i32 - 2, "x {px} outside the inset for {cm:?}");
-                assert!(py >= 1 && py <= h as i32 - 2, "y {py} outside the inset for {cm:?}");
+                assert!(
+                    px >= 1 && px <= w as i32 - 2,
+                    "x {px} outside the inset for {cm:?}"
+                );
+                assert!(
+                    py >= 1 && py <= h as i32 - 2,
+                    "y {py} outside the inset for {cm:?}"
+                );
             }
         }
     }
@@ -598,17 +619,25 @@ mod tests {
                 sg2 += dg * dg;
                 sb2 += db * db;
             }
-            assert_eq!(acc.s2, sr2 + sg2 + sb2, "combined sum of squares is not exact");
+            assert_eq!(
+                acc.s2,
+                sr2 + sg2 + sb2,
+                "combined sum of squares is not exact"
+            );
 
             // The formula as it stood before the collapse, divide and all.
             let ni = n as i64;
-            let reference = ((ni * sr2 as i64 - (acc.sr as i64) * (acc.sr as i64)
-                + ni * sg2 as i64 - (acc.sg as i64) * (acc.sg as i64)
-                + ni * sb2 as i64 - (acc.sb as i64) * (acc.sb as i64)) as f64
+            let reference = ((ni * sr2 as i64 - (acc.sr as i64) * (acc.sr as i64) + ni * sg2 as i64
+                - (acc.sg as i64) * (acc.sg as i64)
+                + ni * sb2 as i64
+                - (acc.sb as i64) * (acc.sb as i64)) as f64
                 / (ni * ni) as f64) as f32;
             let got = acc.finish(n, 1.0 / ((n as f64) * (n as f64)));
             let ulps = (reference.to_bits() as i64 - got.to_bits() as i64).abs();
-            assert!(ulps <= 1, "finish drifted by {ulps} ulps: {reference} vs {got}");
+            assert!(
+                ulps <= 1,
+                "finish drifted by {ulps} ulps: {reference} vs {got}"
+            );
         }
     }
 

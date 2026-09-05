@@ -114,9 +114,17 @@ mod tests {
         let mut rng = Rng::seed_from_u64(7);
         let mut values: Vec<u32> = (0..500).collect();
         rng.shuffle(&mut values);
-        assert_ne!(values, (0..500).collect::<Vec<_>>(), "did not shuffle at all");
+        assert_ne!(
+            values,
+            (0..500).collect::<Vec<_>>(),
+            "did not shuffle at all"
+        );
         values.sort_unstable();
-        assert_eq!(values, (0..500).collect::<Vec<_>>(), "lost or duplicated elements");
+        assert_eq!(
+            values,
+            (0..500).collect::<Vec<_>>(),
+            "lost or duplicated elements"
+        );
     }
 
     #[test]
@@ -137,6 +145,9 @@ mod tests {
             assert!(v < 6, "below(6) returned {v}");
             seen[v as usize] = true;
         }
-        assert!(seen.iter().all(|&s| s), "some values in [0, 6) were never produced");
+        assert!(
+            seen.iter().all(|&s| s),
+            "some values in [0, 6) were never produced"
+        );
     }
 }

@@ -82,49 +82,7 @@ impl AffineTransform {
         let scale_y = (self.a21.powi(2) + self.a22.powi(2)).sqrt();
 
         // Check each scale factor is within [min_scale, scale_bound].
-        scale_x > min_scale && scale_x < scale_bound
-            && scale_y > min_scale && scale_y < scale_bound
-    }
-
-    /// Applies the affine transformation to an integer coordinate `(x, y)`,
-    /// returning a float coordinate `(X, Y)` in the transformed space.
-    ///
-    /// # Parameters
-    /// - `x`: The input x-coordinate (integer).
-    /// - `y`: The input y-coordinate (integer).
-    ///
-    /// # Returns
-    /// A tuple `(X, Y)`, which is the result of:
-    /// ```text
-    /// dx = x - origin_x;
-    /// dy = y - origin_y;
-    /// X = (dx * a11) + (dy * a12) + translate_x;
-    /// Y = (dx * a21) + (dy * a22) + translate_y;
-    /// ```
-    ///
-    /// # Examples
-    /// ```text
-    /// let t = AffineTransform {
-    ///     origin_x: 10,
-    ///     origin_y: 10,
-    ///     translate_x: 0.0,
-    ///     translate_y: 0.0,
-    ///     a11: 1.0,
-    ///     a12: 0.0,
-    ///     a21: 0.0,
-    ///     a22: 1.0,
-    /// };
-    ///
-    /// // The new coordinate will be ((20 - 10), (30 - 10)) => (10.0, 20.0).
-    /// let (X, Y) = t.extrapolate_point(20, 30);
-    /// assert_eq!((X, Y), (10.0, 20.0));
-    /// ```
-    pub fn extrapolate_point(&self, x: u16, y: u16) -> (f32, f32) {
-        let dx = (x as isize - self.origin_x as isize) as f32;
-        let dy = (y as isize - self.origin_y as isize) as f32;
-        let x2 = dx * self.a11 + dy * self.a12 + self.translate_x;
-        let y2 = dx * self.a21 + dy * self.a22 + self.translate_y;
-        (x2, y2)
+        scale_x > min_scale && scale_x < scale_bound && scale_y > min_scale && scale_y < scale_bound
     }
 
     /// Creates a **new** `AffineTransform` in which the origin is shifted to

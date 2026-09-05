@@ -260,7 +260,8 @@ impl State {
     }
 
     fn current_frame(&self) -> Option<&Frame> {
-        self.frames.get(self.index.min(self.frames.len().saturating_sub(1)))
+        self.frames
+            .get(self.index.min(self.frames.len().saturating_sub(1)))
     }
 
     fn title(&self) -> String {
@@ -275,7 +276,11 @@ impl State {
                 self.index + 1,
                 total,
                 self.options.fps,
-                if self.options.ping_pong { "ping-pong" } else { "loop" },
+                if self.options.ping_pong {
+                    "ping-pong"
+                } else {
+                    "loop"
+                },
                 if self.playing { "playing" } else { "paused" },
             ));
         }
@@ -298,7 +303,11 @@ fn draw_progress_bar(canvas: &mut [u32], width: usize, height: usize, fraction: 
     for y in (bottom - bar_height)..bottom {
         let row = y * width;
         for x in 0..bar_width {
-            canvas[row + margin + x] = if x < filled { PROGRESS_FILL } else { PROGRESS_TRACK };
+            canvas[row + margin + x] = if x < filled {
+                PROGRESS_FILL
+            } else {
+                PROGRESS_TRACK
+            };
         }
     }
 }

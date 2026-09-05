@@ -100,3 +100,20 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: Verify the crate is publishable
         run: cargo publish --dry-run -p pixelmap
+
+  docsrs:
+    name: docs.rs simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # docs.rs builds on nightly with `--cfg docsrs`, which is the only configuration
+      # that compiles the `feature(doc_cfg)` gate in lib.rs. The stable `docs` job above
+      # never sees it, so without this a removed rustdoc feature reaches a release as a
+      # crate with no documentation at all.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo doc -p pixelmap --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"

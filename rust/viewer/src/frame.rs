@@ -17,7 +17,9 @@ impl Frame {
     pub fn from_photo(photo: &Photo) -> Frame {
         let pixels = photo
             .as_rgba()
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32)
             .collect();
 
@@ -37,8 +39,8 @@ impl Frame {
         }
 
         // Largest integer size that fits inside the destination, aspect preserved.
-        let scale = (dst_width as f32 / self.width as f32)
-            .min(dst_height as f32 / self.height as f32);
+        let scale =
+            (dst_width as f32 / self.width as f32).min(dst_height as f32 / self.height as f32);
         let draw_width = ((self.width as f32 * scale) as usize).clamp(1, dst_width);
         let draw_height = ((self.height as f32 * scale) as usize).clamp(1, dst_height);
         let offset_x = (dst_width - draw_width) / 2;

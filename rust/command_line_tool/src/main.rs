@@ -2,14 +2,18 @@ use clap::Parser;
 use pixelmap::{Correspondence, DensePhotoMap, ProcessingMode, DEFAULT_SEED};
 use std::sync::Arc;
 
-use std::fs::File;
-use std::io::Write;
 use image::open;
 use pixelmap::Photo;
+use std::fs::File;
+use std::io::Write;
 
 /// Command line arguments structure.
 #[derive(Parser, Debug)]
-#[command(author, version, about = "CLI for pixelmap-based photo matching and interpolation.")]
+#[command(
+    author,
+    version,
+    about = "CLI for pixelmap-based photo matching and interpolation."
+)]
 struct Args {
     /// First photo filename
     #[arg()]
@@ -59,7 +63,9 @@ fn main() {
 
     #[cfg(feature = "bench")]
     if args.bench_matchers {
-        let width = args.bench_width.unwrap_or_else(|| args.processing_mode.photo_width());
+        let width = args
+            .bench_width
+            .unwrap_or_else(|| args.processing_mode.photo_width());
         let reports = pixelmap::matcher_bench::run(&photo1, &photo2, width);
         pixelmap::matcher_bench::print_reports(&reports);
         return;
@@ -89,8 +95,7 @@ fn main() {
     // If the user requested JSON output for the DensePhotoMap, write it out.
     if let Some(dense_map_path) = args.output_dense_map {
         let data_text = to_dense_map(&final_map);
-        let mut file = File::create(&dense_map_path)
-            .expect("Could not create data output file");
+        let mut file = File::create(&dense_map_path).expect("Could not create data output file");
         file.write_all(data_text.as_bytes())
             .expect("Failed to write data to file");
         println!("DensePhotoMap written to {dense_map_path}");
