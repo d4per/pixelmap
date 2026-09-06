@@ -1,7 +1,8 @@
-# The default x86-64 target is SSE2-only, which has no `roundss`: `f32::round`
-# then lowers to a libm `roundf` PLT call, twice per pixel in the correspondence
-# scoring inner loop. Enabling the host's real feature set (SSE4.1/AVX2/FMA)
-# turns those into a single instruction.
+# The correspondence scoring inner loop walks photo2 in 16.16 fixed point, one
+# 32-bit integer multiply per pixel. The default x86-64 target is SSE2-only,
+# which has no `pmulld`, so that multiply vectorizes into a long `pmuludq`
+# shuffle sequence instead. Enabling the host's real feature set
+# (SSE4.1/AVX2/FMA) gives it `vpmulld` at eight lanes.
 #
 # This makes the binary non-portable. For a distributable build, use
 # `target-cpu=x86-64-v2` (SSE4.1, universal since ~2009) as the floor instead.
