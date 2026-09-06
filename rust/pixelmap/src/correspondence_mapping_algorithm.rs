@@ -92,9 +92,14 @@ impl CorrespondenceMappingAlgorithm {
         neighborhood_radius: usize,
         seed: u64,
     ) -> Self {
-        // Determine how many cells fit in the scaled images.
-        let grid_width = photo1a.width / grid_cell_size + 1;
-        let grid_height = photo1a.height / grid_cell_size + 1;
+        // Determine how many cells fit in the scaled images. The last cell's origin is
+        // `(grid_width - 1) * grid_cell_size`, so the count is derived from the last
+        // *pixel* index: `width / grid_cell_size + 1` puts that origin at `width`, one
+        // column past the image, where `resolve_disc` finds no pixels to score and the
+        // cell can never be filled. That dead column and row then took their neighbours
+        // with them through `remove_outliers`, and counted against `coverage()` besides.
+        let grid_width = photo1a.width.saturating_sub(1) / grid_cell_size + 1;
+        let grid_height = photo1a.height.saturating_sub(1) / grid_cell_size + 1;
 
         CorrespondenceMappingAlgorithm {
             photo1: photo1a.clone(),
@@ -415,11 +420,15 @@ impl CorrespondenceMappingAlgorithm {
     /// A `DensePhotoMap` describing how each cell in `photo1` maps to coordinates in `photo2`.
     pub fn get_photo_mapping(&self) -> DensePhotoMap {
         let ac_grid = &self.ac_grid;
-        let mut pm = DensePhotoMap::new(
+        // The solver laid this grid out, so it passes the spacing rather than letting
+        // `DensePhotoMap::new` divide it back out of the photo width — which only
+        // recovers it when the width is an exact multiple of the cell size.
+        let mut pm = DensePhotoMap::with_cell_size(
             self.photo1.clone(),
             self.photo2.clone(),
             ac_grid.get_grid_width(),
             ac_grid.get_grid_height(),
+            self.grid_cell_size,
         );
 
         for y in 0..ac_grid.get_grid_height() {
