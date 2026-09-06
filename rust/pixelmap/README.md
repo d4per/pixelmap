@@ -104,8 +104,9 @@ images is the caller's business, and progress is reported through
 
 ## Performance
 
-The scoring inner loop leans on `f32::round`, which lowers to a libm call on the SSE2
-baseline that `x86_64` targets by default. Building with at least
+The scoring inner loop walks `photo2` in 16.16 fixed point, and the per-pixel step it
+vectorizes to is a 32-bit integer multiply — an instruction (`pmulld`) that SSE2, the
+baseline `x86_64` targets by default, does not have. Building with at least
 
 ```toml
 # .cargo/config.toml
@@ -113,8 +114,8 @@ baseline that `x86_64` targets by default. Building with at least
 rustflags = ["-C", "target-cpu=x86-64-v2"]
 ```
 
-turns it into a single instruction. `target-cpu=native` is faster still, at the cost of a
-binary that will not run on older hardware.
+lets that loop vectorize properly. `target-cpu=native` doubles the lane count again on an
+AVX2 host, at the cost of a binary that will not run on older hardware.
 
 ## Minimum supported Rust version
 
