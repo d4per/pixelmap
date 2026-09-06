@@ -311,6 +311,7 @@ impl DensePhotoMap {
     ///   against the *squared* distance in grid cells, so the tolerance it expresses is
     ///   `sqrt(max_dist)` cells.
     pub fn remove_outliers(&mut self, other: &DensePhotoMap, max_dist: f32) {
+        let max_dist_sq = max_dist * max_dist;
         for y in 0..self.grid_height {
             for x in 0..self.grid_width {
                 // Map forward
@@ -325,7 +326,7 @@ impl DensePhotoMap {
                     let dy = y as f32 - mapped_back.1 / self.grid_cell_size as f32;
 
                     // If the round trip is too far, mark as invalid
-                    if dx.is_nan() || dy.is_nan() || (dx * dx + dy * dy > max_dist) {
+                    if dx.is_nan() || dy.is_nan() || (dx * dx + dy * dy > max_dist_sq) {
                         self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
                     }
                 }
