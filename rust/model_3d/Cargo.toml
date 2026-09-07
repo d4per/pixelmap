@@ -1,11 +1,11 @@
 [package]
 name = "pixelmap_model_3d"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-pixelmap = { path = "../pixelmap", version = "0.1.0" }
+pixelmap = { path = "../pixelmap", version = "0.2.0" }
 # The SVD that lifts a correspondence field into 3D. Kept out of `pixelmap` itself: the
 # library is the correspondence algorithm, and a caller who wants the mapping should not
 # pay for a linear-algebra dependency.
@@ -13,7 +13,7 @@ nalgebra = "0.33"
 
 [dev-dependencies]
 # The example decodes photos from disc, which needs `Photo: From<DynamicImage>`.
-pixelmap = { path = "../pixelmap", version = "0.1.0", features = ["image"] }
+pixelmap = { path = "../pixelmap", version = "0.2.0", features = ["image"] }
 # Only the codecs the example reads and writes: the default feature set pulls in every
 # format image supports, including an AVIF encoder with a heavy C-adjacent tree.
 # Upper-bounded: image 0.25.10 depends on a `zune-core` release that does not exist.

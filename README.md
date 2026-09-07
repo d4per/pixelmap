@@ -21,7 +21,7 @@ between them ([API docs](https://docs.rs/pixelmap), and
 
 ```toml
 [dependencies]
-pixelmap = "0.1"
+pixelmap = "0.2"
 ```
 
 The rest of the [rust](rust) folder builds on it: a command line tool that writes the

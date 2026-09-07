@@ -19,6 +19,12 @@ as the front half of a 3D reconstruction — the `pixelmap_model_3d` crate in th
 [repository](https://github.com/d4per/pixelmap) lifts a finished mapping into a textured
 3D mesh.
 
+![Two photographs of a monkey statue taken from different positions, above three renderings of the correspondence recovered between them](https://raw.githubusercontent.com/d4per/pixelmap/v0.2.0/images/docs/apa.webp)
+
+*Two views of the same statue (top) and the correspondence recovered between them,
+rendered at three settings (bottom). Regions left blank are those with no accepted
+match.*
+
 ## Example
 
 ```rust,no_run

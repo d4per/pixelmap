@@ -659,7 +659,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pixelmap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "rayon",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "pixelmap_command_line_tool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "image",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "pixelmap_model_3d"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "nalgebra",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "pixelmap_viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "image",
