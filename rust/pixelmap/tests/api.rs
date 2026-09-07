@@ -116,6 +116,233 @@ fn recovers_a_known_translation() {
     );
 }
 
+/// The bug this guards against: the mapping came out with unmapped *bands*, whole grid
+/// columns or rows, running through areas the solver had no trouble with. They came from
+/// `remove_outliers` reading each cell through the four-corner interpolation, so a cell
+/// died whenever its right or lower neighbour was missing — one column at a time, seeded
+/// by a last column that could never be filled at all.
+///
+/// A pure translation over dense texture has a correct answer everywhere except the strip
+/// that shifted out of frame, so any full-height column or full-width row of holes in the
+/// interior is this bug and not the photos.
+#[test]
+fn a_pure_translation_leaves_no_unmapped_bands() {
+    let (dx, dy) = (6usize, 3usize);
+    let (w, h) = (420usize, 300usize);
+    let (photo1, photo2) = shifted_pair(w, h, dx, dy);
+    let mapping = run(photo1, photo2, DEFAULT_SEED);
+
+    let map = mapping.forward();
+    let (gw, gh) = map.grid_dimensions();
+    let mapped = |x: usize, y: usize| !map.grid_coordinates(x, y).0.is_nan();
+
+    // The pair is built by sliding a window right and down, so the left and top strips of
+    // `photo1` have no counterpart at all. The outermost row and column of the far edges
+    // go too, for a subtler reason that is not this bug: verifying a cell there means
+    // interpolating in the *other* map at a point the shift pushed past its last node.
+    let margin = 3;
+    let (xs, ys) = (margin..gw - 1, margin..gh - 1);
+
+    let worst_column = xs
+        .clone()
+        .map(|x| (ys.clone().filter(|&y| !mapped(x, y)).count(), x))
+        .max()
+        .expect("the grid has interior columns");
+    let worst_row = ys
+        .clone()
+        .map(|y| (xs.clone().filter(|&x| !mapped(x, y)).count(), y))
+        .max()
+        .expect("the grid has interior rows");
+
+    let (rows, cols) = (ys.len(), xs.len());
+    assert!(
+        worst_column.0 * 2 < rows,
+        "grid column {} is {}/{rows} unmapped: an unmapped band",
+        worst_column.1,
+        worst_column.0
+    );
+    assert!(
+        worst_row.0 * 2 < cols,
+        "grid row {} is {}/{cols} unmapped: an unmapped band",
+        worst_row.1,
+        worst_row.0
+    );
+
+    let holes = xs
+        .clone()
+        .map(|x| ys.clone().filter(|&y| !mapped(x, y)).count())
+        .sum::<usize>();
+    let coverage = 1.0 - holes as f32 / (rows * cols) as f32;
+    assert!(
+        coverage > 0.95,
+        "only {:.1}% of the interior was mapped",
+        coverage * 100.0
+    );
+}
+
+/// The mechanism behind the bands, pinned without going near a photo: a cleanup pass
+/// must remove the cells that fail the round trip and *only* those.
+///
+/// It used to read each cell through the four-corner interpolation, which is `NaN` if any
+/// corner is, so a hole spread one cell left and one cell up every pass — and the last
+/// column and row, having no corner beyond them at all, went every time. Over a schedule
+/// of ten passes that is how a single bad cell became a band.
+#[test]
+fn removing_outliers_does_not_spread_a_hole() {
+    let photo = Arc::new(Photo::from_rgba(64, 48, vec![0; 64 * 48 * 4]).unwrap());
+    let (gw, gh) = (9usize, 7usize);
+
+    // Two identity mappings, so every cell's round trip is exact and nothing is an
+    // outlier — except that one cell of the forward map was never filled in.
+    let identity = |hole: Option<(usize, usize)>| {
+        let mut map = DensePhotoMap::new(photo.clone(), photo.clone(), gw, gh);
+        let cell = map.grid_cell_size();
+        for y in 0..gh {
+            for x in 0..gw {
+                if Some((x, y)) == hole {
+                    continue;
+                }
+                map.set_grid_coordinates(x, y, (x * cell) as f32, (y * cell) as f32);
+            }
+        }
+        map
+    };
+
+    let hole = (4usize, 3usize);
+    let mut forward = identity(Some(hole));
+    forward.remove_outliers(&identity(None), 2.0);
+
+    let survivors: Vec<(usize, usize)> = (0..gh)
+        .flat_map(|y| (0..gw).map(move |x| (x, y)))
+        .filter(|&(x, y)| forward.grid_coordinates(x, y).0.is_nan())
+        .collect();
+    assert_eq!(
+        survivors,
+        vec![hole],
+        "the pass removed cells other than the one that was already empty"
+    );
+}
+
+/// A query that lands exactly on a grid node is that node's value: the other three
+/// corners of the cell have zero bilinear weight, so whether they are set is none of the
+/// query's business. Requiring them anyway is what turned isolated holes into bands.
+#[test]
+fn an_exact_grid_node_does_not_need_its_neighbours() {
+    let photo = Arc::new(Photo::from_rgba(64, 48, vec![0; 64 * 48 * 4]).unwrap());
+    let mut map = DensePhotoMap::new(photo.clone(), photo, 9, 7);
+    let cell = map.grid_cell_size();
+    map.set_grid_coordinates(4, 3, 12.0, 34.0);
+
+    // Every neighbour of (4, 3) is still NaN.
+    assert_eq!(
+        map.lookup((4 * cell) as f32, (3 * cell) as f32),
+        Some((12.0, 34.0))
+    );
+
+    // Halfway between two set nodes both of them are needed, and both are consulted.
+    map.set_grid_coordinates(5, 3, 20.0, 34.0);
+    let (mx, my) = map
+        .lookup((4 * cell) as f32 + cell as f32 / 2.0, (3 * cell) as f32)
+        .expect("both ends of the span are set");
+    assert!((mx - 16.0).abs() < 0.01, "interpolated x was {mx}");
+    assert!((my - 34.0).abs() < 0.01, "interpolated y was {my}");
+
+    // But a node that is not set is still unmapped, however many neighbours are.
+    assert_eq!(map.lookup((6 * cell) as f32, (3 * cell) as f32), None);
+}
+
+/// Smoothing fills a gap from whichever pair of opposite neighbours is actually there.
+/// It used to test both axes against one centre averaged over all four neighbours, so a
+/// single missing neighbour made every test fail and nothing was ever filled in.
+#[test]
+fn smoothing_fills_a_gap_from_the_neighbours_it_has() {
+    let photo = Arc::new(Photo::from_rgba(64, 48, vec![0; 64 * 48 * 4]).unwrap());
+    let mut map = DensePhotoMap::new(photo.clone(), photo, 9, 7);
+    // Left and right of (4, 3) are set; above and below are not.
+    map.set_grid_coordinates(3, 3, 10.0, 20.0);
+    map.set_grid_coordinates(5, 3, 14.0, 24.0);
+    assert!(map.grid_coordinates(4, 3).0.is_nan());
+
+    let smoothed = map.smooth_grid_points_n_times(1);
+    let (x, y) = smoothed.grid_coordinates(4, 3);
+    assert!((x - 12.0).abs() < 0.01, "filled x was {x}, expected 12");
+    assert!((y - 22.0).abs() < 0.01, "filled y was {y}, expected 22");
+}
+
+/// A region the algorithm could not map must not paint over one it could.
+///
+/// Unmapped regions hold still while the rest of the image flows past them, so drawing
+/// them at the only position they have — where they sit in `photo1` — means overwriting
+/// whatever mapped pixel had legitimately moved onto that spot. The scatter is
+/// last-write-wins in scan order, so in a morph that is the normal case, not an edge one:
+/// the unmapped regions punched holes straight through the warped image.
+#[test]
+fn an_unmapped_region_does_not_paint_over_a_mapped_one() {
+    // The red channel carries the column, so a pixel of the output says which column of
+    // `photo1` it came from.
+    let (w, h) = (64usize, 48usize);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for _ in 0..h {
+        for x in 0..w {
+            rgba.extend_from_slice(&[x as u8, 0, 0, 255]);
+        }
+    }
+    let photo = Arc::new(Photo::from_rgba(w, h, rgba).unwrap());
+
+    // Grid columns 0..=2 shift right by 16 pixels; from column 3 on there is no mapping.
+    let mut map = DensePhotoMap::new(photo.clone(), photo.clone(), 9, 7);
+    let cell = map.grid_cell_size();
+    assert_eq!(cell, 8);
+    for y in 0..7 {
+        for x in 0..=2 {
+            map.set_grid_coordinates(x, y, (x * cell + 16) as f32, (y * cell) as f32);
+        }
+    }
+
+    // At the far end of the morph, source column 10 lands on column 26 — which is inside
+    // the unmapped region's own footprint, and reached later in scan order.
+    let warped = map.interpolate_photo(1.0, 1);
+    let row = 20;
+    assert_eq!(
+        warped.pixel(26, row).map(|p| p[0]),
+        Some(10),
+        "column 26 should hold source column 10, not whatever the unmapped region wrote"
+    );
+
+    // And a column nothing reaches is left at the background.
+    assert_eq!(
+        warped.pixel(4, row),
+        Some([0, 0, 0, 255]),
+        "nothing maps onto column 4, so it should be background"
+    );
+}
+
+/// `f32::round(NaN) as usize` is 0, so an unmapped sample that reaches the write lands on
+/// the top left pixel — every unmapped pixel of the photo piled onto one corner. Skipping
+/// them has to happen before the arithmetic, and this is what says so.
+#[test]
+fn an_unmapped_pixel_is_not_scattered_to_the_origin() {
+    let (w, h) = (64usize, 48usize);
+    let photo = Arc::new(Photo::from_rgba(w, h, vec![200; w * h * 4]).unwrap());
+
+    // Only the bottom right corner of the grid is mapped, and it maps to itself, so
+    // nothing legitimately lands anywhere near the origin.
+    let mut map = DensePhotoMap::new(photo.clone(), photo.clone(), 9, 7);
+    let cell = map.grid_cell_size();
+    for y in 5..7 {
+        for x in 7..9 {
+            map.set_grid_coordinates(x, y, (x * cell) as f32, (y * cell) as f32);
+        }
+    }
+
+    let warped = map.interpolate_photo(0.5, 1);
+    assert_eq!(
+        warped.pixel(0, 0),
+        Some([0, 0, 0, 255]),
+        "the unmapped pixels were scattered onto the origin"
+    );
+}
+
 /// Reproducibility is a contract, not an accident: same input, same seed, same mapping.
 #[test]
 fn the_same_seed_reproduces_the_same_mapping() {

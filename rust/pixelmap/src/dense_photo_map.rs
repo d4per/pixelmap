@@ -72,7 +72,10 @@ impl DensePhotoMap {
     ///
     /// # Panics
     /// Panics if `grid_width < 2`. The cell size is `photo1.width / (grid_width - 1)`,
-    /// which divides by zero at one column and underflows at none.
+    /// which divides by zero at one column and underflows at none. Also panics if that
+    /// division comes out as zero — a grid finer than the photo it describes, which every
+    /// later lookup would divide by zero. Pass the spacing you meant to
+    /// [`Self::with_cell_size`] instead of having it inferred.
     pub fn new(
         photo1: Arc<Photo>,
         photo2: Arc<Photo>,
@@ -84,6 +87,34 @@ impl DensePhotoMap {
             "a mapping grid needs at least 2 columns, got {grid_width}"
         );
         let grid_cell_size = photo1.width / (grid_width - 1);
+        Self::with_cell_size(photo1, photo2, grid_width, grid_height, grid_cell_size)
+    }
+
+    /// Creates a new `DensePhotoMap` whose cell size is given rather than derived from
+    /// the grid width.
+    ///
+    /// A caller that laid the grid out itself already knows the spacing exactly;
+    /// [`Self::new`] has to divide it back out of the width, which only returns the same
+    /// number when the width happens to be a multiple of it. Producers of a grid should
+    /// use this and say what they meant.
+    ///
+    /// # Panics
+    /// Panics if `grid_width < 2` or `grid_cell_size == 0`.
+    pub fn with_cell_size(
+        photo1: Arc<Photo>,
+        photo2: Arc<Photo>,
+        grid_width: usize,
+        grid_height: usize,
+        grid_cell_size: usize,
+    ) -> Self {
+        assert!(
+            grid_width >= 2,
+            "a mapping grid needs at least 2 columns, got {grid_width}"
+        );
+        assert!(
+            grid_cell_size > 0,
+            "a mapping grid needs a non-zero cell size"
+        );
         DensePhotoMap {
             photo1,
             photo2,
@@ -171,48 +202,67 @@ impl DensePhotoMap {
     }
 
     /// Interpolates the mapping for a fractional grid coordinate `(xin, yin)`.
-    /// Looks up the four surrounding grid corners and performs bilinear interpolation.
+    /// Looks up the surrounding grid corners and performs bilinear interpolation.
     ///
-    /// Valid only if all four corner cells are set (non-NaN) and pass distance checks.
-    /// Returns `(NaN, NaN)` if interpolation fails or data is missing.
+    /// Only the corners that carry a non-zero bilinear weight have to be set: a query
+    /// that lands exactly on a grid node needs that node alone, and one that lands on a
+    /// grid line needs the two ends of that line. Requiring all four regardless used to
+    /// delete a good cell whenever its right or lower neighbour was missing — and, at
+    /// `xxx + 1 == grid_width`, whenever there was no neighbour to have. Run through
+    /// [`Self::remove_outliers`], which queries exact nodes, that turned one unmapped
+    /// column into the next one over, and so on across the grid: the "dark bands".
+    ///
+    /// Returns `(NaN, NaN)` if a contributing corner is missing, if the contributing
+    /// corners are spread too far apart to interpolate between, or if the coordinate is
+    /// not a finite point inside the grid.
     pub fn interpolated_point(&self, xin: f32, yin: f32) -> (f32, f32) {
+        // `as usize` saturates, so a negative or NaN input would otherwise be read as
+        // cell zero with a nonsensical fraction rather than as "no mapping here".
+        if xin.is_nan() || yin.is_nan() || xin < 0.0 || yin < 0.0 {
+            return (f32::NAN, f32::NAN);
+        }
         let xxx = xin as usize;
         let yyy = yin as usize;
         let xr = xin - xxx as f32;
         let yr = yin - yyy as f32;
 
-        // Get the four corner mappings.
-        let (x1, y1) = self.grid_coordinates(xxx, yyy);
-        let (x2, y2) = self.grid_coordinates(xxx + 1, yyy);
-        let (x3, y3) = self.grid_coordinates(xxx + 1, yyy + 1);
-        let (x4, y4) = self.grid_coordinates(xxx, yyy + 1);
+        // The four corners, each with its bilinear weight.
+        let corners = [
+            (self.grid_coordinates(xxx, yyy), (1.0 - xr) * (1.0 - yr)),
+            (self.grid_coordinates(xxx + 1, yyy), xr * (1.0 - yr)),
+            (self.grid_coordinates(xxx + 1, yyy + 1), xr * yr),
+            (self.grid_coordinates(xxx, yyy + 1), (1.0 - xr) * yr),
+        ];
 
-        // If any corner is NaN, we cannot interpolate.
-        if x1.is_nan() || x2.is_nan() || x3.is_nan() || x4.is_nan() {
-            return (f32::NAN, f32::NAN);
+        // Accumulate the weighted sum and the centroid of the contributing corners in
+        // one pass; a corner with zero weight is not consulted at all.
+        let (mut xt, mut yt, mut sum_x, mut sum_y, mut contributing) = (0.0, 0.0, 0.0, 0.0, 0.0f32);
+        for ((cx, cy), weight) in corners {
+            if weight == 0.0 {
+                continue;
+            }
+            if cx.is_nan() || cy.is_nan() {
+                return (f32::NAN, f32::NAN);
+            }
+            xt += cx * weight;
+            yt += cy * weight;
+            sum_x += cx;
+            sum_y += cy;
+            contributing += 1.0;
         }
 
-        // Check how far the center is from each corner; if it’s too large, discard.
-        let cell_width = self.grid_cell_size as f32;
-        let max_dist_sq = (cell_width * 3.0).powi(2);
-        let center_x = (x1 + x2 + x3 + x4) / 4.0;
-        let center_y = (y1 + y2 + y3 + y4) / 4.0;
-        for &(cx, cy) in &[(x1, y1), (x2, y2), (x3, y3), (x4, y4)] {
-            let dist_sq = (center_x - cx).powi(2) + (center_y - cy).powi(2);
-            if dist_sq > max_dist_sq {
+        // Check how far the centre is from each contributing corner; if it’s too large,
+        // the quad is too distorted to interpolate across and we discard it.
+        let max_dist_sq = (self.grid_cell_size as f32 * 3.0).powi(2);
+        let (center_x, center_y) = (sum_x / contributing, sum_y / contributing);
+        for ((cx, cy), weight) in corners {
+            if weight == 0.0 {
+                continue;
+            }
+            if (center_x - cx).powi(2) + (center_y - cy).powi(2) > max_dist_sq {
                 return (f32::NAN, f32::NAN);
             }
         }
-
-        // Bilinear interpolation between corners.
-        let xx1 = x1 * (1.0 - xr) + x2 * xr;
-        let yy1 = y1 * (1.0 - xr) + y2 * xr;
-
-        let xx2 = x4 * (1.0 - xr) + x3 * xr;
-        let yy2 = y4 * (1.0 - xr) + y3 * xr;
-
-        let xt = xx1 * (1.0 - yr) + xx2 * yr;
-        let yt = yy1 * (1.0 - yr) + yy2 * yr;
 
         (xt, yt)
     }
@@ -242,21 +292,30 @@ impl DensePhotoMap {
     }
 
     /// Removes "outlier" mappings by checking consistency:
-    /// - It maps `(x, y)` in `photo1` to `(mapped_x, mapped_y)`.
-    /// - Then uses `other` to map `(mapped_x, mapped_y)` back into `photo1`.
+    /// - It takes the mapping stored at grid cell `(x, y)`.
+    /// - Then uses `other` to map that point back into `photo1`.
     /// - If the round trip doesn't land near `(x, y)`, the cell is marked as invalid (set to `NaN`).
+    ///
+    /// The forward value is read straight out of the cell rather than interpolated. Both
+    /// give the same number — the query lands exactly on a grid node, where the other
+    /// three corners have zero weight — but going through [`Self::interpolated_point`]
+    /// also inherited its *requirements*, so a cell was discarded whenever its right or
+    /// lower neighbour happened to be missing. Each pass then ate one more column, and
+    /// the last column, which has no right-hand neighbour at all, went every time.
+    ///
+    /// The backward step still interpolates: it lands at an arbitrary point of `other`.
     ///
     /// # Parameters
     /// - `other`: Another `DensePhotoMap` presumably for the reverse transformation.
-    /// - `max_dist`: Threshold for how far the round-trip mapping can deviate.
+    /// - `max_dist`: Threshold for how far the round-trip mapping can deviate. Compared
+    ///   against the *squared* distance in grid cells, so the tolerance it expresses is
+    ///   `sqrt(max_dist)` cells.
     pub fn remove_outliers(&mut self, other: &DensePhotoMap, max_dist: f32) {
+        let max_dist_sq = max_dist * max_dist;
         for y in 0..self.grid_height {
             for x in 0..self.grid_width {
                 // Map forward
-                let mapped = self.map_photo_pixel(
-                    (x * self.grid_cell_size) as f32,
-                    (y * self.grid_cell_size) as f32,
-                );
+                let mapped = self.grid_coordinates(x, y);
                 if mapped.0.is_nan() {
                     // Already invalid; set again to be sure
                     self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
@@ -267,7 +326,7 @@ impl DensePhotoMap {
                     let dy = y as f32 - mapped_back.1 / self.grid_cell_size as f32;
 
                     // If the round trip is too far, mark as invalid
-                    if dx.is_nan() || dy.is_nan() || (dx * dx + dy * dy > max_dist) {
+                    if dx.is_nan() || dy.is_nan() || (dx * dx + dy * dy > max_dist_sq) {
                         self.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
                     }
                 }
@@ -310,22 +369,41 @@ impl DensePhotoMap {
     /// re-mapped and merged pixel data.
     ///
     /// # Notes
-    /// - When mapped coordinates are invalid (`NaN`), this code currently
-    ///   places a red pixel (`(255, 0, 0)`).
+    /// - A source pixel the algorithm could not map contributes nothing. It has no
+    ///   interpolated position to be drawn at: the only candidate is where it sits in
+    ///   `photo1`, and drawing it there would paint over whatever mapped pixel had
+    ///   legitimately moved into that spot, since unmapped regions hold still while the
+    ///   rest of the image flows past them.
+    /// - Output pixels that no source pixel lands on are left opaque black. That is
+    ///   either a region with no correspondence or a place the warp stretched by more
+    ///   than `detail_level`; raise `detail_level` if the result is speckled, and use
+    ///   [`crate::Correspondence::lookup`] to ask which of the two a given pixel is.
     /// - The logic uses the coordinates of `photo1` for indexing. If the mapped
     ///   point is out of range, it skips writing the pixel.
     pub fn interpolate_photo(&self, interpolation_value: f32, detail_level: usize) -> Photo {
         let interpolation_value = interpolation_value.clamp(0.0, 1.0);
         let photo1 = self.photo1.clone();
 
-        // Prepare a blank RGBA buffer.
+        // Opaque black, so that a pixel nothing was scattered onto is distinguishable
+        // from a transparent one rather than depending on how the viewer treats alpha.
         let mut interpolated_img_data = vec![0u8; photo1.width * photo1.height * 4];
+        for pixel in interpolated_img_data.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
 
         for yi in 0..(photo1.height * detail_level) {
             let y = yi as f32 / detail_level as f32;
             for xi in 0..(photo1.width * detail_level) {
                 let x = xi as f32 / detail_level as f32;
                 let (x1, y1) = self.map_photo_pixel(x, y);
+
+                // Nothing to draw where there is no mapping. This has to be tested before
+                // the arithmetic below and not merely fall out of it: blending with `NaN`
+                // gives `NaN`, and `f32::round(NaN) as usize` is 0, so an unmapped sample
+                // that reaches the write would land on the top left pixel.
+                if x1.is_nan() || y1.is_nan() {
+                    continue;
+                }
 
                 // Interpolate the final coordinate.
                 let x_interpolated = x * (1.0 - interpolation_value) + x1 * interpolation_value;
@@ -337,19 +415,12 @@ impl DensePhotoMap {
 
                 // Check bounds.
                 if xx1 < photo1.width && yy1 < photo1.height {
-                    // If invalid, paint red. Otherwise, use `photo1` pixel.
-                    let (r, g, b) = if x1.is_nan() {
-                        (255, 0, 0)
-                    } else {
-                        self.photo1.get_rgb(x as usize, y as usize)
-                    };
+                    let (r, g, b) = self.photo1.get_rgb(x as usize, y as usize);
                     let index = (yy1 * photo1.width + xx1) * 4;
-                    if index < interpolated_img_data.len() {
-                        interpolated_img_data[index] = r;
-                        interpolated_img_data[index + 1] = g;
-                        interpolated_img_data[index + 2] = b;
-                        interpolated_img_data[index + 3] = 255; // alpha channel
-                    }
+                    interpolated_img_data[index] = r;
+                    interpolated_img_data[index + 1] = g;
+                    interpolated_img_data[index + 2] = b;
+                    interpolated_img_data[index + 3] = 255; // alpha channel
                 }
             }
         }
@@ -374,11 +445,28 @@ impl DensePhotoMap {
     /// Creates a new `DensePhotoMap` where each cell is replaced by
     /// the average of its left, right, up, and down neighbors (if valid).
     ///
-    /// This smooths out noisy mappings. Cells with invalid (`NaN`) neighbors
-    /// are averaged only among the valid ones.
+    /// This smooths out noisy mappings, and fills a gap in the grid whenever the pair of
+    /// neighbours on either axis brackets it — which is what lets an unmapped band close
+    /// from both sides over successive passes.
+    ///
+    /// Each axis is judged on its own two neighbours. The horizontal and vertical tests
+    /// used to share one centre averaged over all four, so a single `NaN` neighbour made
+    /// that centre `NaN`, every distance comparison false, and *both* tests fail: the
+    /// "average only the valid ones" this documents could never actually happen, and a
+    /// gap wider than a single cell never closed.
     pub fn average_grid_points(self) -> DensePhotoMap {
         let mut result = self.clone();
-        let max_dist = self.grid_cell_size as f32 * 4.0;
+        let max_dist_sq = (self.grid_cell_size as f32 * 4.0).powi(2);
+
+        // A pair of opposite neighbours can stand in for the cell between them when both
+        // are set and they are close enough together to be on the same surface.
+        let usable = |p: (f32, f32), q: (f32, f32)| {
+            if p.0.is_nan() || q.0.is_nan() {
+                return false;
+            }
+            let (mid_x, mid_y) = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+            (mid_x - p.0).powi(2) + (mid_y - p.1).powi(2) <= max_dist_sq
+        };
 
         // Only average interior cells (1..width-1, 1..height-1).
         for y in 1..self.grid_height - 1 {
@@ -388,29 +476,21 @@ impl DensePhotoMap {
                 let b1 = self.grid_coordinates(x, y - 1);
                 let b2 = self.grid_coordinates(x, y + 1);
 
-                let center_x = (a1.0 + a2.0 + b1.0 + b2.0) / 4.0;
-                let center_y = (a1.1 + a2.1 + b1.1 + b2.1) / 4.0;
-
-                // Distances for neighbor validity checks.
-                let aa = !(a1.0.is_nan() || a2.0.is_nan())
-                    && ((a1.0 - center_x).powi(2) + (a1.1 - center_y).powi(2)).sqrt() < max_dist
-                    && ((a2.0 - center_x).powi(2) + (a2.1 - center_y).powi(2)).sqrt() < max_dist;
-                let bb = !(b1.0.is_nan() || b2.0.is_nan())
-                    && ((b1.0 - center_x).powi(2) + (b1.1 - center_y).powi(2)).sqrt() < max_dist
-                    && ((b2.0 - center_x).powi(2) + (b2.1 - center_y).powi(2)).sqrt() < max_dist;
+                let horizontal = usable(a1, a2);
+                let vertical = usable(b1, b2);
 
                 // If both horizontal neighbors (a1, a2) are valid, average them.
                 // If both vertical neighbors (b1, b2) are valid, average them.
                 // If both sets are valid, average all four.
-                if aa && bb {
+                if horizontal && vertical {
                     let avg_x = (a1.0 + a2.0 + b1.0 + b2.0) / 4.0;
                     let avg_y = (a1.1 + a2.1 + b1.1 + b2.1) / 4.0;
                     result.set_grid_coordinates(x, y, avg_x, avg_y);
-                } else if aa {
+                } else if horizontal {
                     let avg_x = (a1.0 + a2.0) / 2.0;
                     let avg_y = (a1.1 + a2.1) / 2.0;
                     result.set_grid_coordinates(x, y, avg_x, avg_y);
-                } else if bb {
+                } else if vertical {
                     let avg_x = (b1.0 + b2.0) / 2.0;
                     let avg_y = (b1.1 + b2.1) / 2.0;
                     result.set_grid_coordinates(x, y, avg_x, avg_y);
