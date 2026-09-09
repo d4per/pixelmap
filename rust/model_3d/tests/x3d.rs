@@ -24,10 +24,10 @@ fn photo() -> Arc<Photo> {
 /// A correspondence field with real depth in it: a horizontal disparity that varies
 /// quadratically across the frame, as a surface bulging towards the camera would produce.
 ///
-/// The variation has to be non-linear. A pure translation — or any disparity linear in
-/// `(x, y)` — leaves the four columns `[X, Y, dataX, dataY]` spanning only two
-/// dimensions, the third principal component is then pure noise, and every cell washes
-/// out to `NaN` when it is rescaled.
+/// The variation has to be non-linear. `Model3D` fits the affine part of the
+/// correspondence and reads depth out of what is left over, so a pure translation — or
+/// any disparity linear in `(x, y)` — is absorbed by that fit and leaves a zero
+/// residual, which the reconstruction reports as a flat surface.
 fn bulging_surface() -> DensePhotoMap {
     let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
     let cell = map.grid_cell_size() as f32;
