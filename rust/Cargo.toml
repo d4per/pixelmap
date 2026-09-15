@@ -2,11 +2,18 @@
 members = [
     "command_line_tool",
     "model_3d",
+    "multiview",
+    "multiview_cli",
     "pixelmap",
     "viewer",
 ]
 
 resolver = "2"
+
+# The multiview tests run the real matcher on rendered scenes. Unoptimized, a single
+# solve takes over ten seconds.
+[profile.test.package.pixelmap]
+opt-level = 3
 
 [profile.release]
 # codegen-units = 1 so LTO can actually inline across the whole hot path.

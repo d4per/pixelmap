@@ -1,0 +1,20 @@
+[package]
+name = "pixelmap_multiview"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Default features off so that the `parallel` passthrough below is the only way rayon gets
+# in: the wasm build has to be able to leave it out.
+pixelmap = { path = "../pixelmap", version = "0.2.0", default-features = false }
+# All of the geometry — essential matrices, PnP, triangulation, bundle adjustment — is
+# written here on nalgebra rather than taken from rust-cv, whose crates pin nalgebra 0.21.
+nalgebra = "0.33"
+
+[features]
+default = ["parallel"]
+parallel = ["pixelmap/parallel"]
+
+[lib]
+name = "pixelmap_multiview"
