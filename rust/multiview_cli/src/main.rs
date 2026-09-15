@@ -1,9 +1,11 @@
 //! `pixelmap-multiview`: reconstruct a scene from three or more photos on disc.
 //!
 //! The library takes RGBA buffers and intrinsics. Everything that touches files happens
-//! here: decoding, EXIF orientation and focal length, and resizing every photo to one
-//! common size.
+//! here: decoding, EXIF orientation and focal length, resizing every photo to one common
+//! size, and writing the results.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,17 +16,20 @@ use image::imageops::FilterType;
 use image::DynamicImage;
 use nalgebra::Rotation3;
 use pixelmap::{Correspondence, Photo, ProcessingMode, DEFAULT_SEED};
-use pixelmap_multiview::pairs::{self, MIN_PAIR_COVERAGE};
-use pixelmap_multiview::rng::Rng;
+use pixelmap_multiview::depth::DepthMap;
+use pixelmap_multiview::pipeline::{self, Reconstruction};
+use pixelmap_multiview::sfm::SparseModel;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::twoview::{self, Params, Verdict};
-use pixelmap_multiview::{input, Flow, FocalSource, Intrinsics, PairId, ViewId};
+use pixelmap_multiview::tracks::Track;
+use pixelmap_multiview::{
+    align, export, input, Event, Flow, FocalSource, Intrinsics, PairId, Pose, Stage, ViewId, World,
+};
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Reconstruct a 3D model from three or more photos of the same scene."
+    about = "Reconstruct a textured 3D model from three or more photos of the same scene."
 )]
 struct Args {
     /// Photos of the scene, all from the same camera at the same zoom. At least three.
@@ -57,7 +62,8 @@ struct Args {
     #[arg(long, default_value = "low")]
     processing_mode: ProcessingMode,
 
-    /// Write intermediate results (the normalized photos, for now) into this directory.
+    /// Write the photos as used, the sparse model, the depth maps and the textured mesh (as
+    /// OBJ and X3D) into this directory.
     #[arg(long)]
     dump_dir: Option<PathBuf>,
 
@@ -65,6 +71,11 @@ struct Args {
     /// estimate of how long a reconstruction takes derives from this number.
     #[arg(long)]
     time_pair: bool,
+
+    /// Refine the focal length during bundle adjustment. Always on when the photos carry
+    /// no EXIF focal length.
+    #[arg(long)]
+    refine_focal: bool,
 }
 
 fn main() -> ExitCode {
@@ -106,12 +117,16 @@ fn run(args: Args) -> Result<(), String> {
         match intrinsics.source {
             FocalSource::Provided => "provided",
             FocalSource::Exif35mm => "from EXIF",
-            _ => "ESTIMATED: no EXIF focal length, the model may be skewed",
+            _ => "ESTIMATED: no EXIF focal length, so it will be refined",
         }
     );
 
     if let Some(dir) = &args.dump_dir {
-        dump_photos(dir, &photos)?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        for (index, photo) in photos.iter().enumerate() {
+            save_photo(&dir.join(format!("view_{index}.png")), photo)?;
+        }
     }
 
     let seed = seed();
@@ -119,90 +134,189 @@ fn run(args: Args) -> Result<(), String> {
         return time_pair(&args, &photos, seed);
     }
 
+    let mut params = pipeline::Params {
+        quality: args.processing_mode,
+        seed,
+        ..pipeline::Params::default()
+    };
+    params.ba.refine_focal = args.refine_focal;
+
     let start = Instant::now();
-    let graph = pairs::compute(&photos, args.processing_mode, seed, &mut |event| {
-        eprint!("\r{:5.1}%  {:<60}", event.fraction() * 100.0, event.message);
+    let mut mapping_line = false;
+    let result = pipeline::run(&photos, &intrinsics, &params, &mut |event| {
+        print_event(&event, &mut mapping_line);
         Flow::Continue(())
-    })
-    .map_err(|e| e.to_string())?;
-    eprintln!(
-        "\rmapped every pair in {:.1} s{:<60}",
-        start.elapsed().as_secs_f64(),
-        ""
-    );
-
-    let connected =
-        pairs::require_connected(&graph, MIN_PAIR_COVERAGE).map_err(|e| e.to_string())?;
-    if connected.len() < photos.len() {
-        let dropped: Vec<String> = (0..photos.len() as u32)
-            .map(ViewId)
-            .filter(|v| !connected.contains(v))
-            .map(|v| v.to_string())
-            .collect();
-        eprintln!(
-            "warning: dropping {}: no pair with at least {:.0}% coverage links it to the rest",
-            dropped.join(", "),
-            MIN_PAIR_COVERAGE * 100.0
-        );
+    });
+    if mapping_line {
+        eprintln!();
     }
+    let reconstruction = result.map_err(|e| e.to_string())?;
+    println!("reconstructed in {:.1} s", start.elapsed().as_secs_f64());
 
+    if let Some(truth) = &truth {
+        report_truth(truth, &reconstruction);
+    }
+    if let Some(dir) = &args.dump_dir {
+        write_outputs(dir, &photos, &reconstruction)?;
+    }
+    Ok(())
+}
+
+/// Prints a progress event. The many steps of mapping share one line that rewrites
+/// itself; every stage summary gets a line of its own.
+fn print_event(event: &Event, mapping_line: &mut bool) {
+    if event.stage == Stage::Pairs && event.message.starts_with("mapping ") {
+        eprint!("\r{:5.1}%  {:<72}", event.fraction() * 100.0, event.message);
+        *mapping_line = true;
+        return;
+    }
+    if *mapping_line {
+        eprint!("\r{:<80}\r", "");
+        *mapping_line = false;
+    }
     println!(
-        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>9}  verdict",
-        "pair", "coverage", "matches", "inliers", "angle", "parallax"
+        "{:5.1}%  {}: {}",
+        event.fraction() * 100.0,
+        event.stage,
+        event.message
     );
-    let root = Rng::new(seed);
-    for (index, (pair, mapping)) in graph.pairs().enumerate() {
-        let estimate = twoview::estimate(
-            pair,
-            mapping,
-            &intrinsics,
-            (width, height),
-            &Params::default(),
-            &mut root.derive(index as u64),
-        );
-        match estimate {
-            Ok(estimate) => {
-                let verdict = match &estimate.verdict {
-                    Verdict::Usable => "usable".to_string(),
-                    Verdict::Degenerate(reason) => reason.to_string(),
-                };
-                println!(
-                    "{:<10} {:>7.1}% {:>8} {:>7.1}% {:>7.1}° {:>8.2}°  {verdict}",
-                    pair.to_string(),
-                    mapping.coverage() * 100.0,
-                    estimate.matches,
-                    estimate.inlier_ratio * 100.0,
-                    estimate.median_angle_deg,
-                    estimate.structure_deg,
-                );
-                if let Some(truth) = &truth {
-                    let expected = truth.relative_pose(pair);
-                    println!(
-                        "{:<10} against the true pose: rotation off by {:.2}°, translation direction off by {:.2}°",
-                        "",
-                        angle_between(&estimate.pose.rotation, &expected.rotation),
-                        estimate
-                            .pose
-                            .translation
-                            .angle(&expected.translation)
-                            .to_degrees(),
-                    );
-                }
-            }
-            Err(reason) => println!(
-                "{:<10} {:>7.1}% {:>8} {:>8} {:>8} {:>9}  {reason}",
-                pair.to_string(),
-                mapping.coverage() * 100.0,
-                "-",
-                "-",
-                "-",
-                "-"
-            ),
+}
+
+/// Compares every stage of a reconstruction of a synthetic scene with the ground truth.
+fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
+    println!();
+    println!("against the ground truth:");
+    for report in &r.pairs {
+        if let Ok(estimate) = &report.estimate {
+            let expected = truth.relative_pose(report.pair);
+            println!(
+                "  {}: rotation off by {:.2}°, translation direction off by {:.2}°",
+                report.pair,
+                angle_between(&estimate.pose.rotation, &expected.rotation),
+                estimate
+                    .pose
+                    .translation
+                    .angle(&expected.translation)
+                    .to_degrees()
+            );
         }
     }
+    if let Some((_, cameras, points)) = align_with_truth(truth, &r.tracks, &r.registered) {
+        println!(
+            "  registered: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
+        );
+    }
+    let Some((similarity, cameras, points)) = align_with_truth(truth, &r.tracks, &r.adjusted)
+    else {
+        eprintln!("could not align the reconstruction with the ground truth");
+        return;
+    };
+    println!(
+        "  bundle adjusted: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
+    );
 
-    eprintln!("registration and the stages after it are not implemented yet");
-    Ok(())
+    let mut depth_errors: Vec<f64> = r
+        .depth
+        .iter()
+        .flat_map(|map| {
+            (0..map.rows)
+                .flat_map(move |row| (0..map.columns).map(move |column| (map, column, row)))
+        })
+        .filter_map(|(map, column, row)| {
+            let d = map.get(column, row)? as f64 * similarity.scale;
+            let t = truth.depth(map.view, map.pixel(column, row))?;
+            Some((d - t).abs() / t * 100.0)
+        })
+        .collect();
+    if !depth_errors.is_empty() {
+        println!(
+            "  depth: median error {:.2}%, 95th percentile {:.2}%",
+            percentile(&mut depth_errors, 0.5),
+            percentile(&mut depth_errors, 0.95)
+        );
+    }
+
+    let extent = camera_spread(truth);
+    let mesh = &r.fused.mesh;
+    let mut distances: Vec<f64> = mesh
+        .positions
+        .iter()
+        .map(|p| truth.scene.distance(&similarity.apply(p)) / extent * 100.0)
+        .collect();
+    let mut colour_errors: Vec<f64> = mesh
+        .positions
+        .iter()
+        .zip(&r.texture.vertex_colours)
+        .map(|(p, colour)| {
+            let expected = truth.scene.colour(&similarity.apply(p));
+            (0..3)
+                .map(|k| (colour[k] as f64 - expected[k] as f64).abs())
+                .sum::<f64>()
+                / 3.0
+        })
+        .collect();
+    if !distances.is_empty() {
+        println!(
+            "  mesh: median distance {:.2}%, 90th percentile {:.2}% of the camera spread",
+            percentile(&mut distances, 0.5),
+            percentile(&mut distances, 0.9)
+        );
+        println!(
+            "  vertex colours: off by a median {:.1}, 90th percentile {:.1} levels of 255",
+            percentile(&mut colour_errors, 0.5),
+            percentile(&mut colour_errors, 0.9)
+        );
+    }
+}
+
+/// Aligns `model` to the truth on its cameras and points together. Returns the
+/// similarity, the largest camera error and the median point error, both as percentages
+/// of the true cameras' spread.
+fn align_with_truth(
+    truth: &SyntheticSet,
+    tracks: &[Track],
+    model: &SparseModel,
+) -> Option<(align::Similarity, f64, f64)> {
+    let mut estimated = Vec::new();
+    let mut expected = Vec::new();
+    for view in model.registered() {
+        estimated.push(model.cameras[view.index()]?.centre());
+        expected.push(truth.poses[view.index()].centre());
+    }
+    let cameras = estimated.len();
+    for point in &model.points {
+        let track = &tracks[point.track];
+        let surface = track
+            .observation(track.anchor)
+            .and_then(|p| truth.surface_point(track.anchor, p));
+        if let Some(surface) = surface {
+            estimated.push(point.position.0);
+            expected.push(surface.0);
+        }
+    }
+    let similarity = align::umeyama(&estimated, &expected)?;
+    let extent = camera_spread(truth);
+    let mut errors: Vec<f64> = estimated
+        .iter()
+        .zip(&expected)
+        .map(|(e, x)| (similarity.apply(e) - x).norm() / extent * 100.0)
+        .collect();
+    let camera_error = errors[..cameras].iter().copied().fold(0.0, f64::max);
+    let point_error = percentile(&mut errors[cameras..], 0.5);
+    Some((similarity, camera_error, point_error))
+}
+
+fn camera_spread(truth: &SyntheticSet) -> f64 {
+    truth
+        .poses
+        .iter()
+        .flat_map(|a| {
+            truth
+                .poses
+                .iter()
+                .map(move |b| (a.centre() - b.centre()).norm())
+        })
+        .fold(0.0, f64::max)
 }
 
 /// The angle, in degrees, of the rotation taking `b` to `a`.
@@ -210,6 +324,117 @@ fn angle_between(a: &Rotation3<f64>, b: &Rotation3<f64>) -> f64 {
     // `Rotation3::angle` does not clamp, and a near-perfect estimate lands just above 1.
     let cos = ((a * b.inverse()).matrix().trace() - 1.0) / 2.0;
     cos.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+fn percentile(values: &mut [f64], q: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_by(f64::total_cmp);
+    values[((values.len() - 1) as f64 * q) as usize]
+}
+
+/// Writes the sparse model, depth maps and textured mesh into `dir`.
+fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+
+    let points: Vec<(World, [u8; 3])> = r
+        .adjusted
+        .points
+        .iter()
+        .map(|p| {
+            let track = &r.tracks[p.track];
+            let anchor = track
+                .observation(track.anchor)
+                .expect("a track observes its anchor");
+            let colour = export::sample_colour(&photos[track.anchor.index()], anchor);
+            (p.position, colour)
+        })
+        .collect();
+    let cameras: Vec<Pose> = r.adjusted.cameras.iter().flatten().copied().collect();
+    write_file(&dir.join("sparse.ply"), |out| {
+        export::write_ply(out, &points, &cameras, &r.intrinsics, r.size, 0.3)
+    })?;
+
+    for map in &r.depth {
+        write_depth_png(&dir.join(format!("depth_{}.png", map.view.0)), map)?;
+    }
+
+    let mesh = &r.fused.mesh;
+    write_file(&dir.join("mesh.obj"), |out| {
+        export::write_textured_obj(out, mesh, &r.texture, "mesh.mtl")
+    })?;
+    write_file(&dir.join("mesh.mtl"), |out| {
+        export::write_mtl(out, "mesh_texture.png")
+    })?;
+    save_photo(&dir.join("mesh_texture.png"), &r.texture.atlas)?;
+    write_file(&dir.join("mesh.x3d"), |out| {
+        export::write_textured_x3d(out, mesh, &r.texture, "mesh_texture.png")
+    })?;
+    write_file(&dir.join("mesh_colours.ply"), |out| {
+        export::write_ply_mesh(out, mesh, &r.texture.vertex_colours)
+    })?;
+
+    eprintln!(
+        "wrote view_N.png, sparse.ply, depth_N.png, mesh.obj, mesh.mtl, mesh.x3d, mesh_texture.png and mesh_colours.ply to {}",
+        dir.display()
+    );
+    Ok(())
+}
+
+fn write_file(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
+) -> Result<(), String> {
+    File::create(path)
+        .and_then(|file| {
+            let mut out = BufWriter::new(file);
+            write(&mut out)?;
+            out.flush()
+        })
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+fn save_photo(path: &Path, photo: &Photo) -> Result<(), String> {
+    image::RgbaImage::from_raw(
+        photo.width() as u32,
+        photo.height() as u32,
+        photo.as_rgba().to_vec(),
+    )
+    .expect("buffer came from a Photo of exactly these dimensions")
+    .save(path)
+    .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// A depth map as a greyscale image: near is bright, far is dark, unknown is black.
+fn write_depth_png(path: &Path, map: &DepthMap) -> Result<(), String> {
+    let mut known: Vec<f32> = map
+        .depth
+        .iter()
+        .copied()
+        .filter(|d| d.is_finite())
+        .collect();
+    known.sort_by(f32::total_cmp);
+    let (near, far) = match known.len() {
+        0 => (0.0, 1.0),
+        n => (known[n / 50], known[n - 1 - n / 50]),
+    };
+    let range = (far - near).max(f32::EPSILON);
+    let pixels = map
+        .depth
+        .iter()
+        .map(|&d| {
+            if d.is_finite() {
+                (255.0 - ((d - near) / range).clamp(0.0, 1.0) * 215.0) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    image::GrayImage::from_raw(map.columns as u32, map.rows as u32, pixels)
+        .expect("one byte per sample")
+        .save(path)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 fn seed() -> u64 {
@@ -393,24 +618,6 @@ fn intrinsics(
 
 fn describe_focal(focal: Option<f64>) -> String {
     focal.map_or_else(|| "none".to_string(), |f| format!("{f} mm equivalent"))
-}
-
-fn dump_photos(dir: &Path, photos: &[Arc<Photo>]) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    for (index, photo) in photos.iter().enumerate() {
-        let path = dir.join(format!("view_{index}.png"));
-        let buffer = image::RgbaImage::from_raw(
-            photo.width() as u32,
-            photo.height() as u32,
-            photo.as_rgba().to_vec(),
-        )
-        .expect("buffer came from a Photo of exactly these dimensions");
-        buffer
-            .save(&path)
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    }
-    eprintln!("wrote {} photos to {}", photos.len(), dir.display());
-    Ok(())
 }
 
 fn time_pair(args: &Args, photos: &[Arc<Photo>], seed: u64) -> Result<(), String> {

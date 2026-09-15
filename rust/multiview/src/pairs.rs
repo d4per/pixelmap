@@ -82,6 +82,14 @@ impl<L: PairLookup> PairGraph<L> {
         (pair.b().index() < self.views).then(|| Directed::new(self.get(pair), from > to))
     }
 
+    /// The largest typical localization error among the mappings, in photo pixels.
+    pub fn precision_px(&self) -> f32 {
+        self.maps
+            .iter()
+            .map(|m| m.precision_px())
+            .fold(0.0, f32::max)
+    }
+
     /// Every pair with its mapping.
     pub fn pairs(&self) -> impl Iterator<Item = (PairId, &L)> {
         PairId::all(self.views as u32).zip(&self.maps)

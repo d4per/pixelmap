@@ -44,6 +44,19 @@ pub enum Surface {
 }
 
 impl Surface {
+    /// The distance from `p` to the nearest point of this surface.
+    pub fn distance(&self, p: &Point3<f64>) -> f64 {
+        match self {
+            Surface::Rectangle { origin, u, v } => {
+                let offset = p - origin;
+                let a = (offset.dot(u) / u.norm_squared()).clamp(0.0, 1.0);
+                let b = (offset.dot(v) / v.norm_squared()).clamp(0.0, 1.0);
+                (p - (origin + u * a + v * b)).norm()
+            }
+            Surface::Sphere { centre, radius } => ((p - centre).norm() - radius).abs(),
+        }
+    }
+
     /// The distance along a ray with unit direction `dir` to where it first hits this
     /// surface, if it does.
     fn intersect(&self, origin: &Point3<f64>, dir: &Vector3<f64>) -> Option<f64> {
@@ -166,6 +179,14 @@ impl Scene {
             "corner" => Some(Scene::corner()),
             _ => None,
         }
+    }
+
+    /// The distance from `p` to the nearest surface.
+    pub fn distance(&self, p: &Point3<f64>) -> f64 {
+        self.surfaces
+            .iter()
+            .map(|s| s.distance(p))
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// The distance to the nearest surface along a ray with unit direction `dir`.

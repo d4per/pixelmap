@@ -24,6 +24,8 @@ pub enum FocalSource {
     /// A guess: [`ESTIMATED_FOCAL_FACTOR`] times the long edge. Worth refining during
     /// bundle adjustment, and worth telling the user about.
     Estimated,
+    /// Refined by bundle adjustment, starting from one of the other sources.
+    Refined,
 }
 
 /// A pinhole camera with square pixels and no skew.

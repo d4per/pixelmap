@@ -1,6 +1,6 @@
 //! Points from rays: where the lines of sight of several cameras meet.
 
-use nalgebra::{Matrix4, Point3};
+use nalgebra::{Matrix2x3, Matrix3, Matrix4, Point3, Vector2, Vector3};
 
 use crate::pose::Pose;
 use crate::types::{Norm, World};
@@ -39,6 +39,75 @@ pub fn dlt(observations: &[(Pose, Norm)]) -> Option<World> {
     (point.coords.iter().all(|c| c.is_finite())).then_some(World(point))
 }
 
+/// Gauss–Newton on the point's reprojection error, in normalized camera units, starting
+/// from `initial`. A step is kept only if it lowers the error.
+pub fn refine(observations: &[(Pose, Norm)], initial: World, iterations: usize) -> World {
+    let cost = |x: &Point3<f64>| -> f64 {
+        observations
+            .iter()
+            .map(|(pose, n)| {
+                let c = pose.to_camera(x);
+                if c.z <= 1e-12 {
+                    1.0
+                } else {
+                    (c.x / c.z - n.x()).powi(2) + (c.y / c.z - n.y()).powi(2)
+                }
+            })
+            .sum()
+    };
+    let mut x = initial.0;
+    let mut current = cost(&x);
+    for _ in 0..iterations {
+        let mut h = Matrix3::<f64>::zeros();
+        let mut g = Vector3::<f64>::zeros();
+        for (pose, n) in observations {
+            let c = pose.to_camera(&x);
+            if c.z <= 1e-12 {
+                continue;
+            }
+            let projection = Matrix2x3::new(
+                1.0 / c.z,
+                0.0,
+                -c.x / (c.z * c.z),
+                0.0,
+                1.0 / c.z,
+                -c.y / (c.z * c.z),
+            );
+            let j = projection * pose.rotation.matrix();
+            let r = Vector2::new(c.x / c.z - n.x(), c.y / c.z - n.y());
+            h += j.transpose() * j;
+            g += j.transpose() * r;
+        }
+        let Some(delta) = h.cholesky().map(|c| c.solve(&-g)) else {
+            break;
+        };
+        let candidate = x + delta;
+        let candidate_cost = cost(&candidate);
+        if candidate_cost.is_nan() || candidate_cost >= current {
+            break;
+        }
+        x = candidate;
+        current = candidate_cost;
+        if delta.norm() <= 1e-12 * (1.0 + x.coords.norm()) {
+            break;
+        }
+    }
+    World(x)
+}
+
+/// The reprojection error of `point` in each observation, in normalized camera units.
+/// Infinite where the point is behind the camera.
+pub fn reprojection_errors<'a>(
+    observations: &'a [(Pose, Norm)],
+    point: &'a World,
+) -> impl Iterator<Item = f64> + 'a {
+    observations.iter().map(move |(pose, n)| {
+        pose.project(point).map_or(f64::INFINITY, |p| {
+            ((p.x() - n.x()).powi(2) + (p.y() - n.y()).powi(2)).sqrt()
+        })
+    })
+}
+
 /// Whether `point` lies in front of every camera in `observations`.
 pub fn in_front(observations: &[(Pose, Norm)], point: &World) -> bool {
     observations
@@ -57,7 +126,6 @@ pub fn triangulation_angle(centre_a: &Point3<f64>, centre_b: &Point3<f64>, point
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nalgebra::Vector3;
 
     #[test]
     fn recovers_a_point_seen_by_three_cameras() {

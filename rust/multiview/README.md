@@ -7,16 +7,30 @@ goes further: it maps every pair of N ≥ 3 photos with [`pixelmap`](../pixelmap
 where each photo was taken from, and fuses all of the views into one mesh in a single
 frame.
 
-**Status: under construction.** Implemented so far:
+The stages, in order:
 
 1. **Pairwise correspondence** — pixelmap over every pair, and a check that the
    well-mapped pairs link enough views together.
 2. **Two-view geometry** — the relative pose of each pair from an 8-point essential
    matrix in RANSAC, plus triage that flags cameras which only rotated or moved too
    little to measure depth.
+3. **Tracks** — points followed across every view that sees them, kept only where each
+   observation agrees with every other view's mapping.
+4. **Registration** — the best pair defines the frame, the other views are added by
+   PnP, and every track is triangulated over all the views that see it.
+5. **Bundle adjustment** — every camera and point refined together by Levenberg–Marquardt
+   with a Schur complement and a Huber loss, optionally including the focal length.
+6. **Dense depth** — a depth map per view from the full correspondences, solved along each
+   pixel's ray and kept only where the other views' depth maps agree.
+7. **Fusion** — the depth maps merged in a sparse truncated signed distance grid, and the
+   surface extracted with surface nets into a mesh.
+8. **Texturing** — a colour per vertex, and a texture atlas in which each part of the surface
+   comes from the photo that sees it best.
 
-Next, in order: tracks with a cycle-consistency filter, incremental registration, bundle
-adjustment, dense depth, TSDF fusion and texturing.
+`pipeline::run` runs every stage in one call, reporting a summary as each finishes. It
+returns every intermediate result as well as the textured mesh. Each way a capture can
+fail, such as a camera that only turned, a flat scene, or photos with too little in
+common, comes back as an error that names the stage and says what to do differently.
 
 `synthetic` renders scenes with known geometry, and answers correspondence queries
 exactly, so each stage can be tested against ground truth instead of against the
@@ -27,8 +41,13 @@ builds for `wasm32-unknown-unknown` with `--no-default-features`. Decoding, EXIF
 resizing are the caller's job; the `pixelmap-multiview` binary in
 [`../multiview_cli`](../multiview_cli) does them for photos on disc:
 
-    cargo run --release -p pixelmap_multiview_cli -- a.jpg b.jpg c.jpg d.jpg
+    cargo run --release -p pixelmap_multiview_cli -- a.jpg b.jpg c.jpg d.jpg --dump-dir out
     cargo run --release -p pixelmap_multiview_cli -- --synthetic sphere --views 4
+
+With `--dump-dir`, the sparse model is written to `out/sparse.ply`, with coloured points and a
+red pyramid per camera; the textured surface to `out/mesh.obj`, with `mesh.mtl` and
+`mesh_texture.png`, and as X3D to `out/mesh.x3d`; the surface with a colour per vertex to `out/mesh_colours.ply`; and each
+depth map to `out/depth_N.png`. They open in MeshLab, Blender or CloudCompare.
 
 It is not published to crates.io.
 

@@ -50,6 +50,12 @@ pub struct Params {
     /// How far the matches must stray from what a pure rotation explains, as a multiple
     /// of the lookup's precision, for the pair to count as seeing any depth at all.
     pub min_structure: f64,
+    /// The inlier threshold for the flat-scene check's homography, as a multiple of the
+    /// essential matrix's.
+    pub homography_threshold: f64,
+    /// Above this share of the inliers explained by one homography, the scene counts as
+    /// flat.
+    pub max_homography_ratio: f64,
 }
 
 impl Default for Params {
@@ -63,6 +69,8 @@ impl Default for Params {
             min_inlier_ratio: 0.5,
             min_median_angle_deg: 2.0,
             min_structure: 2.0,
+            homography_threshold: 1.5,
+            max_homography_ratio: 0.95,
         }
     }
 }
@@ -72,6 +80,8 @@ impl Default for Params {
 pub struct RelativePose {
     /// The pair.
     pub pair: PairId,
+    /// The fraction of the first photo the pair's mapping covers.
+    pub coverage: f32,
     /// The second camera in the first camera's frame, with `‖t‖ = 1`. The pair's own scale
     /// is unknown; registration resolves it.
     pub pose: Pose,
@@ -89,6 +99,8 @@ pub struct RelativePose {
     /// rotation. Near zero when the camera only turned and nothing about depth can be
     /// learnt.
     pub structure_deg: f64,
+    /// The share of the inliers a single homography explains. Near 1 for a flat scene.
+    pub homography_ratio: f64,
     /// The fraction of an 8 × 8 grid over the first photo that holds at least one inlier.
     pub spread: f64,
     /// The inlier threshold used, in photo pixels.
@@ -142,6 +154,14 @@ pub enum Degeneracy {
         /// How far they need to.
         required_deg: f64,
     },
+    /// One plane explains nearly every match: the scene is flat, or the camera barely
+    /// moved. Either way, the 8-point method cannot recover camera motion.
+    Planar {
+        /// The share of the inliers one homography explains.
+        homography_ratio: f64,
+        /// The largest share allowed.
+        max_ratio: f64,
+    },
     /// The cameras moved, but too little for depth to be measured precisely.
     SmallBaseline {
         /// The median triangulation angle, in degrees.
@@ -167,7 +187,17 @@ impl fmt::Display for Degeneracy {
             ),
             Degeneracy::NoParallax { structure_deg, required_deg } => write!(
                 f,
-                "the camera rotated without moving ({structure_deg:.2}° of parallax, need {required_deg:.2}°); step sideways between shots"
+                "the camera turned but barely moved ({structure_deg:.2}° of parallax, need {required_deg:.2}°); step sideways between shots"
+            ),
+            Degeneracy::Planar {
+                homography_ratio,
+                max_ratio,
+            } => write!(
+                f,
+                "one plane explains {:.0}% of the matches (at most {:.0}% allowed): the scene is too flat, \
+                 or the camera barely moved; step sideways between shots and include things at different distances",
+                homography_ratio * 100.0,
+                max_ratio * 100.0
             ),
             Degeneracy::SmallBaseline { median_angle_deg, required_deg } => write!(
                 f,
@@ -284,6 +314,14 @@ pub fn estimate<L: PairLookup + ?Sized>(
     let structure_deg = rotation_residual(&x1, &x2, &inliers);
     let inlier_ratio = inliers.len() as f64 / n as f64;
     let spread = spread(&matches, &inliers, size);
+    let homography_ratio = homography_ratio(
+        &x1,
+        &x2,
+        &inliers,
+        params.homography_threshold * threshold_px / focal,
+        params.confidence,
+        rng,
+    );
 
     let required_structure_deg = (params.min_structure * precision_px / focal).to_degrees();
     let verdict = if inlier_ratio < params.min_inlier_ratio {
@@ -296,6 +334,14 @@ pub fn estimate<L: PairLookup + ?Sized>(
             structure_deg,
             required_deg: required_structure_deg,
         })
+    } else if homography_ratio > params.max_homography_ratio {
+        // One plane explains nearly every match. From two views, a flat scene and a camera
+        // that barely moved look alike. The 8-point pose is unreliable either way, and so
+        // is any angle computed from it, so this comes before the baseline check.
+        Verdict::Degenerate(Degeneracy::Planar {
+            homography_ratio,
+            max_ratio: params.max_homography_ratio,
+        })
     } else if median_angle_deg < params.min_median_angle_deg {
         Verdict::Degenerate(Degeneracy::SmallBaseline {
             median_angle_deg,
@@ -307,6 +353,7 @@ pub fn estimate<L: PairLookup + ?Sized>(
 
     Ok(RelativePose {
         pair,
+        coverage: lookup.coverage(),
         pose,
         essential,
         matches: n,
@@ -314,6 +361,7 @@ pub fn estimate<L: PairLookup + ?Sized>(
         inlier_ratio,
         median_angle_deg,
         structure_deg,
+        homography_ratio,
         spread,
         threshold_px,
         iterations,
@@ -323,7 +371,7 @@ pub fn estimate<L: PairLookup + ?Sized>(
 
 /// How many RANSAC iterations give `confidence` of drawing one all-inlier sample of
 /// `sample_size` when a fraction `inlier_ratio` of the data are inliers.
-fn ransac_iterations(inlier_ratio: f64, sample_size: i32, confidence: f64) -> usize {
+pub(crate) fn ransac_iterations(inlier_ratio: f64, sample_size: i32, confidence: f64) -> usize {
     let p = inlier_ratio.powi(sample_size);
     if p <= f64::EPSILON {
         usize::MAX
@@ -568,6 +616,95 @@ fn rotation_residual(x1: &[Vector3<f64>], x2: &[Vector3<f64>], inliers: &[usize]
     median(residuals)
 }
 
+/// The share of `inliers` a single homography explains, found by RANSAC over 4-point
+/// samples. Close to 1 when the scene is flat, and also when the camera only turned.
+fn homography_ratio(
+    x1: &[Vector3<f64>],
+    x2: &[Vector3<f64>],
+    inliers: &[usize],
+    threshold: f64,
+    confidence: f64,
+    rng: &mut Rng,
+) -> f64 {
+    const MAX_ITERATIONS: usize = 500;
+    let step = (inliers.len() / 2000).max(1);
+    let subset: Vec<usize> = inliers.iter().step_by(step).copied().collect();
+    if subset.len() < 8 {
+        return 0.0;
+    }
+    let threshold_sq = threshold * threshold;
+    let mut best = 0;
+    let mut sample = [0usize; 4];
+    let mut needed = MAX_ITERATIONS;
+    let mut iterations = 0;
+    while iterations < needed {
+        iterations += 1;
+        rng.sample_distinct(subset.len(), &mut sample);
+        let chosen = sample.map(|k| subset[k]);
+        let Some(h) = homography(x1, x2, &chosen) else {
+            continue;
+        };
+        let count = subset
+            .iter()
+            .filter(|&&i| transfer_sq(&h, &x1[i], &x2[i]) < threshold_sq)
+            .count();
+        if count > best {
+            best = count;
+            let ratio = count as f64 / subset.len() as f64;
+            needed = ransac_iterations(ratio, 4, confidence).min(MAX_ITERATIONS);
+        }
+    }
+    best as f64 / subset.len() as f64
+}
+
+/// The normalized DLT homography taking the points of `x1` at `indices` onto `x2`.
+fn homography(x1: &[Vector3<f64>], x2: &[Vector3<f64>], indices: &[usize]) -> Option<Matrix3<f64>> {
+    let t1 = hartley(indices.iter().map(|&i| &x1[i]))?;
+    let t2 = hartley(indices.iter().map(|&i| &x2[i]))?;
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for &i in indices {
+        let p = t1 * x1[i];
+        let q = t2 * x2[i];
+        let r1 = SVector::<f64, 9>::from_column_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            -p.x,
+            -p.y,
+            -1.0,
+            q.y * p.x,
+            q.y * p.y,
+            q.y,
+        ]);
+        let r2 = SVector::<f64, 9>::from_column_slice(&[
+            p.x,
+            p.y,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -q.x * p.x,
+            -q.x * p.y,
+            -q.x,
+        ]);
+        ata += r1 * r1.transpose() + r2 * r2.transpose();
+    }
+    let eigen = ata.symmetric_eigen();
+    let v = eigen.eigenvectors.column(eigen.eigenvalues.imin());
+    let entries: [f64; 9] = std::array::from_fn(|k| v[k]);
+    let h = t2.try_inverse()? * Matrix3::from_row_slice(&entries) * t1;
+    h.iter().all(|x| x.is_finite()).then_some(h)
+}
+
+/// Squared distance between `H · a` and `b`, in normalized units.
+fn transfer_sq(h: &Matrix3<f64>, a: &Vector3<f64>, b: &Vector3<f64>) -> f64 {
+    let y = h * a;
+    if y.z.abs() < 1e-12 {
+        return f64::INFINITY;
+    }
+    (y.x / y.z - b.x).powi(2) + (y.y / y.z - b.y).powi(2)
+}
+
 fn spread(matches: &[Match], inliers: &[usize], (width, height): (usize, usize)) -> f64 {
     const CELLS: usize = 8;
     let mut occupied = [false; CELLS * CELLS];
@@ -580,7 +717,7 @@ fn spread(matches: &[Match], inliers: &[usize], (width, height): (usize, usize))
     occupied.iter().filter(|&&o| o).count() as f64 / (CELLS * CELLS) as f64
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
+pub(crate) fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
     }

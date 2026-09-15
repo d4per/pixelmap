@@ -98,7 +98,11 @@ fn flags_a_baseline_too_small_to_measure_depth() {
     assert!(
         matches!(
             estimate.verdict,
-            Verdict::Degenerate(Degeneracy::NoParallax { .. } | Degeneracy::SmallBaseline { .. })
+            Verdict::Degenerate(
+                Degeneracy::NoParallax { .. }
+                    | Degeneracy::SmallBaseline { .. }
+                    | Degeneracy::Planar { .. }
+            )
         ),
         "{:?}",
         estimate.verdict
