@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use pixelmap::{DensePhotoMap, Photo};
-use pixelmap_model_3d::Model3D;
+use pixelmap_model_3d::{Model3D, Projection};
 
 const WIDTH: usize = 200;
 const HEIGHT: usize = 150;
@@ -22,12 +22,12 @@ fn photo() -> Arc<Photo> {
 }
 
 /// A correspondence field with real depth in it: a horizontal disparity that varies
-/// quadratically across the frame, as a surface bulging towards the camera would produce.
+/// quadratically across the frame. This is what a rectified stereo pair sees of a surface
+/// bulging towards the camera; larger disparity means nearer.
 ///
-/// The variation has to be non-linear. `Model3D` fits the affine part of the
-/// correspondence and reads depth out of what is left over, so a pure translation — or
-/// any disparity linear in `(x, y)` — is absorbed by that fit and leaves a zero
-/// residual, which the reconstruction reports as a flat surface.
+/// The variation has to be non-linear. A disparity that is constant, or linear in
+/// `(x, y)`, is what a plane produces. A single homography explains a plane as well as
+/// the epipolar geometry does, so `Model3D` treats such a pair as carrying no depth.
 fn bulging_surface() -> DensePhotoMap {
     let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
     let cell = map.grid_cell_size() as f32;
@@ -71,6 +71,27 @@ fn builds_a_textured_grid_from_a_mapping() {
         valid * 2 > cells,
         "only {valid} of {cells} cells were reconstructed"
     );
+}
+
+#[test]
+fn a_rectified_pair_is_reconstructed_in_perspective() {
+    let model = Model3D::new(&bulging_surface());
+    assert_eq!(model.projection(), Projection::Perspective);
+
+    let geometry = model.two_view_geometry().expect("geometry was estimated");
+    assert!(geometry.is_well_conditioned());
+    // A rectified pair: the second camera sits beside the first, looking the same way.
+    let turned = ((geometry.rotation.trace() - 1.0) / 2.0)
+        .clamp(-1.0, 1.0)
+        .acos();
+    assert!(turned.to_degrees() < 0.5, "camera turned {turned} rad");
+    assert!(geometry.translation.x.abs() > 0.99);
+
+    // The middle column has the largest disparity, so it is nearest the viewer.
+    let row = GRID_HEIGHT / 2;
+    let middle = model.get_texture_point(GRID_WIDTH / 2, row).z;
+    let side = model.get_texture_point(1, row).z;
+    assert!(middle > side, "middle z {middle} behind side z {side}");
 }
 
 #[test]

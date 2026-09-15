@@ -5,31 +5,137 @@
 //! the texture coordinates they came from, and [`Model3D::to_x3d`] writes that grid out
 //! as an X3D mesh.
 //!
+//! # How depth is recovered
+//!
+//! The two photos are treated as what they are: pictures from two perspective cameras.
+//!
+//! 1. A **fundamental matrix** is fitted to the correspondences with RANSAC and refined
+//!    on its inliers, which also discards matches that do not fit any single rigid
+//!    camera motion.
+//! 2. Assuming a focal length ([`Settings::focal_lengths`]) and a principal point at the
+//!    centre of the frame, it becomes an **essential matrix**, which factors into the
+//!    rotation and the direction of travel between the two cameras. Of its four
+//!    factorizations, the one that puts the scene in front of both cameras wins, so the
+//!    depth comes out the right way round for convex and concave scenes alike.
+//! 3. Every consistent correspondence is **triangulated**. Wild depths are dropped, a
+//!    3x3 median filter removes matching noise, and the result is centred and scaled so
+//!    its longer image-plane extent spans `[-1, 1]` — with depth on the same scale, so
+//!    the proportions are the triangulated ones.
+//!
+//! Two views do not always pin that geometry down: too few matches may agree on it, a
+//! single homography may explain the map just as well (a flat scene, or a camera that only
+//! turned), or the viewpoints may be too close for depth to rise above the noise. With
+//! [`Projection::Auto`], the default, such pairs fall back to an **affine** camera model,
+//! which reads a relative depth out of whatever an affine warp cannot explain.
+//! [`Model3D::projection`] says which model was used, and
+//! [`Model3D::two_view_geometry`] reports the perspective estimate either way.
+//!
 //! The correspondence itself comes from the [`pixelmap`] crate; this one only reads the
 //! finished [`DensePhotoMap`], so nothing here is on the algorithm's hot path.
 //!
 #![doc = include_str!("../doc/model-3d.md")]
 #![warn(missing_docs)]
 
+mod affine;
+mod perspective;
+mod rng;
+mod two_view;
+
+pub use two_view::TwoViewGeometry;
+
 use std::sync::Arc;
 
-use nalgebra::{DMatrix, Matrix2, SVD};
 use pixelmap::{DensePhotoMap, Photo};
 
-/// How deep the object is assumed to be, as a fraction of its smaller image-plane
-/// extent.
-///
-/// A two-view correspondence fixes shape only up to an unknown depth scale, so this
-/// has to be assumed rather than measured. Purely empirical: `0.3` is what looks right
-/// on test pairs.
-const Z_DEPTH_RATIO: f64 = 0.3;
+use two_view::PointPair;
 
-/// A residual spread smaller than this fraction of the image-plane extent counts as no
-/// depth signal at all.
-///
-/// Without it, a scene whose two views really are related by an affine warp would have
-/// its floating-point rounding noise stretched across the full depth range.
-const FLAT_EPSILON: f64 = 1e-6;
+/// The focal length [`Settings::default`] assumes for both cameras, as a multiple of the
+/// larger image dimension: about a 28 mm lens in 35 mm terms, typical of a phone's main
+/// camera.
+pub const DEFAULT_FOCAL_LENGTH: f64 = 0.8;
+
+/// The diagonal of a 36 x 24 mm frame, which is what a "35 mm equivalent" focal length
+/// is relative to.
+const FULL_FRAME_DIAGONAL_MM: f64 = 43.266_615_305_567_875;
+
+/// In the affine model, faces with an edge longer than this in model units are torn.
+const AFFINE_MAX_EDGE: f32 = 0.5;
+
+/// In the perspective model, an edge is torn when it is this many times longer than the
+/// grid spacing of a surface facing the camera at that depth. Six allows surfaces
+/// inclined up to about 80° from the viewing direction, and tears at real depth
+/// discontinuities such as the silhouette of a near object against a far background.
+const PERSPECTIVE_MAX_STRETCH: f32 = 6.0;
+
+/// Which camera model a reconstruction assumes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    /// Perspective when the two views determine it well, affine otherwise.
+    #[default]
+    Auto,
+    /// Always reconstruct under the perspective model. If no perspective geometry can be
+    /// estimated at all, the model is empty.
+    Perspective,
+    /// Always use the affine model, which never looks at camera geometry. Its depth scale
+    /// is a fixed guess and it assumes the middle of the scene is nearest the viewer.
+    Affine,
+}
+
+/// How [`Model3D::with_settings`] reconstructs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    /// Which camera model to assume. Defaults to [`Projection::Auto`].
+    pub projection: Projection,
+    /// The focal lengths of the cameras that took photo 1 and photo 2, each as a multiple
+    /// of the photo's larger dimension. Defaults to [`DEFAULT_FOCAL_LENGTH`] for both.
+    ///
+    /// A wrong value mostly stretches or squashes the model along the viewing direction.
+    /// [`Settings::focal_length_from_35mm`] converts the 35 mm equivalent focal length
+    /// most cameras record in their EXIF data.
+    pub focal_lengths: [f64; 2],
+    /// Seeds the RANSAC sampling, so the same mapping always gives the same model.
+    pub seed: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            projection: Projection::Auto,
+            focal_lengths: [DEFAULT_FOCAL_LENGTH; 2],
+            seed: 0x3D_5EED,
+        }
+    }
+}
+
+impl Settings {
+    /// Converts a 35 mm equivalent focal length, for a photo of `width` x `height`, into
+    /// the ratio [`Settings::focal_lengths`] expects.
+    ///
+    /// Only the aspect ratio of the dimensions matters, so the original photo's size and
+    /// the working resolution give the same answer.
+    pub fn focal_length_from_35mm(millimetres: f64, width: usize, height: usize) -> f64 {
+        let (w, h) = (width as f64, height as f64);
+        millimetres / FULL_FRAME_DIAGONAL_MM * w.hypot(h) / w.max(h)
+    }
+}
+
+/// Where the first camera sits in a perspective model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Viewpoint {
+    pub position: [f32; 3],
+    /// Radians, across the smaller dimension of the photo.
+    pub field_of_view: f32,
+}
+
+/// How to decide that a face spans a gap in the surface rather than the surface itself.
+enum Tearing {
+    /// The affine model's depth is compressed by a fixed ratio; undo that and compare
+    /// against a fixed length.
+    Affine { z_scale: f32 },
+    /// The perspective model's grid spacing grows with depth, so compare against the
+    /// spacing expected at each cell.
+    Perspective { spacing: Vec<f32> },
+}
 
 /// A 3D model built from a 2D grid of correspondences. Each cell in the grid has a
 /// position in 3D space (`x, y, z`) plus texture coordinates (`u, v`) mapping it
@@ -48,10 +154,10 @@ pub struct Model3D {
     /// describing each cell's 3D location and texture coordinates.
     grid: Vec<TexturePoint>,
 
-    /// Half the depth range the model was given, i.e. the factor the normalised depth
-    /// was multiplied by. Used to undo that scaling when culling stretched faces, so
-    /// the cull stays as sensitive to depth as it is to the image plane.
-    z_scale: f32,
+    projection: Projection,
+    geometry: Option<TwoViewGeometry>,
+    tearing: Tearing,
+    viewpoint: Option<Viewpoint>,
 }
 
 /// Represents a single point's 3D position along with texture coordinates.
@@ -65,9 +171,9 @@ pub struct TexturePoint {
     /// 3D z-coordinate of this point.
     pub z: f32,
 
-    /// Horizontal texture coordinate (U axis), typically in [0, 1].
+    /// Horizontal texture coordinate (U axis), in [0, 1].
     pub u: f32,
-    /// Vertical texture coordinate (V axis), typically in [0, 1].
+    /// Vertical texture coordinate (V axis), in [0, 1].
     pub v: f32,
 
     /// The x-index in the grid this point belongs to.
@@ -106,241 +212,82 @@ impl Default for TexturePoint {
 }
 
 impl Model3D {
-    /// Constructs a new `Model3D` from a given [`DensePhotoMap`].
+    /// Reconstructs a model from a mapping with [`Settings::default`].
     ///
-    /// Two of the three coordinates are already known: a grid cell `(x, y)` sits at
-    /// pixel `(x, y) * grid_cell_size` in photo 1. Those become the model's `x` and `y`
-    /// directly, under a single shared scale so the photo's aspect ratio survives, and
-    /// only the depth has to be solved for.
-    ///
-    /// The process, repeated for **two iterations** so the second one re-fits without
-    /// the outliers the first one found:
-    /// 1. Collects the valid cells (those with non-NaN coordinates) and takes the
-    ///    bounding box of their photo-1 positions.
-    /// 2. Centers `[x1, y1, x2, y2]` on its column means and least-squares fits the
-    ///    affine part, `[x2, y2] ~ [x1, y1] * W`. Whatever that cannot explain is the
-    ///    depth signal: for an affine camera the residual is `depth * b` for one fixed
-    ///    2-vector `b`, so an SVD of the residuals recovers `b` as its dominant
-    ///    direction and the per-point depth as the projection onto it.
-    /// 3. Picks the sign of that direction so the middle of the object is nearer to the
-    ///    viewer than its edges, since the SVD's own sign is arbitrary.
-    /// 4. Rescales the depth to [-1, 1] over its 10th/90th percentiles, drops cells
-    ///    that land far outside that (they are invalidated for the next iteration), and
-    ///    multiplies by a fixed fraction (`Z_DEPTH_RATIO`) of the smaller image-plane
-    ///    extent.
-    ///
-    /// # Returns
-    /// A `Model3D` whose grid cells now store `(x, y, z)` in 3D space, plus `(u, v)`
-    /// texture coordinates.
+    /// Grid cells that were never mapped, or whose depth could not be recovered, hold a
+    /// point with `NaN` coordinates.
     pub fn new(photo_mapping: &DensePhotoMap) -> Self {
-        let mut photo_mapping = photo_mapping.clone();
-        let (map_width, map_height) = photo_mapping.grid_dimensions();
+        Self::with_settings(photo_mapping, &Settings::default())
+    }
 
-        let mut result = Model3D {
-            grid_width: map_width,
-            grid_height: map_height,
-            photo: photo_mapping.photo1().clone(),
-            grid: vec![TexturePoint::default(); map_width * map_height],
-            z_scale: 1.0,
-        };
-
-        let grid_cell_size = photo_mapping.grid_cell_size();
-
-        // Perform two passes of cleanup and depth solving.
-        for _ in 0..2 {
-            // Collect valid points (non-NaN) into a vector for the fit.
-            let valid_points: Vec<_> = (0..map_height)
-                .flat_map(|y| {
-                    (0..map_width).filter_map({
-                        let value = photo_mapping.clone();
-                        move |x| {
-                            let (data_x, data_y) = value.grid_coordinates(x, y);
-                            if !data_x.is_nan() && !data_y.is_nan() {
-                                Some((
-                                    (x * grid_cell_size) as f64,
-                                    (y * grid_cell_size) as f64,
-                                    data_x as f64,
-                                    data_y as f64,
-                                ))
-                            } else {
-                                None
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            // The affine fit needs more points than it has parameters.
-            if valid_points.len() < 3 {
-                break;
-            }
-
-            // Bounding box of the photo-1 positions. This is the object's extent in the
-            // image plane, and it sets both the image-plane scale and the depth scale.
-            let (mut x_min, mut x_max) = (f64::INFINITY, f64::NEG_INFINITY);
-            let (mut y_min, mut y_max) = (f64::INFINITY, f64::NEG_INFINITY);
-            for p in &valid_points {
-                x_min = x_min.min(p.0);
-                x_max = x_max.max(p.0);
-                y_min = y_min.min(p.1);
-                y_max = y_max.max(p.1);
-            }
-            let x_extent = x_max - x_min;
-            let y_extent = y_max - y_min;
-            let x_center = (x_min + x_max) / 2.0;
-            let y_center = (y_min + y_max) / 2.0;
-
-            // One scale for both image-plane axes, so the aspect ratio is preserved:
-            // the longer of the two spans [-1, 1] and the shorter comes out shorter.
-            let plane_extent = x_extent.max(y_extent);
-            if plane_extent <= 0.0 {
-                break;
-            }
-            let plane_scale = 2.0 / plane_extent;
-
-            // Half the depth range, in the same units as the scaled image plane.
-            let z_scale = Z_DEPTH_RATIO * x_extent.min(y_extent) * plane_scale / 2.0;
-
-            // Build a DMatrix from the valid points: each row is [X, Y, dataX, dataY],
-            // then center the columns so the affine fit needs no intercept term.
-            let mut matrix = DMatrix::from_fn(valid_points.len(), 4, |i, j| match j {
-                0 => valid_points[i].0,
-                1 => valid_points[i].1,
-                2 => valid_points[i].2,
-                3 => valid_points[i].3,
-                _ => unreachable!(),
-            });
-            let col_means = compute_column_means(&matrix);
-            center_data(&mut matrix, &col_means);
-
-            // Normal equations for [x2, y2] ~ [X, Y] * W. Both sides are two columns
-            // wide, so the whole least-squares solve is a 2x2 inverse.
-            let a = matrix.columns(0, 2);
-            let b = matrix.columns(2, 2);
-            let ata = Matrix2::new(
-                a.column(0).dot(&a.column(0)),
-                a.column(0).dot(&a.column(1)),
-                a.column(1).dot(&a.column(0)),
-                a.column(1).dot(&a.column(1)),
-            );
-            let atb = Matrix2::new(
-                a.column(0).dot(&b.column(0)),
-                a.column(0).dot(&b.column(1)),
-                a.column(1).dot(&b.column(0)),
-                a.column(1).dot(&b.column(1)),
-            );
-            // Singular only if the valid cells are collinear, which leaves no surface
-            // to reconstruct.
-            let Some(ata_inv) = ata.try_inverse() else {
-                break;
-            };
-            let w = ata_inv * atb;
-
-            // What the affine part could not explain. This is the depth signal.
-            let residuals = DMatrix::from_fn(matrix.nrows(), 2, |i, j| {
-                matrix[(i, 2 + j)] - (matrix[(i, 0)] * w[(0, j)] + matrix[(i, 1)] * w[(1, j)])
-            });
-
-            // The residuals of an affine camera lie along one direction; recover it.
-            let svd = SVD::new(residuals.clone(), false, true);
-            let v_t = svd.v_t.expect("V^T matrix not found");
-            let mut direction = [v_t[(0, 0)], v_t[(0, 1)]];
-
-            let mut depths: Vec<f64> = (0..residuals.nrows())
-                .map(|i| residuals[(i, 0)] * direction[0] + residuals[(i, 1)] * direction[1])
-                .collect();
-
-            // The SVD's sign is arbitrary, so the surface can come out as an inverted
-            // bowl. Assume the middle of the object is nearer to the viewer than its
-            // edges (X3D is right-handed, so nearer means larger z) and flip if not.
-            if x_extent > 0.0 && y_extent > 0.0 {
-                let (mut inner_sum, mut inner_count) = (0.0, 0usize);
-                let (mut outer_sum, mut outer_count) = (0.0, 0usize);
-                for (p, &depth) in valid_points.iter().zip(depths.iter()) {
-                    let u = (p.0 - x_center) / (x_extent / 2.0);
-                    let v = (p.1 - y_center) / (y_extent / 2.0);
-                    if (u * u + v * v).sqrt() < 0.5 {
-                        inner_sum += depth;
-                        inner_count += 1;
-                    } else {
-                        outer_sum += depth;
-                        outer_count += 1;
-                    }
-                }
-                if inner_count > 0
-                    && outer_count > 0
-                    && inner_sum / (inner_count as f64) < outer_sum / (outer_count as f64)
-                {
-                    direction = [-direction[0], -direction[1]];
-                    for depth in &mut depths {
-                        *depth = -*depth;
-                    }
-                }
-            }
-
-            // Determine min/max using the 10th and 90th percentile of the depth.
-            let depth_column = DMatrix::from_column_slice(depths.len(), 1, &depths);
-            let (min_values, max_values) = compute_min_max(&depth_column, 0.1, 0.9);
-            let (z_low, z_high) = (min_values[0], max_values[0]);
-            // Two views related by a pure affine warp carry no depth at all; without
-            // this the rounding noise would be stretched over the whole depth range.
-            let depth_spread = z_high - z_low;
-            let is_flat = !depth_spread.is_finite() || depth_spread <= FLAT_EPSILON * plane_extent;
-
-            result.z_scale = z_scale as f32;
-
-            // Now update every cell in the DensePhotoMap with a 3D coordinate, or
-            // invalidate it.
-            for y in 0..map_height {
-                for x in 0..map_width {
-                    let (x2, y2) = photo_mapping.grid_coordinates(x, y);
-                    if x2.is_nan() || y2.is_nan() {
-                        continue;
-                    }
-
-                    // This cell's photo-1 position, and both pairs centered the same
-                    // way the fit was.
-                    let plane_x = (x * grid_cell_size) as f64;
-                    let plane_y = (y * grid_cell_size) as f64;
-                    let a_x = plane_x - col_means[0];
-                    let a_y = plane_y - col_means[1];
-                    let b_x = x2 as f64 - col_means[2];
-                    let b_y = y2 as f64 - col_means[3];
-
-                    // Project this cell's residual onto the depth direction.
-                    let r_x = b_x - (a_x * w[(0, 0)] + a_y * w[(1, 0)]);
-                    let r_y = b_y - (a_x * w[(0, 1)] + a_y * w[(1, 1)]);
-                    let z_normalized = if is_flat {
-                        0.0
-                    } else {
-                        rescale_value(r_x * direction[0] + r_y * direction[1], z_low, z_high)
-                    };
-
-                    // Only the depth can be an outlier now; x and y are exact grid
-                    // positions.
-                    if z_normalized.is_finite() && z_normalized.abs() < 3.0 {
-                        result.grid[y * map_width + x] = TexturePoint {
-                            x: ((plane_x - x_center) * plane_scale) as f32,
-                            // Grid rows count downwards from the top of photo 1, X3D's
-                            // y-axis points up.
-                            y: (-(plane_y - y_center) * plane_scale) as f32,
-                            z: (z_normalized * z_scale) as f32,
-                            u: x as f32 / map_width as f32,
-                            v: 1f32 - (y as f32 / map_height as f32),
-                            grid_x: x,
-                            grid_y: y,
-                        };
-                    } else {
-                        // Invalidate this cell for the next iteration, and drop any
-                        // value the previous iteration left in it.
-                        result.grid[y * map_width + x] = TexturePoint::default();
-                        photo_mapping.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
-                    }
-                }
-            }
+    /// Reconstructs a model from a mapping; see the [crate documentation](crate) for how.
+    pub fn with_settings(photo_mapping: &DensePhotoMap, settings: &Settings) -> Self {
+        if settings.projection == Projection::Affine {
+            return Self::affine(photo_mapping, None);
         }
 
-        result
+        let (cells, pairs) = correspondences(photo_mapping);
+        let photo = photo_mapping.photo1();
+        let estimate = two_view::estimate(&pairs, photo.width(), photo.height(), settings);
+
+        let Some(estimate) = estimate else {
+            return match settings.projection {
+                Projection::Perspective => Self::empty(photo_mapping, Projection::Perspective),
+                _ => Self::affine(photo_mapping, None),
+            };
+        };
+        if settings.projection == Projection::Auto && !estimate.geometry.is_well_conditioned() {
+            return Self::affine(photo_mapping, Some(estimate.geometry));
+        }
+
+        let surface = perspective::build(photo_mapping, &cells, &pairs, &estimate);
+        let mut model = Self::empty(photo_mapping, Projection::Perspective);
+        model.geometry = Some(estimate.geometry);
+        if let Some(surface) = surface {
+            model.grid = surface.grid;
+            model.tearing = Tearing::Perspective {
+                spacing: surface.spacing,
+            };
+            model.viewpoint = Some(surface.viewpoint);
+        }
+        model
+    }
+
+    fn empty(photo_mapping: &DensePhotoMap, projection: Projection) -> Self {
+        let (grid_width, grid_height) = photo_mapping.grid_dimensions();
+        Model3D {
+            grid_width,
+            grid_height,
+            photo: photo_mapping.photo1().clone(),
+            grid: vec![TexturePoint::default(); grid_width * grid_height],
+            projection,
+            geometry: None,
+            tearing: Tearing::Affine { z_scale: 1.0 },
+            viewpoint: None,
+        }
+    }
+
+    fn affine(photo_mapping: &DensePhotoMap, geometry: Option<TwoViewGeometry>) -> Self {
+        let (grid, z_scale) = affine::reconstruct(photo_mapping);
+        Model3D {
+            grid,
+            geometry,
+            tearing: Tearing::Affine { z_scale },
+            ..Self::empty(photo_mapping, Projection::Affine)
+        }
+    }
+
+    /// The camera model this reconstruction used: [`Projection::Perspective`] or
+    /// [`Projection::Affine`], never [`Projection::Auto`].
+    pub fn projection(&self) -> Projection {
+        self.projection
+    }
+
+    /// The perspective geometry estimated between the two photos, if one was attempted
+    /// and succeeded — including when [`Projection::Auto`] then judged it too weak and
+    /// fell back to the affine model, in which case this says why.
+    pub fn two_view_geometry(&self) -> Option<&TwoViewGeometry> {
+        self.geometry.as_ref()
     }
 
     /// Retrieves a reference to the `TexturePoint` at grid cell `(x, y)`.
@@ -351,22 +298,33 @@ impl Model3D {
         &self.grid[y * self.grid_width + x]
     }
 
-    /// The distance between two points with the depth axis stretched back out to the
-    /// same span as the image-plane axes, for use as a face-culling threshold.
-    ///
-    /// The model's depth is deliberately compressed to [`Z_DEPTH_RATIO`] of the image
-    /// plane, so comparing raw distances against a fixed threshold would barely notice
-    /// depth discontinuities. Dividing the depth difference back out makes the cull
-    /// equally sensitive in all three directions.
-    fn cull_distance(&self, a: &TexturePoint, b: &TexturePoint) -> f32 {
-        let dx = a.x - b.x;
-        let dy = a.y - b.y;
-        let dz = if self.z_scale > 0.0 {
-            (a.z - b.z) / self.z_scale
-        } else {
-            0.0
-        };
-        (dx * dx + dy * dy + dz * dz).sqrt()
+    /// Whether the mesh edge between grid cells `a` and `b` (flat indices) spans a gap in
+    /// the surface rather than the surface itself.
+    fn is_torn(&self, a: usize, b: usize, diagonal: bool) -> bool {
+        let (pa, pb) = (&self.grid[a], &self.grid[b]);
+        match &self.tearing {
+            Tearing::Affine { z_scale } => {
+                // The model's depth is deliberately compressed to `Z_DEPTH_RATIO` of the
+                // image plane; stretch it back out so the test is equally sensitive in
+                // all three directions.
+                let dz = if *z_scale > 0.0 {
+                    (pa.z - pb.z) / z_scale
+                } else {
+                    0.0
+                };
+                let (dx, dy) = (pa.x - pb.x, pa.y - pb.y);
+                (dx * dx + dy * dy + dz * dz).sqrt() > AFFINE_MAX_EDGE
+            }
+            Tearing::Perspective { spacing } => {
+                let steps = if diagonal {
+                    std::f32::consts::SQRT_2
+                } else {
+                    1.0
+                };
+                let expected = 0.5 * (spacing[a] + spacing[b]) * steps;
+                pa.distance(pb) > PERSPECTIVE_MAX_STRETCH * expected
+            }
+        }
     }
 
     /// Creates and returns an X3D string representing the 3D mesh of points.
@@ -375,10 +333,11 @@ impl Model3D {
     /// - The `<IndexedFaceSet>` is built by iterating over each cell `(x, y)` and forming quads
     ///   (split into triangles) with the adjacent cells `(x+1, y)`, `(x, y+1)`, `(x+1, y+1)`.
     /// - Invalid points (with `NaN` coordinates) are skipped.
-    /// - If any pair of points is too far apart, that face is skipped. The depth axis is
-    ///   stretched back out to the span of the image-plane axes first, so the cull is
-    ///   equally sensitive in all three directions.
+    /// - A quad with an edge that spans a gap in the surface — a depth discontinuity, or
+    ///   an outlier — is skipped.
     /// - Texture coordinates and 3D positions are embedded in the X3D output.
+    /// - A perspective model also carries a `<Viewpoint>` at the first camera, so a viewer
+    ///   opens on the scene as photo 1 saw it.
     ///
     /// Replace `"[photo_placeholder]"` in the string with a real texture file URL if needed.
     pub fn to_x3d(&self) -> String {
@@ -390,7 +349,18 @@ impl Model3D {
         <meta name='description' content='3D Model with texture'/>
     </head>
     <Scene>
-        <Shape>
+"#,
+        );
+        if let Some(viewpoint) = &self.viewpoint {
+            let [x, y, z] = viewpoint.position;
+            result.push_str(&format!(
+                "        <Viewpoint description='photo 1' position='{x} {y} {z}' \
+                 fieldOfView='{}'></Viewpoint>\n",
+                viewpoint.field_of_view
+            ));
+        }
+        result.push_str(
+            r#"        <Shape>
             <Appearance>
                 <ImageTexture id="imagetexture" url='"#,
         );
@@ -402,63 +372,49 @@ impl Model3D {
         );
 
         // Each pair of adjacent cells forms two triangles, if valid.
-        for y in 0..self.grid_height - 1 {
-            for x in 0..self.grid_width - 1 {
-                let p1 = self.get_texture_point(x, y);
-                let p2 = self.get_texture_point(x + 1, y);
-                let p3 = self.get_texture_point(x, y + 1);
-                let p4 = self.get_texture_point(x + 1, y + 1);
+        for y in 0..self.grid_height.saturating_sub(1) {
+            for x in 0..self.grid_width.saturating_sub(1) {
+                let i1 = y * self.grid_width + x;
+                let (i2, i3, i4) = (i1 + 1, i1 + self.grid_width, i1 + self.grid_width + 1);
 
-                // Skip faces if any point is invalid or too far from the others.
-                if p1.x.is_nan() || p2.x.is_nan() || p3.x.is_nan() || p4.x.is_nan() {
+                // Skip faces if any point is invalid or the quad spans a gap.
+                if [i1, i2, i3, i4].iter().any(|&i| self.grid[i].x.is_nan()) {
                     continue;
                 }
-                if self.cull_distance(p1, p2) > 0.5
-                    || self.cull_distance(p1, p3) > 0.5
-                    || self.cull_distance(p1, p4) > 0.5
+                if self.is_torn(i1, i2, false)
+                    || self.is_torn(i1, i3, false)
+                    || self.is_torn(i2, i4, false)
+                    || self.is_torn(i3, i4, false)
+                    || self.is_torn(i1, i4, true)
                 {
                     continue;
                 }
 
                 // Construct two triangles (p1->p2->p4 and p1->p4->p3).
                 // X3D uses -1 as a face separator.
-                result.push_str(&format!(
-                    "{} {} {} -1 {} {} {} -1 ",
-                    y * self.grid_width + x,
-                    y * self.grid_width + x + 1,
-                    (y + 1) * self.grid_width + x + 1,
-                    y * self.grid_width + x,
-                    (y + 1) * self.grid_width + x + 1,
-                    (y + 1) * self.grid_width + x
-                ));
+                result.push_str(&format!("{i1} {i2} {i4} -1 {i1} {i4} {i3} -1 "));
             }
         }
 
         result.push_str("'>\n<Coordinate point='");
 
         // Write out the 3D coordinates of every grid cell.
-        for y in 0..self.grid_height {
-            for x in 0..self.grid_width {
-                let p = self.get_texture_point(x, y);
-                if p.x.is_nan() {
-                    result.push_str("0 0 0 ");
-                } else {
-                    result.push_str(&format!("{} {} {} ", p.x, p.y, p.z));
-                }
+        for p in &self.grid {
+            if p.x.is_nan() {
+                result.push_str("0 0 0 ");
+            } else {
+                result.push_str(&format!("{} {} {} ", p.x, p.y, p.z));
             }
         }
 
         result.push_str("'></Coordinate>\n<TextureCoordinate point='");
 
         // Write out the (u, v) texture coordinates.
-        for y in 0..self.grid_height {
-            for x in 0..self.grid_width {
-                let p = self.get_texture_point(x, y);
-                if p.x.is_nan() {
-                    result.push_str("0 0 ");
-                } else {
-                    result.push_str(&format!("{} {} ", p.u, p.v));
-                }
+        for p in &self.grid {
+            if p.x.is_nan() {
+                result.push_str("0 0 ");
+            } else {
+                result.push_str(&format!("{} {} ", p.u, p.v));
             }
         }
 
@@ -473,184 +429,264 @@ impl Model3D {
     }
 }
 
-/// Computes column-wise means of a DMatrix.
-///
-/// # Returns
-/// A `Vec<f64>` of length `matrix.ncols()`, where each entry is
-/// the average of that column's values.
-fn compute_column_means(matrix: &DMatrix<f64>) -> Vec<f64> {
-    let mut means = Vec::with_capacity(matrix.ncols());
-    for col in 0..matrix.ncols() {
-        let sum: f64 = matrix.column(col).iter().sum();
-        means.push(sum / matrix.nrows() as f64);
-    }
-    means
+/// The mapped cells of `map`, as grid coordinates and the correspondences they carry.
+fn correspondences(map: &DensePhotoMap) -> (Vec<(usize, usize)>, Vec<PointPair>) {
+    let (grid_width, grid_height) = map.grid_dimensions();
+    let cell = map.grid_cell_size() as f64;
+    (0..grid_height)
+        .flat_map(|gy| (0..grid_width).map(move |gx| (gx, gy)))
+        .filter_map(|(gx, gy)| {
+            let (x2, y2) = map.grid_coordinates(gx, gy);
+            (!x2.is_nan() && !y2.is_nan()).then_some((
+                (gx, gy),
+                PointPair {
+                    x1: gx as f64 * cell,
+                    y1: gy as f64 * cell,
+                    x2: x2 as f64,
+                    y2: y2 as f64,
+                },
+            ))
+        })
+        .unzip()
 }
 
-/// Subtracts the given column means from each value in `matrix`,
-/// effectively centering each column around 0.
-fn center_data(matrix: &mut DMatrix<f64>, col_means: &[f64]) {
-    for col in 0..matrix.ncols() {
-        for row in 0..matrix.nrows() {
-            matrix[(row, col)] -= col_means[col];
-        }
-    }
+/// The texture coordinates of grid cell `(gx, gy)`: the centre of the photo-1 pixel the
+/// cell sits on, with `v` running up from the bottom of the image as X3D expects.
+///
+/// Derived from the pixel position rather than from the cell's index over the grid size:
+/// the grid's last node generally falls short of the photo's last pixel, so dividing by
+/// the grid size slid the texture across the mesh by up to a cell.
+pub(crate) fn texture_coordinates(map: &DensePhotoMap, gx: usize, gy: usize) -> (f32, f32) {
+    let photo = map.photo1();
+    let cell = map.grid_cell_size() as f32;
+    let u = (gx as f32 * cell + 0.5) / photo.width() as f32;
+    let v = 1.0 - (gy as f32 * cell + 0.5) / photo.height() as f32;
+    (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0))
 }
 
-/// Finds the values at the specified `lower_percentile` and `upper_percentile`
-/// for each column in `reduced_data`.
-///
-/// # Returns
-/// A tuple `(min_values, max_values)`, each a `Vec<f64>` of length `ncols`.
-/// - `min_values[i]` is the `lower_percentile`-quantile in column `i`.
-/// - `max_values[i]` is the `upper_percentile`-quantile in column `i`.
-fn compute_min_max(
-    reduced_data: &DMatrix<f64>,
-    lower_percentile: f64,
-    upper_percentile: f64,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut min_values = Vec::with_capacity(reduced_data.ncols());
-    let mut max_values = Vec::with_capacity(reduced_data.ncols());
-
-    for col in 0..reduced_data.ncols() {
-        let mut values: Vec<f64> = reduced_data.column(col).iter().copied().collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let lower_idx = (values.len() as f64 * lower_percentile) as usize;
-        let upper_idx = (values.len() as f64 * upper_percentile) as usize;
-
-        min_values.push(values[lower_idx]);
-        max_values.push(values[upper_idx]);
-    }
-    (min_values, max_values)
-}
-
-/// Maps `value` from the range [min_val, max_val] to [-1, 1].
-///
-/// If `max_val == min_val`, this may produce invalid output (`NaN`).
-fn rescale_value(value: f64, min_val: f64, max_val: f64) -> f64 {
-    ((value - min_val) / (max_val - min_val)) * 2.0 - 1.0
+/// The `q`-quantile of `values` (nearest rank), reordering them. `values` must not be
+/// empty.
+pub(crate) fn quantile(values: &mut [f64], q: f64) -> f64 {
+    values.sort_unstable_by(f64::total_cmp);
+    values[((values.len() - 1) as f64 * q).round() as usize]
 }
 
 #[cfg(test)]
 mod tests {
+    use nalgebra::{Matrix3, Rotation3, Vector3};
+
     use super::*;
 
-    const GRID_WIDTH: usize = 17;
-    const GRID_HEIGHT: usize = 9;
-    const CELL: f64 = 10.0; // photo width 160 / (GRID_WIDTH - 1)
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 240;
+    const CELL: usize = 8;
+    const DISTANCE: f64 = 10.0;
 
-    /// A blank photo of the size the grid constants above assume.
     fn photo() -> Arc<Photo> {
-        Arc::new(Photo::from_rgba(160, 80, vec![0u8; 160 * 80 * 4]).unwrap())
+        Arc::new(Photo::from_rgba(WIDTH, HEIGHT, vec![0u8; WIDTH * HEIGHT * 4]).unwrap())
     }
 
-    /// A fully populated map whose two views are related by an exact affine warp, plus
-    /// whatever `bump` adds to the horizontal correspondence.
-    fn mapping(bump: impl Fn(f64, f64) -> f64) -> DensePhotoMap {
-        let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
-        assert_eq!(map.grid_cell_size(), CELL as usize);
-        for y in 0..GRID_HEIGHT {
-            for x in 0..GRID_WIDTH {
-                let (px, py) = (x as f64 * CELL, y as f64 * CELL);
-                // Integer coefficients so the affine part is exact in f32 and the
-                // no-bump case really does have a zero residual.
-                let x2 = 2.0 * px + py + 5.0 + bump(px, py);
-                let y2 = px + 2.0 * py + 3.0;
-                map.set_grid_coordinates(x, y, x2 as f32, y2 as f32);
+    fn grid_size() -> (usize, usize) {
+        ((WIDTH - 1) / CELL + 1, (HEIGHT - 1) / CELL + 1)
+    }
+
+    /// The second camera: one unit to the right of the first, turned back towards the
+    /// middle of the scene. Returns `(R, t)` with `X2 = R·X1 + t`.
+    fn second_camera() -> (Matrix3<f64>, Vector3<f64>) {
+        let angle = 1.0f64.atan2(DISTANCE);
+        let rotation = Rotation3::from_axis_angle(&Vector3::y_axis(), angle).into_inner();
+        let centre = Vector3::new(1.0, 0.0, 0.0);
+        (rotation, -(rotation * centre))
+    }
+
+    /// Photographs a surface with both cameras and records the correspondences as a map.
+    /// `depth(u, v)` gives the depth along camera 1's axis at normalized image position
+    /// `(u, v)`, both in `[-1, 1]`.
+    fn scene(depth: impl Fn(f64, f64) -> f64) -> DensePhotoMap {
+        let (gw, gh) = grid_size();
+        let mut map = DensePhotoMap::with_cell_size(photo(), photo(), gw, gh, CELL);
+        let focal = DEFAULT_FOCAL_LENGTH * WIDTH as f64;
+        let (cx, cy) = ((WIDTH - 1) as f64 / 2.0, (HEIGHT - 1) as f64 / 2.0);
+        let (rotation, translation) = second_camera();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (px, py) = ((gx * CELL) as f64, (gy * CELL) as f64);
+                let z = depth((px - cx) / cx, (py - cy) / cy);
+                let point = Vector3::new((px - cx) / focal * z, (py - cy) / focal * z, z);
+                let seen = rotation * point + translation;
+                if seen.z <= 0.0 {
+                    continue;
+                }
+                let x2 = focal * seen.x / seen.z + cx;
+                let y2 = focal * seen.y / seen.z + cy;
+                if (0.0..=(WIDTH - 1) as f64).contains(&x2)
+                    && (0.0..=(HEIGHT - 1) as f64).contains(&y2)
+                {
+                    map.set_grid_coordinates(gx, gy, x2 as f32, y2 as f32);
+                }
             }
         }
         map
     }
 
-    /// Normalised distance from the centre of the grid, 0 at the middle and 1 at the
-    /// middle of an edge.
-    fn radius(px: f64, py: f64) -> f64 {
-        let u =
-            (px - (GRID_WIDTH - 1) as f64 * CELL / 2.0) / ((GRID_WIDTH - 1) as f64 * CELL / 2.0);
-        let v =
-            (py - (GRID_HEIGHT - 1) as f64 * CELL / 2.0) / ((GRID_HEIGHT - 1) as f64 * CELL / 2.0);
-        (u * u + v * v).sqrt()
+    fn bump(u: f64, v: f64) -> f64 {
+        DISTANCE - 2.0 * (1.0 - (u * u + v * v)).max(0.0)
     }
 
-    fn valid_points(model: &Model3D) -> Vec<TexturePoint> {
-        (0..model.grid_height)
-            .flat_map(|y| (0..model.grid_width).map(move |x| (x, y)))
-            .map(|(x, y)| *model.get_texture_point(x, y))
-            .filter(|p| !p.x.is_nan())
-            .collect()
+    fn bowl(u: f64, v: f64) -> f64 {
+        DISTANCE + 2.0 * (1.0 - (u * u + v * v)).max(0.0)
     }
 
-    #[test]
-    fn image_plane_keeps_the_photo_aspect_ratio() {
-        let model = Model3D::new(&mapping(|px, py| 8.0 * (1.0 - radius(px, py)).max(0.0)));
-        let points = valid_points(&model);
-        assert_eq!(points.len(), GRID_WIDTH * GRID_HEIGHT);
+    fn centre_and_corner_z(model: &Model3D) -> (f32, f32) {
+        let (gw, gh) = grid_size();
+        (
+            model.get_texture_point(gw / 2, gh / 2).z,
+            model.get_texture_point(3, 3).z,
+        )
+    }
 
-        // The grid is 160 x 80 pixels, so the long axis spans [-1, 1] and the short one
-        // spans exactly half that.
-        let xs: Vec<f32> = points.iter().map(|p| p.x).collect();
-        let ys: Vec<f32> = points.iter().map(|p| p.y).collect();
-        let x_span = xs.iter().cloned().fold(f32::MIN, f32::max)
-            - xs.iter().cloned().fold(f32::MAX, f32::min);
-        let y_span = ys.iter().cloned().fold(f32::MIN, f32::max)
-            - ys.iter().cloned().fold(f32::MAX, f32::min);
-        assert!((x_span - 2.0).abs() < 1e-5, "x span was {x_span}");
-        assert!((y_span - 1.0).abs() < 1e-5, "y span was {y_span}");
-
-        // x follows the column index, and y runs the other way: grid row 0 is the top
-        // of the photo, which is the top of the model too.
-        assert!(model.get_texture_point(0, 0).x < model.get_texture_point(GRID_WIDTH - 1, 0).x);
-        assert!(model.get_texture_point(0, 0).y > model.get_texture_point(0, GRID_HEIGHT - 1).y);
-
-        // The texture still tracks the geometry: v = 1 at the top.
-        assert!(model.get_texture_point(0, 0).v > model.get_texture_point(0, GRID_HEIGHT - 1).v);
+    fn pearson(a: &[f64], b: &[f64]) -> f64 {
+        let n = a.len() as f64;
+        let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+        let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+        let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum();
+        let vb: f64 = b.iter().map(|y| (y - mb).powi(2)).sum();
+        cov / (va * vb).sqrt()
     }
 
     #[test]
-    fn a_pure_affine_warp_has_no_depth() {
-        let model = Model3D::new(&mapping(|_, _| 0.0));
-        let points = valid_points(&model);
-        assert_eq!(points.len(), GRID_WIDTH * GRID_HEIGHT);
-        for p in &points {
-            assert_eq!(p.z, 0.0, "flat scene produced z = {}", p.z);
-        }
-    }
-
-    #[test]
-    fn depth_scales_with_the_smaller_image_plane_extent() {
-        let model = Model3D::new(&mapping(|px, py| 8.0 * (1.0 - radius(px, py)).max(0.0)));
-        let mut zs: Vec<f32> = valid_points(&model).iter().map(|p| p.z).collect();
-        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // The depth is normalised over its own 10th/90th percentiles, so that is the
-        // band the ratio applies to, measured against the 1.0-wide short axis.
-        let low = zs[(zs.len() as f64 * 0.1) as usize];
-        let high = zs[(zs.len() as f64 * 0.9) as usize];
-        let expected = Z_DEPTH_RATIO as f32 * 1.0;
+    fn a_bump_comes_out_towards_the_viewer() {
+        let model = Model3D::new(&scene(bump));
+        assert_eq!(model.projection(), Projection::Perspective);
+        let (centre, corner) = centre_and_corner_z(&model);
         assert!(
-            (high - low - expected).abs() < 1e-3,
-            "10-90 depth span was {}, expected {expected}",
-            high - low
+            centre > corner,
+            "centre z {centre} behind corner z {corner}"
+        );
+    }
+
+    /// The case the affine model's "the middle is nearest" guess gets wrong.
+    #[test]
+    fn a_concave_scene_is_not_turned_inside_out() {
+        let model = Model3D::new(&scene(bowl));
+        assert_eq!(model.projection(), Projection::Perspective);
+        let (centre, corner) = centre_and_corner_z(&model);
+        assert!(
+            centre < corner,
+            "centre z {centre} in front of corner z {corner}"
         );
     }
 
     #[test]
-    fn the_middle_of_the_object_faces_the_viewer() {
-        let bump = |px: f64, py: f64| 8.0 * (1.0 - radius(px, py)).max(0.0);
-        let centre = |model: &Model3D| model.get_texture_point(GRID_WIDTH / 2, GRID_HEIGHT / 2).z;
-        let corner = |model: &Model3D| model.get_texture_point(0, 0).z;
-
-        // Either sign of the bump has to come out the same way round, since the SVD
-        // direction it produces differs only by its sign.
-        for sign in [1.0, -1.0] {
-            let model = Model3D::new(&mapping(|px, py| sign * bump(px, py)));
-            assert!(
-                centre(&model) > corner(&model),
-                "sign {sign}: centre z {} was not in front of corner z {}",
-                centre(&model),
-                corner(&model)
-            );
+    fn depth_follows_the_true_surface() {
+        let model = Model3D::new(&scene(bump));
+        let (cx, cy) = ((WIDTH - 1) as f64 / 2.0, (HEIGHT - 1) as f64 / 2.0);
+        let (mut got, mut truth) = (Vec::new(), Vec::new());
+        for p in model.grid.iter().filter(|p| !p.x.is_nan()) {
+            let (px, py) = ((p.grid_x * CELL) as f64, (p.grid_y * CELL) as f64);
+            got.push(p.z as f64);
+            // Nearer is larger z in the model.
+            truth.push(-bump((px - cx) / cx, (py - cy) / cy));
         }
+        let (gw, gh) = grid_size();
+        assert!(got.len() * 10 > gw * gh * 9, "only {} points", got.len());
+        let r = pearson(&got, &truth);
+        assert!(r > 0.99, "depth correlation with the true surface was {r}");
+    }
+
+    #[test]
+    fn the_relative_pose_is_recovered() {
+        let model = Model3D::new(&scene(bump));
+        let geometry = model.two_view_geometry().expect("geometry was estimated");
+        let (rotation, translation) = second_camera();
+
+        let error = geometry.rotation * rotation.transpose();
+        let angle = ((error.trace() - 1.0) / 2.0).clamp(-1.0, 1.0).acos();
+        assert!(angle.to_degrees() < 0.1, "rotation off by {angle} rad");
+
+        let cos = geometry.translation.dot(&translation.normalize());
+        assert!(
+            cos > 0.5f64.to_radians().cos(),
+            "translation off, cos = {cos}"
+        );
+        assert!(geometry.inlier_fraction > 0.99);
+        assert!(geometry.is_well_conditioned());
+    }
+
+    #[test]
+    fn outlying_matches_do_not_derail_the_estimate() {
+        let mut map = scene(bump);
+        let (gw, gh) = grid_size();
+        // A deterministic scatter of a quarter of the cells to random places.
+        let mut state = 12345u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f64 / (1u64 << 31) as f64
+        };
+        for gy in 0..gh {
+            for gx in 0..gw {
+                if next() < 0.25 {
+                    let (x, y) = (next() * WIDTH as f64, next() * HEIGHT as f64);
+                    map.set_grid_coordinates(gx, gy, x as f32, y as f32);
+                }
+            }
+        }
+
+        let model = Model3D::new(&map);
+        assert_eq!(model.projection(), Projection::Perspective);
+        let geometry = model.two_view_geometry().unwrap();
+        let (rotation, _) = second_camera();
+        let error = geometry.rotation * rotation.transpose();
+        let angle = ((error.trace() - 1.0) / 2.0).clamp(-1.0, 1.0).acos();
+        assert!(angle.to_degrees() < 0.5, "rotation off by {angle} rad");
+        let (centre, corner) = centre_and_corner_z(&model);
+        assert!(centre > corner);
+    }
+
+    #[test]
+    fn a_planar_scene_falls_back_to_the_affine_model() {
+        let model = Model3D::new(&scene(|u, _| DISTANCE + 1.5 * u));
+        assert_eq!(model.projection(), Projection::Affine);
+        let geometry = model
+            .two_view_geometry()
+            .expect("the estimate is still reported");
+        assert!(!geometry.is_well_conditioned());
+    }
+
+    #[test]
+    fn forcing_the_affine_model_skips_the_estimate() {
+        let settings = Settings {
+            projection: Projection::Affine,
+            ..Settings::default()
+        };
+        let model = Model3D::with_settings(&scene(bump), &settings);
+        assert_eq!(model.projection(), Projection::Affine);
+        assert!(model.two_view_geometry().is_none());
+        assert!(!model.to_x3d().contains("<Viewpoint"));
+    }
+
+    #[test]
+    fn a_perspective_mesh_opens_at_the_first_camera() {
+        let x3d = Model3D::new(&scene(bump)).to_x3d();
+        assert!(x3d.contains("<Viewpoint"));
+        let faces = x3d.split("coordIndex='").nth(1).unwrap();
+        assert!(faces.starts_with(|c: char| c.is_ascii_digit()), "no faces");
+    }
+
+    #[test]
+    fn texture_coordinates_address_pixel_centres() {
+        let model = Model3D::new(&scene(bump));
+        let p = model.get_texture_point(5, 4);
+        assert_eq!(p.u, ((5 * CELL) as f32 + 0.5) / WIDTH as f32);
+        assert_eq!(p.v, 1.0 - ((4 * CELL) as f32 + 0.5) / HEIGHT as f32);
+    }
+
+    #[test]
+    fn focal_length_from_35mm() {
+        // A 36 x 24 frame is its own reference: 36 mm across the long side is 1.0.
+        let ratio = Settings::focal_length_from_35mm(36.0, 36, 24);
+        assert!((ratio - 1.0).abs() < 1e-12, "{ratio}");
     }
 }
