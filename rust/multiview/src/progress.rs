@@ -7,9 +7,62 @@
 use std::fmt;
 use std::ops::ControlFlow;
 
+use crate::types::{PairId, PhotoPx};
+
 /// What a progress callback returns. `ControlFlow::Break(())` asks the pipeline to stop,
 /// and the run then returns [`crate::Error::Cancelled`].
 pub type Flow = ControlFlow<()>;
+
+/// The dense correspondence found between one pair of photos.
+///
+/// Handed to the progress callback on the event that finishes a pair, so that a caller can
+/// show what the matcher made of it. This is the raw grid, not a picture: how to draw it is
+/// the caller's decision.
+///
+/// Deliberately plain data — no borrows, no generics, no `Arc` — so it survives a trip
+/// across a language boundary unchanged.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PairMap {
+    /// The pair this maps.
+    pub pair: PairId,
+    /// Grid columns.
+    pub columns: usize,
+    /// Grid rows.
+    pub rows: usize,
+    /// Photo pixels between neighbouring grid cells.
+    pub cell_size: f32,
+    /// Where each cell of the first photo lands in the second, as `x, y` pairs, row by
+    /// row. `NaN` where the cell is unmapped.
+    ///
+    /// In the coordinates of the photos handed to the pipeline, not the lower resolution
+    /// the solver works at.
+    pub points: Vec<f32>,
+    /// The fraction of the first photo that is mapped, from `0.0` to `1.0`.
+    pub coverage: f32,
+}
+
+impl PairMap {
+    /// The position in the first photo of grid cell `(column, row)`.
+    pub fn pixel(&self, column: usize, row: usize) -> PhotoPx {
+        PhotoPx::new(
+            column as f32 * self.cell_size,
+            row as f32 * self.cell_size,
+        )
+    }
+
+    /// Where grid cell `(column, row)` lands in the second photo, if it is mapped.
+    pub fn point(&self, column: usize, row: usize) -> Option<PhotoPx> {
+        let i = (row * self.columns + column) * 2;
+        let (x, y) = (*self.points.get(i)?, *self.points.get(i + 1)?);
+        (x.is_finite() && y.is_finite()).then(|| PhotoPx::new(x, y))
+    }
+
+    /// How many cells are mapped.
+    pub fn mapped(&self) -> usize {
+        self.points.iter().step_by(2).filter(|x| x.is_finite()).count()
+    }
+}
 
 /// The pipeline's stages, in the order they run.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,6 +144,31 @@ impl fmt::Display for Stage {
     }
 }
 
+/// Reports that `stage` is `fraction` done, and turns a `Break` from the callback into
+/// [`crate::Error::Cancelled`].
+///
+/// Every stage that reports from inside itself goes through this, so that cancellation
+/// means the same thing everywhere.
+pub(crate) fn report(
+    on_event: &mut dyn FnMut(Event) -> Flow,
+    stage: Stage,
+    fraction: f32,
+    message: String,
+) -> Result<(), crate::Error> {
+    if on_event(Event::new(stage, fraction, message)).is_break() {
+        return Err(crate::Error::Cancelled { stage });
+    }
+    Ok(())
+}
+
+/// A callback that ignores every event and never cancels.
+///
+/// What the plain, progress-free form of each stage passes to the reporting form. Since it
+/// never breaks, those cannot return [`crate::Error::Cancelled`].
+pub(crate) fn silent(_: Event) -> Flow {
+    Flow::Continue(())
+}
+
 /// A progress report from a running reconstruction.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -101,6 +179,12 @@ pub struct Event {
     pub stage_fraction: f32,
     /// What is happening, for display.
     pub message: String,
+    /// The dense correspondence just computed, on the event that finishes a pair, and
+    /// `None` on every other event.
+    ///
+    /// Boxed because only one event in a pair's worth of them carries a map, and the rest
+    /// should not pay for the space.
+    pub map: Option<Box<PairMap>>,
 }
 
 impl Event {
@@ -110,7 +194,14 @@ impl Event {
             stage,
             stage_fraction: stage_fraction.clamp(0.0, 1.0),
             message: message.into(),
+            map: None,
         }
+    }
+
+    /// The same report, carrying the dense map of a pair that has just finished.
+    pub fn with_map(mut self, map: PairMap) -> Self {
+        self.map = Some(Box::new(map));
+        self
     }
 
     /// How far through the whole run this is, from `0.0` to `1.0`, with each stage

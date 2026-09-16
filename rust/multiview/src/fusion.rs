@@ -8,9 +8,13 @@
 //! observed surface are allocated. The voxel size follows the spacing of the depth
 //! samples, and it grows automatically if the grid would exceed a voxel budget.
 //!
-//! Each voxel is projected into every depth map. Its signed distance to the surface that
-//! map sees along the ray is truncated to a band of a few voxels. Positive is in front of
-//! the surface, on the camera's side; far behind a surface is left unobserved.
+//! Each voxel is projected into every depth map, and its signed distance to the surface that
+//! map sees is truncated to a band of a few voxels. Positive is in front of the surface, on
+//! the camera's side; far behind a surface is left unobserved. The distance is measured along
+//! the surface normal, estimated from the depth map, not along the camera ray: along the ray,
+//! a surface seen obliquely, such as a floor or a step tread, gets a band too thin to hold a
+//! surface and comes out full of holes. Each observation is weighted by how precise its
+//! depth is.
 //!
 //! Surface nets place one vertex inside every cell whose corners change sign, at the mean
 //! of the edge crossings, and join the cells around each crossing edge with a quad. This
@@ -30,6 +34,7 @@ use crate::depth::DepthMap;
 use crate::error::Error;
 use crate::mesh::Mesh;
 use crate::pose::Pose;
+use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::twoview::median;
 use crate::types::Norm;
 
@@ -46,7 +51,8 @@ pub struct Params {
     pub truncation: f64,
     /// The most voxels to allocate. The voxel size grows until the grid fits.
     pub max_voxels: usize,
-    /// How many depth maps must have observed a voxel for it to take part in the surface.
+    /// The total observation weight a voxel needs to take part in the surface. Each depth
+    /// adds up to 1, less the less precise it is.
     pub min_weight: f32,
     /// Connected pieces with less than this fraction of the triangles are dropped.
     pub min_component_fraction: f64,
@@ -58,7 +64,7 @@ impl Default for Params {
             voxel_factor: 2.0,
             truncation: 4.0,
             max_voxels: 16_000_000,
-            min_weight: 1.0,
+            min_weight: 0.1,
             min_component_fraction: 0.02,
         }
     }
@@ -105,6 +111,20 @@ pub fn fuse(
     intrinsics: &Intrinsics,
     params: &Params,
 ) -> Result<Fused, Error> {
+    fuse_with_progress(maps, cameras, intrinsics, params, &mut silent)
+}
+
+/// [`fuse`], reporting each phase through `on_event`.
+///
+/// # Errors
+/// As [`fuse`], plus [`Error::Cancelled`] if `on_event` asks the run to stop.
+pub fn fuse_with_progress(
+    maps: &[DepthMap],
+    cameras: &[Option<Pose>],
+    intrinsics: &Intrinsics,
+    params: &Params,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<Fused, Error> {
     let focal = (intrinsics.fx + intrinsics.fy) / 2.0;
     let spacings: Vec<f64> = maps
         .iter()
@@ -120,12 +140,41 @@ pub fn fuse(
         return Err(Error::EmptyMesh);
     }
 
+    let uncertainties: Vec<f64> = maps
+        .iter()
+        .flat_map(|m| {
+            m.depth
+                .iter()
+                .zip(&m.uncertainty)
+                .filter(|(d, _)| d.is_finite())
+                .step_by(7)
+                .map(|(_, &u)| u as f64)
+        })
+        .collect();
+    let typical_uncertainty = median(uncertainties).max(1e-9);
+
+    let cosines: Vec<Vec<f32>> = maps.iter().map(|m| incidence(m, intrinsics)).collect();
+
     let mut voxel_size = median(spacings) * params.voxel_factor;
     let keys = loop {
-        let keys = allocate(maps, cameras, intrinsics, voxel_size, params.truncation);
+        report(
+            on_event,
+            Stage::Fusion,
+            0.1,
+            format!("finding the occupied volume at voxel size {voxel_size:.4}"),
+        )?;
+        let keys = allocate(
+            maps,
+            cameras,
+            intrinsics,
+            voxel_size,
+            params.truncation,
+            &cosines,
+        );
         if keys.len() * VOXELS_PER_BLOCK <= params.max_voxels {
             break keys;
         }
+        // Too fine to fit in the voxel budget; coarsen and measure again.
         voxel_size *= 2f64.cbrt();
     };
 
@@ -140,9 +189,24 @@ pub fn fuse(
         intrinsics,
         voxel_size,
         params.truncation * voxel_size,
-    );
+        typical_uncertainty,
+        &cosines,
+        on_event,
+    )?;
 
+    report(
+        on_event,
+        Stage::Fusion,
+        0.8,
+        format!("extracting the surface from {} blocks", keys.len()),
+    )?;
     let mut mesh = surface_nets(&blocks, &keys, voxel_size, params.min_weight);
+    report(
+        on_event,
+        Stage::Fusion,
+        0.95,
+        format!("{} triangles before pruning", mesh.triangles.len()),
+    )?;
     if mesh.triangles.is_empty() {
         return Err(Error::EmptyMesh);
     }
@@ -184,12 +248,12 @@ fn allocate(
     intrinsics: &Intrinsics,
     voxel_size: f64,
     truncation: f64,
+    cosines: &[Vec<f32>],
 ) -> Vec<[i64; 3]> {
     let block_size = voxel_size * BLOCK as f64;
     let band = truncation * voxel_size;
-    let steps = ((2.0 * band) / (block_size / 2.0)).ceil().max(1.0) as usize;
     let mut keys: HashSet<[i64; 3], Deterministic> = HashSet::default();
-    for (map, pose) in posed(maps, cameras) {
+    for ((map, pose), cosines) in posed(maps, cameras).zip(cosines) {
         let to_world = pose.inverse();
         let centre = pose.centre();
         for row in 0..map.rows {
@@ -201,8 +265,14 @@ fn allocate(
                 let n = intrinsics.normalize(map.pixel(column, row));
                 let point = to_world.to_camera(&Point3::new(n.x() * d, n.y() * d, d));
                 let direction = (point - centre).normalize();
+                // The band is measured along the surface normal, so along a ray that meets
+                // the surface obliquely it reaches further.
+                let cosine =
+                    (cosines[row * map.columns + column] as f64).max(MIN_ALLOCATION_COSINE);
+                let reach = band / cosine;
+                let steps = ((2.0 * reach) / (block_size / 2.0)).ceil().max(1.0) as usize;
                 for step in 0..=steps {
-                    let t = -band + 2.0 * band * step as f64 / steps as f64;
+                    let t = -reach + 2.0 * reach * step as f64 / steps as f64;
                     let q = point + direction * t;
                     keys.insert(q.coords.map(|c| (c / block_size).floor() as i64).into());
                 }
@@ -212,6 +282,65 @@ fn allocate(
     let mut keys: Vec<[i64; 3]> = keys.into_iter().collect();
     keys.sort_unstable();
     keys
+}
+
+/// The smallest cosine between a ray and the surface normal that distances are scaled by.
+/// Surfaces seen more obliquely than this are treated as if seen at this angle.
+const MIN_COSINE: f64 = 0.1;
+
+/// The smallest cosine allocation stretches the band for, which bounds how many blocks a
+/// single sample can allocate.
+const MIN_ALLOCATION_COSINE: f64 = 0.25;
+
+/// For each depth sample, the cosine between its viewing ray and the surface normal that
+/// the neighbouring samples imply. 1 where the neighbours do not give a normal.
+fn incidence(map: &DepthMap, intrinsics: &Intrinsics) -> Vec<f32> {
+    let point = |column: usize, row: usize| -> Option<Vector3<f64>> {
+        let d = map.get(column, row)? as f64;
+        let n = intrinsics.normalize(map.pixel(column, row));
+        Some(Vector3::new(n.x() * d, n.y() * d, d))
+    };
+    let mut cosines = vec![1.0f32; map.depth.len()];
+    for row in 0..map.rows {
+        for column in 0..map.columns {
+            let Some(centre) = point(column, row) else {
+                continue;
+            };
+            let tangent =
+                |before: Option<Vector3<f64>>, after: Option<Vector3<f64>>| match (before, after) {
+                    (Some(a), Some(b)) => Some(b - a),
+                    (Some(a), None) => Some(centre - a),
+                    (None, Some(b)) => Some(b - centre),
+                    (None, None) => None,
+                };
+            let across = tangent(
+                column.checked_sub(1).and_then(|c| point(c, row)),
+                (column + 1 < map.columns)
+                    .then(|| point(column + 1, row))
+                    .flatten(),
+            );
+            let down = tangent(
+                row.checked_sub(1).and_then(|r| point(column, r)),
+                (row + 1 < map.rows)
+                    .then(|| point(column, row + 1))
+                    .flatten(),
+            );
+            let (Some(across), Some(down)) = (across, down) else {
+                continue;
+            };
+            // Neighbours across a depth edge belong to another surface.
+            let limit = 0.2 * centre.z;
+            if across.norm() > limit || down.norm() > limit {
+                continue;
+            }
+            let Some(normal) = across.cross(&down).try_normalize(1e-12) else {
+                continue;
+            };
+            let cosine = normal.dot(&centre.normalize()).abs().max(MIN_COSINE);
+            cosines[row * map.columns + column] = cosine as f32;
+        }
+    }
+    cosines
 }
 
 fn voxel_centre(global: [i64; 3], voxel_size: f64) -> Point3<f64> {
@@ -226,6 +355,7 @@ fn local_index(local: [i64; 3]) -> usize {
     ((local[2] * BLOCK + local[1]) * BLOCK + local[0]) as usize
 }
 
+#[allow(clippy::too_many_arguments)]
 fn integrate(
     blocks: &mut Blocks,
     maps: &[DepthMap],
@@ -233,37 +363,61 @@ fn integrate(
     intrinsics: &Intrinsics,
     voxel_size: f64,
     truncation: f64,
-) {
-    let views: Vec<(&DepthMap, Pose)> = posed(maps, cameras).collect();
-    for (key, block) in blocks.iter_mut() {
+    typical_uncertainty: f64,
+    cosines: &[Vec<f32>],
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<(), Error> {
+    let views: Vec<((&DepthMap, Pose), &Vec<f32>)> = posed(maps, cameras).zip(cosines).collect();
+    let total = blocks.len();
+    for (index, (key, block)) in blocks.iter_mut().enumerate() {
+        // Every voxel of every block is projected into every view, so this is the longest
+        // loop of the stage. Reporting in batches keeps the callback off the hot path.
+        if index % 64 == 0 {
+            report(
+                on_event,
+                Stage::Fusion,
+                0.2 + 0.6 * index as f32 / total.max(1) as f32,
+                format!("merging depth into block {index} of {total}"),
+            )?;
+        }
         for z in 0..BLOCK {
             for y in 0..BLOCK {
                 for x in 0..BLOCK {
                     let global = [key[0] * BLOCK + x, key[1] * BLOCK + y, key[2] * BLOCK + z];
                     let centre = voxel_centre(global, voxel_size);
                     let voxel = &mut block[local_index([x, y, z])];
-                    for (map, pose) in &views {
+                    for ((map, pose), cosines) in &views {
                         let c = pose.to_camera(&centre);
                         if c.z <= 0.0 {
                             continue;
                         }
                         let p = intrinsics.denormalize(Norm::new(c.x / c.z, c.y / c.z));
-                        let Some(d) = map.sample(p) else { continue };
-                        // Depth difference along the optical axis, turned into distance
-                        // along the ray.
-                        let distance = (d as f64 - c.z) * c.coords.norm() / c.z;
+                        let Some(i) = map.index_of(p).filter(|&i| map.depth[i].is_finite()) else {
+                            continue;
+                        };
+                        let (d, uncertainty) = (map.depth[i], map.uncertainty[i]);
+                        // Depth difference along the optical axis, turned into distance along
+                        // the ray and then along the surface normal. Measured along the ray
+                        // alone, a surface seen obliquely gets a band too thin to hold a
+                        // zero crossing, and comes out full of holes.
+                        let distance = (d as f64 - c.z) * c.coords.norm() / c.z * cosines[i] as f64;
                         if distance < -truncation {
                             continue;
                         }
                         let value = (distance / truncation).min(1.0) as f32;
-                        voxel.distance =
-                            (voxel.distance * voxel.weight + value) / (voxel.weight + 1.0);
-                        voxel.weight += 1.0;
+                        // Less precise depths count for less, so that where precise and
+                        // imprecise observations overlap, the precise ones decide.
+                        let relative = uncertainty as f64 / typical_uncertainty;
+                        let weight = (1.0 / (1.0 + relative * relative)) as f32;
+                        voxel.distance = (voxel.distance * voxel.weight + value * weight)
+                            / (voxel.weight + weight);
+                        voxel.weight += weight;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Offsets of a cell's eight corners, indexed by bits: x = 1, y = 2, z = 4.

@@ -22,6 +22,7 @@ use crate::error::Error;
 use crate::input::MIN_VIEWS;
 use crate::pnp;
 use crate::pose::Pose;
+use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::rng::Rng;
 use crate::tracks::Track;
 use crate::triangulate;
@@ -169,6 +170,33 @@ pub fn reconstruct(
     params: &Params,
     rng: &mut Rng,
 ) -> Result<SparseModel, Error> {
+    reconstruct_with_progress(
+        relative,
+        tracks,
+        intrinsics,
+        views,
+        precision_px,
+        params,
+        rng,
+        &mut silent,
+    )
+}
+
+/// [`reconstruct`], reporting each view as it is placed through `on_event`.
+///
+/// # Errors
+/// As [`reconstruct`], plus [`Error::Cancelled`] if `on_event` asks the run to stop.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_with_progress(
+    relative: &[RelativePose],
+    tracks: &[Track],
+    intrinsics: &Intrinsics,
+    views: usize,
+    precision_px: f64,
+    params: &Params,
+    rng: &mut Rng,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<SparseModel, Error> {
     let focal = (intrinsics.fx + intrinsics.fy) / 2.0;
     let threshold = params.max_reprojection * precision_px / focal;
     let min_angle = params.min_point_angle_deg.to_radians();
@@ -190,6 +218,12 @@ pub fn reconstruct(
     let mut cameras: Vec<Option<Pose>> = vec![None; views];
     cameras[seed.pair.a().index()] = Some(Pose::identity());
     cameras[seed.pair.b().index()] = Some(seed.pose);
+    report(
+        on_event,
+        Stage::Registration,
+        2.0 / views as f32,
+        format!("{} defines the frame; 2 of {views} views placed", seed.pair),
+    )?;
 
     let normalized: Vec<Vec<(ViewId, Norm)>> = tracks
         .iter()
@@ -281,6 +315,16 @@ pub fn reconstruct(
             inliers: solution.inliers.len(),
             inlier_ratio,
         });
+        let placed = cameras.iter().flatten().count();
+        report(
+            on_event,
+            Stage::Registration,
+            placed as f32 / views as f32,
+            format!(
+                "placed {view} on {} of the {count} points it sees; {placed} of {views} views placed",
+                solution.inliers.len()
+            ),
+        )?;
         triangulate_missing(&normalized, &cameras, &mut points, threshold, min_angle);
     }
 

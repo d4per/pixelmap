@@ -82,6 +82,64 @@ fn maps_rendered_views_and_recovers_their_motion() {
 }
 
 #[test]
+fn hands_back_the_dense_map_of_every_pair() {
+    let set = SyntheticSet::orbit(Scene::sphere(), 3, 24.0, 400, 300);
+    let photos = rendered(&set);
+
+    let mut maps = Vec::new();
+    let graph = pairs::compute(&photos, Quality::Low, DEFAULT_SEED, &mut |event| {
+        let stage = event.stage;
+        if let Some(map) = event.map {
+            assert_eq!(stage, Stage::Pairs);
+            maps.push(*map);
+        }
+        Flow::Continue(())
+    })
+    .expect("rendered photos are valid input");
+
+    // One map per pair, in the order the pairs were mapped.
+    let pairs: Vec<_> = graph.pairs().map(|(pair, _)| pair).collect();
+    assert_eq!(maps.len(), pairs.len());
+    assert_eq!(maps.iter().map(|m| m.pair).collect::<Vec<_>>(), pairs);
+
+    for (map, (pair, mapping)) in maps.iter().zip(graph.pairs()) {
+        let (columns, rows) = mapping.forward().grid_dimensions();
+        assert_eq!((map.columns, map.rows), (columns, rows));
+        assert_eq!(map.cell_size, mapping.native_stride());
+        assert_eq!(map.points.len(), columns * rows * 2);
+        assert!(map.mapped() > 0, "{pair}: nothing mapped");
+        assert!(
+            map.coverage > 0.5,
+            "{pair}: only {:.0}% covered",
+            map.coverage * 100.0
+        );
+
+        // The grid must be in the coordinates of the photos handed in, not the lower
+        // resolution the solver works at. Comparing every cell against the lookup at the
+        // same place is what catches the working-scale conversion being wrong.
+        let (mut compared, mut close) = (0, 0);
+        for row in 0..rows {
+            for column in 0..columns {
+                let (Some(found), Some(expected)) =
+                    (map.point(column, row), mapping.a_to_b(map.pixel(column, row)))
+                else {
+                    continue;
+                };
+                compared += 1;
+                if (found.0 - expected.0).norm() < 1.0 {
+                    close += 1;
+                }
+            }
+        }
+        assert!(compared > 100, "{pair}: only {compared} cells to compare");
+        assert!(
+            close as f32 > 0.9 * compared as f32,
+            "{pair}: only {close} of {compared} cells agree with the lookup"
+        );
+    }
+}
+
+#[test]
 fn stops_when_asked() {
     let set = SyntheticSet::orbit(Scene::corner(), 3, 20.0, 200, 150);
     let photos = rendered(&set);

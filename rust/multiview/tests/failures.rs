@@ -98,6 +98,7 @@ fn a_run_stops_when_asked() {
     let set = SyntheticSet::orbit(Scene::corner(), 3, 30.0, WIDTH, HEIGHT);
     let graph = PairGraph::from_fn(set.views(), |pair| set.pair(pair));
     let mut stages = Vec::new();
+    let mut first_depth = None;
     let result = pipeline::reconstruct(
         &graph,
         &photos(&set),
@@ -106,6 +107,7 @@ fn a_run_stops_when_asked() {
         &mut |event| {
             stages.push(event.stage);
             if event.stage == Stage::Depth {
+                first_depth.get_or_insert(event.stage_fraction);
                 Flow::Break(())
             } else {
                 Flow::Continue(())
@@ -124,4 +126,10 @@ fn a_run_stops_when_asked() {
     );
     assert!(!stages.contains(&Stage::Fusion));
     assert!(stages.contains(&Stage::BundleAdjustment));
+    // Depth reports as each view is solved, so the run stops partway through the stage
+    // rather than only after it has already done all of its work.
+    assert!(
+        first_depth.is_some_and(|fraction| fraction < 1.0),
+        "depth should report before it finishes, got {first_depth:?}"
+    );
 }

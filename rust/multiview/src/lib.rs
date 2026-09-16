@@ -72,5 +72,5 @@ pub use mesh::Mesh;
 pub use pairs::PairGraph;
 pub use pipeline::Reconstruction;
 pub use pose::Pose;
-pub use progress::{Event, Flow, Stage};
+pub use progress::{Event, Flow, PairMap, Stage};
 pub use types::{Norm, PairId, PhotoPx, ViewId, World};

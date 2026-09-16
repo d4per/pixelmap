@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use nalgebra::{Point3, Vector3};
 use pixelmap::{Quality, DEFAULT_SEED};
 use pixelmap_multiview::depth::{self, DepthMap};
 use pixelmap_multiview::rng::Rng;
-use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
+use pixelmap_multiview::synthetic::{Scene, Surface, SyntheticSet};
 use pixelmap_multiview::{
-    align, ba, fusion, pairs, sfm, tracks, twoview, Flow, PairGraph, Pose, ViewId,
+    align, ba, fusion, pairs, sfm, tracks, twoview, Flow, PairGraph, PhotoPx, Pose, ViewId,
 };
 
 const SIZE: (usize, usize) = (640, 480);
@@ -284,5 +285,167 @@ fn reconstructs_matched_renders_close_to_the_truth() {
         fused.largest_component > 0.5,
         "largest piece {:.0}%",
         fused.largest_component * 100.0
+    );
+}
+
+/// How many views truly see the surface at pixel `p` of `view`, itself included.
+fn true_views(set: &SyntheticSet, view: ViewId, p: PhotoPx) -> usize {
+    let Some(point) = set.surface_point(view, p) else {
+        return 0;
+    };
+    (0..set.views() as u32)
+        .map(ViewId)
+        .filter(|&v| set.project(v, &point).is_some() && set.visible(v, &point))
+        .count()
+}
+
+#[test]
+fn two_view_areas_get_depth() {
+    // Adjacent views 12° apart with 2.5 px of matching noise: a depth from a single pair is
+    // good to about 2%, a depth from both neighbours to about 1%.
+    let set = SyntheticSet::orbit(Scene::corner(), 3, 24.0, SIZE.0, SIZE.1);
+    let graph = PairGraph::from_fn(set.views(), |pair| {
+        set.pair(pair)
+            .with_noise(2.5)
+            .with_seed(u64::from(pair.a().0) * 16 + u64::from(pair.b().0))
+    });
+    let (maps, stats) = depth::estimate_with_stats(
+        &graph,
+        &true_cameras(&set),
+        &set.intrinsics,
+        SIZE,
+        &depth::Params::default(),
+    );
+
+    // Index 0: seen by exactly two views. Index 1: seen by all three.
+    let mut samples = [0usize; 2];
+    let mut valid = [0usize; 2];
+    let mut errors: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    for map in &maps {
+        for row in 0..map.rows {
+            for column in 0..map.columns {
+                let p = map.pixel(column, row);
+                let seen_by = true_views(&set, map.view, p);
+                if seen_by < 2 {
+                    continue;
+                }
+                let group = seen_by.min(3) - 2;
+                samples[group] += 1;
+                if let Some(d) = map.get(column, row) {
+                    valid[group] += 1;
+                    if let Some(truth) = set.depth(map.view, p) {
+                        errors[group].push((d as f64 - truth).abs() / truth);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        samples[0] > 1000,
+        "the scene has areas seen by two views: {samples:?}"
+    );
+    let fraction = |group: usize| valid[group] as f64 / samples[group] as f64;
+    assert!(
+        fraction(0) >= 0.8 * fraction(1),
+        "{:.0}% of the areas seen by two views have a depth, against {:.0}% of those seen by three; {:#?}",
+        fraction(0) * 100.0,
+        fraction(1) * 100.0,
+        stats
+    );
+    let median = percentile(&mut errors[0], 0.5);
+    assert!(
+        median < 0.03,
+        "median depth error {:.2}% where two views see the surface",
+        median * 100.0
+    );
+}
+
+#[test]
+fn fuses_surfaces_seen_at_a_grazing_angle() {
+    // A long floor, seen by cameras 0.6 units above it, looking along it: most of the floor
+    // meets the rays at well under 20°.
+    let floor = Scene::new(
+        vec![Surface::Rectangle {
+            origin: Point3::new(-6.0, 0.0, -3.0),
+            u: Vector3::new(12.0, 0.0, 0.0),
+            v: Vector3::new(0.0, 0.0, 16.0),
+        }],
+        Point3::new(0.0, 0.0, 3.0),
+        6.0,
+    );
+    let poses = [-0.8, 0.0, 0.8]
+        .map(|x| {
+            Pose::look_at(
+                &Point3::new(x, 0.6, -4.0),
+                &Point3::new(0.0, 0.0, 3.0),
+                &Vector3::y(),
+            )
+        })
+        .to_vec();
+    let set = SyntheticSet::with_poses(floor, poses, SIZE.0, SIZE.1);
+    let graph = PairGraph::from_fn(set.views(), |pair| set.pair(pair));
+    let cameras = true_cameras(&set);
+    let maps = depth::estimate(
+        &graph,
+        &cameras,
+        &set.intrinsics,
+        SIZE,
+        &depth::Params::default(),
+    );
+    let fused = fusion::fuse(&maps, &cameras, &set.intrinsics, &fusion::Params::default())
+        .expect("a surface");
+
+    // Index mesh vertices by cells two voxels wide, then ask of each depth sample whether a
+    // vertex lies within two voxels of its true surface point.
+    let cell = 2.0 * fused.voxel_size;
+    let key = |p: &Point3<f64>| p.coords.map(|c| (c / cell).floor() as i64);
+    let mut cells = std::collections::HashMap::<_, Vec<Point3<f64>>>::new();
+    for p in &fused.mesh.positions {
+        cells.entry(key(p)).or_default().push(*p);
+    }
+    let (mut samples, mut covered) = (0usize, 0usize);
+    for map in &maps {
+        for row in (0..map.rows).step_by(3) {
+            for column in (0..map.columns).step_by(3) {
+                if map.get(column, row).is_none() {
+                    continue;
+                }
+                let Some(truth) = set.surface_point(map.view, map.pixel(column, row)) else {
+                    continue;
+                };
+                samples += 1;
+                let k = key(&truth.0);
+                let near = (-1..=1).any(|dx| {
+                    (-1..=1).any(|dy| {
+                        (-1..=1).any(|dz| {
+                            cells
+                                .get(&(k + Vector3::new(dx, dy, dz)))
+                                .is_some_and(|ps| ps.iter().any(|p| (p - truth.0).norm() <= cell))
+                        })
+                    })
+                });
+                covered += near as usize;
+            }
+        }
+    }
+    assert!(samples > 1000, "only {samples} floor samples");
+    let fraction = covered as f64 / samples as f64;
+    assert!(
+        fraction > 0.9,
+        "only {:.0}% of the floor's depth made it into the mesh",
+        fraction * 100.0
+    );
+
+    let mut distances: Vec<f64> = fused
+        .mesh
+        .positions
+        .iter()
+        .map(|p| set.scene.distance(p))
+        .collect();
+    let median = percentile(&mut distances, 0.5);
+    assert!(
+        median < 0.5 * fused.voxel_size,
+        "median distance {median}, voxel {}",
+        fused.voxel_size
     );
 }

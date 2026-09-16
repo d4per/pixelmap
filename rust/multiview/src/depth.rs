@@ -23,6 +23,7 @@ use crate::error::Error;
 use crate::lookup::PairLookup;
 use crate::pairs::PairGraph;
 use crate::pose::Pose;
+use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::triangulate;
 use crate::types::{Norm, PhotoPx, ViewId, World};
 
@@ -42,8 +43,14 @@ pub struct Params {
     /// The widest angle between the reference ray and another view's ray must reach this,
     /// in degrees.
     pub min_angle_deg: f64,
-    /// The largest relative depth difference the cross-view check accepts.
+    /// The largest relative depth difference the cross-view check accepts between two
+    /// precise depths.
     pub max_depth_difference: f64,
+    /// Less precise depths may differ by this many times their combined expected error,
+    /// when that allows more than `max_depth_difference`. A depth from a single narrow pair
+    /// is far less precise than one from several wide ones, and holding both to the same
+    /// absolute tolerance throws away most of the parts only two photos see.
+    pub depth_agreement_sigmas: f64,
     /// How many other depth maps must agree with a depth for it to survive.
     pub min_consistent_views: usize,
     /// Neighbouring samples whose depths differ by more than this fraction are on
@@ -60,11 +67,12 @@ impl Default for Params {
     fn default() -> Self {
         Params {
             stride: None,
-            max_reprojection: 2.0,
-            min_angle_deg: 2.0,
-            max_depth_difference: 0.02,
+            max_reprojection: 10.0,
+            min_angle_deg: 7.0,
+            max_depth_difference: 0.5,
+            depth_agreement_sigmas: 5.0,
             min_consistent_views: 1,
-            max_depth_step: 0.05,
+            max_depth_step: 0.2,
             min_component: 64,
             smooth: true,
         }
@@ -84,6 +92,9 @@ pub struct DepthMap {
     pub stride: usize,
     /// Camera-frame z of the surface at each sample, row by row. `NaN` where unknown.
     pub depth: Vec<f32>,
+    /// The expected relative error of each depth, from the precision of the mappings and
+    /// the angle at which the rays met. Meaningless where the depth is unknown.
+    pub uncertainty: Vec<f32>,
 }
 
 impl DepthMap {
@@ -100,16 +111,39 @@ impl DepthMap {
 
     /// The depth of the sample nearest photo position `p`, if known.
     pub fn sample(&self, p: PhotoPx) -> Option<f32> {
+        let (column, row) = self.nearest(p)?;
+        self.get(column, row)
+    }
+
+    /// The depth at grid sample `(column, row)` and its expected relative error, if known.
+    pub fn get_with_uncertainty(&self, column: usize, row: usize) -> Option<(f32, f32)> {
+        let i = row * self.columns + column;
+        let d = self.depth[i];
+        d.is_finite().then(|| (d, self.uncertainty[i]))
+    }
+
+    /// [`Self::sample`], with the depth's expected relative error.
+    pub fn sample_with_uncertainty(&self, p: PhotoPx) -> Option<(f32, f32)> {
+        let (column, row) = self.nearest(p)?;
+        self.get_with_uncertainty(column, row)
+    }
+
+    /// The index into [`Self::depth`] of the sample nearest photo position `p`, if `p` is
+    /// over the grid.
+    pub fn index_of(&self, p: PhotoPx) -> Option<usize> {
+        self.nearest(p)
+            .map(|(column, row)| row * self.columns + column)
+    }
+
+    /// The grid sample nearest photo position `p`, if `p` is over the grid.
+    fn nearest(&self, p: PhotoPx) -> Option<(usize, usize)> {
         let column = (p.x() / self.stride as f32).round();
         let row = (p.y() / self.stride as f32).round();
         if column < 0.0 || row < 0.0 {
             return None;
         }
         let (column, row) = (column as usize, row as usize);
-        if column >= self.columns || row >= self.rows {
-            return None;
-        }
-        self.get(column, row)
+        (column < self.columns && row < self.rows).then_some((column, row))
     }
 
     /// How many samples have a depth.
@@ -123,14 +157,97 @@ impl DepthMap {
     }
 }
 
+/// Where one view's depth samples went, split by whether a sample mapped into one other
+/// view or into several.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthStats {
+    /// The view.
+    pub view: ViewId,
+    /// Samples no other view's mapping reaches. Nothing can give these a depth.
+    pub unmapped: usize,
+    /// Samples mapped into exactly one other view.
+    pub single: Counts,
+    /// Samples mapped into two or more other views.
+    pub multiple: Counts,
+    /// What became of each sample, row by row over the view's depth-map grid.
+    pub fates: Vec<Fate>,
+    /// How many other views each sample mapped into, row by row.
+    pub matched: Vec<u8>,
+}
+
+/// What became of one depth sample.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Fate {
+    /// No other view's mapping reached it.
+    Unmapped,
+    /// The views did not fit one depth.
+    RejectedByFit,
+    /// The views fit, but their rays met at too narrow an angle to measure depth.
+    RejectedByAngle,
+    /// No other depth map agreed.
+    RejectedByConsistency,
+    /// Part of a small disconnected patch.
+    RemovedAsSpeckle,
+    /// It has a depth.
+    Kept,
+}
+
+/// What became of a group of depth samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Counts {
+    /// How many samples.
+    pub samples: usize,
+    /// Dropped because the views did not fit one depth.
+    pub rejected_by_fit: usize,
+    /// Dropped because the rays met at too narrow an angle.
+    pub rejected_by_angle: usize,
+    /// Dropped because no other depth map agreed.
+    pub rejected_by_consistency: usize,
+    /// Dropped as part of a small disconnected patch.
+    pub removed_as_speckle: usize,
+    /// Kept.
+    pub kept: usize,
+}
+
 /// A depth map for every registered view in `cameras`, over photos of `size`.
 pub fn estimate<L: PairLookup>(
     graph: &PairGraph<L>,
     cameras: &[Option<Pose>],
     intrinsics: &Intrinsics,
-    (width, height): (usize, usize),
+    size: (usize, usize),
     params: &Params,
 ) -> Vec<DepthMap> {
+    estimate_with_stats(graph, cameras, intrinsics, size, params).0
+}
+
+/// [`estimate`], with an account of where each view's samples were lost.
+pub fn estimate_with_stats<L: PairLookup>(
+    graph: &PairGraph<L>,
+    cameras: &[Option<Pose>],
+    intrinsics: &Intrinsics,
+    size: (usize, usize),
+    params: &Params,
+) -> (Vec<DepthMap>, Vec<DepthStats>) {
+    // `silent` never breaks, so the only error this form could return cannot happen.
+    estimate_with_progress(graph, cameras, intrinsics, size, params, &mut silent)
+        .expect("a callback that never breaks cannot cancel")
+}
+
+/// [`estimate_with_stats`], reporting each view through `on_event`.
+///
+/// Depth is the first stage whose cost grows with the number of views squared, so it
+/// reports as each view is solved, cross-checked and cleaned rather than only at the end.
+///
+/// # Errors
+/// [`Error::Cancelled`] if `on_event` asks the run to stop.
+pub fn estimate_with_progress<L: PairLookup>(
+    graph: &PairGraph<L>,
+    cameras: &[Option<Pose>],
+    intrinsics: &Intrinsics,
+    (width, height): (usize, usize),
+    params: &Params,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<(Vec<DepthMap>, Vec<DepthStats>), Error> {
     let precision = graph.precision_px() as f64;
     let native = graph
         .pairs()
@@ -153,55 +270,137 @@ pub fn estimate<L: PairLookup>(
         .filter(|(v, _)| v.index() < graph.views())
         .collect();
 
-    let raw: Vec<DepthMap> = registered
-        .iter()
-        .map(|&(view, pose)| {
-            let to_world = pose.rotation.inverse();
-            let centre = pose.centre();
-            let mut depth = vec![f32::NAN; columns * rows];
-            let mut rays = Vec::with_capacity(registered.len());
-            for row in 0..rows {
-                for column in 0..columns {
-                    let p = PhotoPx::new((column * stride) as f32, (row * stride) as f32);
-                    rays.clear();
-                    for &(other, other_pose) in &registered {
-                        if other == view {
-                            continue;
-                        }
-                        if let Some(q) = graph.directed(view, other).and_then(|m| m.map(p)) {
-                            rays.push((other_pose, intrinsics.normalize(q)));
-                        }
+    let mut results: Vec<(DepthMap, Vec<u8>, Vec<bool>)> = Vec::with_capacity(registered.len());
+    for (index, &(view, pose)) in registered.iter().enumerate() {
+        let to_world = pose.rotation.inverse();
+        let centre = pose.centre();
+        let mut depth = vec![f32::NAN; columns * rows];
+        let mut uncertainty = vec![f32::NAN; columns * rows];
+        let mut narrow = vec![false; columns * rows];
+        let mut mapped = vec![0u8; columns * rows];
+        let mut rays = Vec::with_capacity(registered.len());
+        for row in 0..rows {
+            for column in 0..columns {
+                let p = PhotoPx::new((column * stride) as f32, (row * stride) as f32);
+                rays.clear();
+                for &(other, other_pose) in &registered {
+                    if other == view {
+                        continue;
                     }
-                    let n = intrinsics.normalize(p);
-                    let direction = to_world * Vector3::new(n.x(), n.y(), 1.0);
-                    if let Some(z) =
-                        depth_along_ray(&centre, &direction, &mut rays, threshold, min_angle)
-                    {
-                        depth[row * columns + column] = z as f32;
+                    if let Some(q) = graph.directed(view, other).and_then(|m| m.map(p)) {
+                        rays.push((other_pose, intrinsics.normalize(q)));
                     }
                 }
+                let i = row * columns + column;
+                mapped[i] = rays.len().min(u8::MAX as usize) as u8;
+                let n = intrinsics.normalize(p);
+                let direction = to_world * Vector3::new(n.x(), n.y(), 1.0);
+                let fit = depth_along_ray(&centre, &direction, &mut rays, threshold, min_angle);
+                narrow[i] = fit == Err(Rejection::Angle);
+                if let Ok((z, angle)) = fit {
+                    depth[i] = z as f32;
+                    // The error grows as the rays meet more obliquely, and shrinks with
+                    // more of them.
+                    let count = rays.len().max(1) as f64;
+                    uncertainty[i] = (precision / (focal * angle.sin() * count.sqrt())) as f32;
+                }
             }
-            DepthMap {
-                view,
-                columns,
-                rows,
-                stride,
-                depth,
-            }
-        })
-        .collect();
+        }
+        let map = DepthMap {
+            view,
+            columns,
+            rows,
+            stride,
+            depth,
+            uncertainty,
+        };
+        let (valid, total) = (map.valid(), map.depth.len());
+        results.push((map, mapped, narrow));
+        // Solving every view is the bulk of the stage; cross-checking and cleaning
+        // share what is left.
+        report(
+            on_event,
+            Stage::Depth,
+            0.6 * (index + 1) as f32 / registered.len() as f32,
+            format!("{view}: {valid} of {total} samples have a depth"),
+        )?;
+    }
+    let mut raw = Vec::with_capacity(results.len());
+    let mut mapped = Vec::with_capacity(results.len());
+    let mut narrow = Vec::with_capacity(results.len());
+    for (map, counts, angles) in results {
+        raw.push(map);
+        mapped.push(counts);
+        narrow.push(angles);
+    }
 
-    consistency_filter(&raw, cameras, intrinsics, precision, params)
-        .into_iter()
-        .map(|map| {
-            let map = remove_speckles(map, params);
-            if params.smooth {
-                smooth(map, params)
+    let consistent = consistency_filter(&raw, cameras, intrinsics, precision, params, on_event)?;
+    let view_count = raw.len();
+    let mut maps = Vec::with_capacity(raw.len());
+    let mut stats = Vec::with_capacity(raw.len());
+    for (index, (((raw, consistent), mapped), narrow)) in raw
+        .iter()
+        .zip(consistent)
+        .zip(&mapped)
+        .zip(&narrow)
+        .enumerate()
+    {
+        let cleaned = remove_speckles(consistent.clone(), params);
+        let mut view_stats = DepthStats {
+            view: raw.view,
+            unmapped: 0,
+            single: Counts::default(),
+            multiple: Counts::default(),
+            fates: Vec::with_capacity(mapped.len()),
+            matched: mapped.clone(),
+        };
+        for (i, &rays) in mapped.iter().enumerate() {
+            let fate = if rays == 0 {
+                Fate::Unmapped
+            } else if !raw.depth[i].is_finite() && narrow[i] {
+                Fate::RejectedByAngle
+            } else if !raw.depth[i].is_finite() {
+                Fate::RejectedByFit
+            } else if !consistent.depth[i].is_finite() {
+                Fate::RejectedByConsistency
+            } else if !cleaned.depth[i].is_finite() {
+                Fate::RemovedAsSpeckle
             } else {
-                map
+                Fate::Kept
+            };
+            view_stats.fates.push(fate);
+            let counts = match rays {
+                0 => {
+                    view_stats.unmapped += 1;
+                    continue;
+                }
+                1 => &mut view_stats.single,
+                _ => &mut view_stats.multiple,
+            };
+            counts.samples += 1;
+            match fate {
+                Fate::RejectedByFit => counts.rejected_by_fit += 1,
+                Fate::RejectedByAngle => counts.rejected_by_angle += 1,
+                Fate::RejectedByConsistency => counts.rejected_by_consistency += 1,
+                Fate::RemovedAsSpeckle => counts.removed_as_speckle += 1,
+                Fate::Kept => counts.kept += 1,
+                Fate::Unmapped => {}
             }
-        })
-        .collect()
+        }
+        stats.push(view_stats);
+        maps.push(if params.smooth {
+            smooth(cleaned, params)
+        } else {
+            cleaned
+        });
+        report(
+            on_event,
+            Stage::Depth,
+            0.9 + 0.1 * (index + 1) as f32 / view_count as f32,
+            format!("{}: speckles removed", raw.view),
+        )?;
+    }
+    Ok((maps, stats))
 }
 
 /// The fraction of all samples in `maps` that have a depth.
@@ -224,17 +423,27 @@ pub fn require_coverage(maps: &[DepthMap]) -> Result<f64, Error> {
 /// The depth along the ray `centre + z · direction` that best fits `rays`, where
 /// `direction` has unit z in the reference camera's frame, so that `z` is the reference
 /// camera's depth. Drops the worst-fitting ray until the rest fit within `threshold`.
+/// Returns the depth and the widest angle between the reference ray and another one.
+/// Why a sample's rays gave it no depth.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Rejection {
+    /// No depth fits the views.
+    Fit,
+    /// The rays fit, but meet too narrowly.
+    Angle,
+}
+
 fn depth_along_ray(
     centre: &Point3<f64>,
     direction: &Vector3<f64>,
     rays: &mut Vec<(Pose, Norm)>,
     threshold: f64,
     min_angle: f64,
-) -> Option<f64> {
+) -> Result<(f64, f64), Rejection> {
     while !rays.is_empty() {
-        let z = solve_depth(centre, direction, rays)?;
+        let z = solve_depth(centre, direction, rays).ok_or(Rejection::Fit)?;
         if z <= 0.0 {
-            return None;
+            return Err(Rejection::Fit);
         }
         let point = World(centre + direction * z);
         let (worst, error) = rays
@@ -246,17 +455,22 @@ fn depth_along_ray(
                     .map_or(f64::INFINITY, |p| (p.x() - n.x()).hypot(p.y() - n.y()));
                 (i, error)
             })
-            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .ok_or(Rejection::Fit)?;
         if error <= threshold {
             let angle = rays
                 .iter()
                 .map(|(pose, _)| triangulate::triangulation_angle(centre, &pose.centre(), &point))
                 .fold(0.0, f64::max);
-            return (angle >= min_angle).then_some(z);
+            return if angle >= min_angle {
+                Ok((z, angle))
+            } else {
+                Err(Rejection::Angle)
+            };
         }
         rays.swap_remove(worst);
     }
-    None
+    Err(Rejection::Fit)
 }
 
 fn solve_depth(
@@ -320,70 +534,88 @@ fn consistency_filter(
     intrinsics: &Intrinsics,
     precision: f64,
     params: &Params,
-) -> Vec<DepthMap> {
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<Vec<DepthMap>, Error> {
     let tolerance_px = params.max_reprojection * precision;
-    maps.iter()
-        .map(|map| {
-            let pose = cameras[map.view.index()].expect("depth maps are of registered views");
-            let to_world = pose.inverse();
-            let mut filtered = map.clone();
-            for row in 0..map.rows {
-                for column in 0..map.columns {
-                    let Some(d) = map.get(column, row) else {
-                        continue;
-                    };
-                    let d = d as f64;
-                    let p = map.pixel(column, row);
-                    let n = intrinsics.normalize(p);
-                    let world = to_world.to_camera(&Point3::new(n.x() * d, n.y() * d, d));
+    let mut filtered_maps = Vec::with_capacity(maps.len());
+    for (index, map) in maps.iter().enumerate() {
+        let pose = cameras[map.view.index()].expect("depth maps are of registered views");
+        let to_world = pose.inverse();
+        let mut filtered = map.clone();
+        for row in 0..map.rows {
+            for column in 0..map.columns {
+                let Some((d, sigma)) = map.get_with_uncertainty(column, row) else {
+                    continue;
+                };
+                let d = d as f64;
+                let p = map.pixel(column, row);
+                let n = intrinsics.normalize(p);
+                let world = to_world.to_camera(&Point3::new(n.x() * d, n.y() * d, d));
 
-                    let agreeing = maps
-                        .iter()
-                        .filter(|other| other.view != map.view)
-                        .filter(|other| {
-                            let other_pose = cameras[other.view.index()]
-                                .expect("depth maps are of registered views");
-                            let c = other_pose.to_camera(&world);
-                            if c.z <= 0.0 {
-                                return false;
-                            }
-                            let q = intrinsics.denormalize(Norm::new(c.x / c.z, c.y / c.z));
-                            let Some(ds) = other.sample(q) else {
-                                return false;
-                            };
-                            let ds = ds as f64;
-                            let nq = intrinsics.normalize(q);
-                            let back = other_pose.inverse().to_camera(&Point3::new(
-                                nq.x() * ds,
-                                nq.y() * ds,
-                                ds,
-                            ));
-                            let in_reference = pose.to_camera(&back);
-                            if in_reference.z <= 0.0 {
-                                return false;
-                            }
-                            let reprojected = intrinsics.denormalize(Norm::new(
-                                in_reference.x / in_reference.z,
-                                in_reference.y / in_reference.z,
-                            ));
-                            let pixels = (reprojected.0 - p.0).norm() as f64;
-                            let difference = ((in_reference.z - d) / d).abs();
-                            pixels <= tolerance_px && difference <= params.max_depth_difference
-                        })
-                        .count();
-                    if agreeing < params.min_consistent_views {
-                        filtered.depth[row * map.columns + column] = f32::NAN;
-                    }
+                let agreeing = maps
+                    .iter()
+                    .filter(|other| other.view != map.view)
+                    .filter(|other| {
+                        let other_pose = cameras[other.view.index()]
+                            .expect("depth maps are of registered views");
+                        let c = other_pose.to_camera(&world);
+                        if c.z <= 0.0 {
+                            return false;
+                        }
+                        let q = intrinsics.denormalize(Norm::new(c.x / c.z, c.y / c.z));
+                        let Some((ds, other_sigma)) = other.sample_with_uncertainty(q) else {
+                            return false;
+                        };
+                        let ds = ds as f64;
+                        let nq = intrinsics.normalize(q);
+                        let back = other_pose.inverse().to_camera(&Point3::new(
+                            nq.x() * ds,
+                            nq.y() * ds,
+                            ds,
+                        ));
+                        let in_reference = pose.to_camera(&back);
+                        if in_reference.z <= 0.0 {
+                            return false;
+                        }
+                        let reprojected = intrinsics.denormalize(Norm::new(
+                            in_reference.x / in_reference.z,
+                            in_reference.y / in_reference.z,
+                        ));
+                        let pixels = (reprojected.0 - p.0).norm() as f64;
+                        let difference = ((in_reference.z - d) / d).abs();
+                        let allowed = params.max_depth_difference.max(
+                            params.depth_agreement_sigmas
+                                * (sigma as f64).hypot(other_sigma as f64),
+                        );
+                        // Lifting the other view's depth back into this one moves it only along the
+                        // epipolar line, so the pixel distance measures the same disagreement
+                        // as the depth difference. Relax it by the same factor.
+                        let relaxation = allowed / params.max_depth_difference;
+                        pixels <= tolerance_px * relaxation && difference <= allowed
+                    })
+                    .count();
+                if agreeing < params.min_consistent_views {
+                    filtered.depth[row * map.columns + column] = f32::NAN;
                 }
             }
-            filtered
-        })
-        .collect()
+        }
+        filtered_maps.push(filtered);
+        report(
+            on_event,
+            Stage::Depth,
+            0.6 + 0.3 * (index + 1) as f32 / maps.len() as f32,
+            format!("{}: cross-checked against the other views", map.view),
+        )?;
+    }
+    Ok(filtered_maps)
 }
 
-/// Whether two neighbouring depths belong to the same surface.
-fn continuous(a: f32, b: f32, step: f64) -> bool {
-    ((a - b).abs() as f64) <= step * a.max(b) as f64
+/// Whether two neighbouring depths, each with its expected relative error, belong to the
+/// same surface: they differ by no more than `step`, or by three times their combined
+/// error if that is larger.
+fn continuous(a: (f32, f32), b: (f32, f32), step: f64) -> bool {
+    let allowed = step.max(3.0 * (a.1 + b.1) as f64);
+    ((a.0 - b.0).abs() as f64) <= allowed * a.0.max(b.0) as f64
 }
 
 /// Removes connected patches smaller than `params.min_component` samples.
@@ -411,7 +643,11 @@ fn remove_speckles(mut map: DepthMap, params: &Params) -> DepthMap {
             for j in neighbours.into_iter().flatten() {
                 if !visited[j]
                     && map.depth[j].is_finite()
-                    && continuous(map.depth[i], map.depth[j], params.max_depth_step)
+                    && continuous(
+                        (map.depth[i], map.uncertainty[i]),
+                        (map.depth[j], map.uncertainty[j]),
+                        params.max_depth_step,
+                    )
                 {
                     visited[j] = true;
                     stack.push(j);
@@ -433,15 +669,15 @@ fn smooth(map: DepthMap, params: &Params) -> DepthMap {
     let mut window = Vec::with_capacity(9);
     for row in 0..map.rows {
         for column in 0..map.columns {
-            let Some(d) = map.get(column, row) else {
+            let Some(d) = map.get_with_uncertainty(column, row) else {
                 continue;
             };
             window.clear();
             for r in row.saturating_sub(1)..(row + 2).min(map.rows) {
                 for c in column.saturating_sub(1)..(column + 2).min(map.columns) {
-                    if let Some(n) = map.get(c, r) {
+                    if let Some(n) = map.get_with_uncertainty(c, r) {
                         if continuous(d, n, params.max_depth_step) {
-                            window.push(n);
+                            window.push(n.0);
                         }
                     }
                 }
@@ -463,6 +699,7 @@ mod tests {
             columns,
             rows: depth.len() / columns,
             stride: 4,
+            uncertainty: vec![0.001; depth.len()],
             depth,
         }
     }
@@ -522,7 +759,7 @@ mod tests {
 
         let n = reference.project(&World(target)).unwrap();
         let direction = Vector3::new(n.x(), n.y(), 1.0);
-        let z = depth_along_ray(
+        let (z, _angle) = depth_along_ray(
             &reference.centre(),
             &direction,
             &mut rays,

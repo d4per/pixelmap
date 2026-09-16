@@ -10,7 +10,7 @@ use pixelmap::{Correspondence, Photo, Quality};
 use crate::error::Error;
 use crate::input::MIN_VIEWS;
 use crate::lookup::{Directed, PairLookup};
-use crate::progress::{Event, Flow, Stage};
+use crate::progress::{Event, Flow, PairMap, Stage};
 use crate::types::{PairId, PhotoPx, ViewId};
 
 /// The coverage below which a pair is not trusted to connect its two views.
@@ -102,10 +102,39 @@ fn index(views: usize, pair: PairId) -> usize {
     a * (2 * views - a - 1) / 2 + (b - a - 1)
 }
 
+/// The finished mapping of `pair` as a [`PairMap`], converted out of the solver's working
+/// resolution into the coordinates of the photos the caller handed in.
+fn pair_map(pair: PairId, mapping: &Correspondence) -> PairMap {
+    let forward = mapping.forward();
+    let (columns, rows) = forward.grid_dimensions();
+    // `working_scale` is working pixels per source pixel, so dividing takes a grid entry
+    // back to the photo the caller passed in. Unmapped cells hold NaN and stay NaN.
+    let scale = mapping.working_scale();
+    let mut points = Vec::with_capacity(columns * rows * 2);
+    for row in 0..rows {
+        for column in 0..columns {
+            let (x, y) = forward.grid_coordinates(column, row);
+            points.push(x / scale);
+            points.push(y / scale);
+        }
+    }
+    PairMap {
+        pair,
+        columns,
+        rows,
+        cell_size: mapping.native_stride(),
+        points,
+        coverage: mapping.coverage(),
+    }
+}
+
 /// Runs pixelmap over every pair of `photos`, one pair at a time.
 ///
 /// Reports progress through `on_event`. A `Break` takes effect once the pair being
 /// mapped is finished, since a pixelmap run cannot be interrupted partway.
+///
+/// The event that finishes each pair carries that pair's [`PairMap`], so a caller can show
+/// the correspondence as it is found.
 ///
 /// # Errors
 /// [`Error::Correspondence`] if pixelmap rejects a pair; [`Error::Cancelled`].
@@ -136,9 +165,10 @@ pub fn compute(
             .map_err(|source| Error::Correspondence { pair, source })?;
 
         let message = format!("mapped {pair}: {:.0}% coverage", mapping.coverage() * 100.0);
+        let map = pair_map(pair, &mapping);
         maps.push(mapping);
         let fraction = (index + 1) as f32 / total as f32;
-        stop |= on_event(Event::new(Stage::Pairs, fraction, message)).is_break();
+        stop |= on_event(Event::new(Stage::Pairs, fraction, message).with_map(map)).is_break();
         if stop {
             return Err(Error::Cancelled {
                 stage: Stage::Pairs,

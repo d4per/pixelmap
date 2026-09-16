@@ -16,7 +16,7 @@ use image::imageops::FilterType;
 use image::DynamicImage;
 use nalgebra::Rotation3;
 use pixelmap::{Correspondence, Photo, ProcessingMode, DEFAULT_SEED};
-use pixelmap_multiview::depth::DepthMap;
+use pixelmap_multiview::depth::{self, DepthMap};
 use pixelmap_multiview::pipeline::{self, Reconstruction};
 use pixelmap_multiview::sfm::SparseModel;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
@@ -152,6 +152,7 @@ fn run(args: Args) -> Result<(), String> {
     }
     let reconstruction = result.map_err(|e| e.to_string())?;
     println!("reconstructed in {:.1} s", start.elapsed().as_secs_f64());
+    print_depth_stats(&reconstruction);
 
     if let Some(truth) = &truth {
         report_truth(truth, &reconstruction);
@@ -180,6 +181,45 @@ fn print_event(event: &Event, mapping_line: &mut bool) {
         event.stage,
         event.message
     );
+}
+
+/// How dense depth treated each photo's samples, by how many other photos they map into.
+fn print_depth_stats(r: &Reconstruction) {
+    let percent = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
+    let describe = |counts: &depth::Counts| {
+        format!(
+            "{} samples, {:.0}% kept; dropped {:.0}% by fit, {:.0}% by narrow ray angle, {:.0}% by consistency, {:.0}% as speckle",
+            counts.samples,
+            percent(counts.kept, counts.samples),
+            percent(counts.rejected_by_fit, counts.samples),
+            percent(counts.rejected_by_angle, counts.samples),
+            percent(counts.rejected_by_consistency, counts.samples),
+            percent(counts.removed_as_speckle, counts.samples),
+        )
+    };
+    println!("dense depth per photo:");
+    for stats in &r.depth_stats {
+        let total = stats.unmapped + stats.single.samples + stats.multiple.samples;
+        println!(
+            "  {}: {:.0}% matched to no other photo",
+            stats.view,
+            percent(stats.unmapped, total)
+        );
+        if percent(stats.unmapped, total) >= 10.0 {
+            println!(
+                "    those parts cannot be reconstructed: no other photo shows them, or the matcher \
+                 could not follow them there. Another photo overlapping them would help"
+            );
+        }
+        println!(
+            "    matched to one other photo: {}",
+            describe(&stats.single)
+        );
+        println!(
+            "    matched to two or more:     {}",
+            describe(&stats.multiple)
+        );
+    }
 }
 
 /// Compares every stage of a reconstruction of a synthetic scene with the ground truth.
@@ -359,6 +399,14 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Resul
     for map in &r.depth {
         write_depth_png(&dir.join(format!("depth_{}.png", map.view.0)), map)?;
     }
+    for (map, stats) in r.depth.iter().zip(&r.depth_stats) {
+        write_coverage_png(
+            &dir.join(format!("coverage_{}.png", map.view.0)),
+            &photos[map.view.index()],
+            map,
+            stats,
+        )?;
+    }
 
     let mesh = &r.fused.mesh;
     write_file(&dir.join("mesh.obj"), |out| {
@@ -376,7 +424,7 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Resul
     })?;
 
     eprintln!(
-        "wrote view_N.png, sparse.ply, depth_N.png, mesh.obj, mesh.mtl, mesh.x3d, mesh_texture.png and mesh_colours.ply to {}",
+        "wrote view_N.png, sparse.ply, depth_N.png, coverage_N.png, mesh.obj, mesh.mtl, mesh.x3d, mesh_texture.png and mesh_colours.ply to {}",
         dir.display()
     );
     Ok(())
@@ -404,6 +452,42 @@ fn save_photo(path: &Path, photo: &Photo) -> Result<(), String> {
     .expect("buffer came from a Photo of exactly these dimensions")
     .save(path)
     .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// A photo tinted by what became of its depth samples: red where no other photo was matched
+/// to it, yellow where a match was found but the depth rejected, blue where only one other
+/// photo supports the depth, and untinted where two or more do.
+fn write_coverage_png(
+    path: &Path,
+    photo: &Photo,
+    map: &DepthMap,
+    stats: &depth::DepthStats,
+) -> Result<(), String> {
+    let (width, height) = (photo.width(), photo.height());
+    let mut rgba = photo.as_rgba().to_vec();
+    for y in 0..height {
+        let row = ((y as f32 / map.stride as f32).round() as usize).min(map.rows - 1);
+        for x in 0..width {
+            let column = ((x as f32 / map.stride as f32).round() as usize).min(map.columns - 1);
+            let i = row * map.columns + column;
+            let tint = match stats.fates[i] {
+                depth::Fate::Unmapped => Some([220, 30, 30]),
+                depth::Fate::Kept if stats.matched[i] >= 2 => None,
+                depth::Fate::Kept => Some([40, 90, 230]),
+                _ => Some([240, 200, 0]),
+            };
+            if let Some(tint) = tint {
+                let p = (y * width + x) * 4;
+                for (channel, t) in rgba[p..p + 3].iter_mut().zip(tint) {
+                    *channel = ((*channel as u16 + t as u16) / 2) as u8;
+                }
+            }
+        }
+    }
+    image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+        .expect("buffer came from a Photo of exactly these dimensions")
+        .save(path)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// A depth map as a greyscale image: near is bright, far is dark, unknown is black.

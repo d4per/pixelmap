@@ -24,8 +24,10 @@ use pixelmap::Photo;
 
 use crate::calib::Intrinsics;
 use crate::depth::DepthMap;
+use crate::error::Error;
 use crate::mesh::Mesh;
 use crate::pose::Pose;
+use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::types::{PhotoPx, ViewId};
 
 /// Tuning for [`build`].
@@ -89,6 +91,25 @@ pub fn build(
     depth: &[DepthMap],
     params: &Params,
 ) -> Texture {
+    // `silent` never breaks, so the only error this form could return cannot happen.
+    build_with_progress(mesh, cameras, intrinsics, photos, depth, params, &mut silent)
+        .expect("a callback that never breaks cannot cancel")
+}
+
+/// [`build`], reporting each phase through `on_event`.
+///
+/// # Errors
+/// [`Error::Cancelled`] if `on_event` asks the run to stop.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_progress(
+    mesh: &Mesh,
+    cameras: &[Option<Pose>],
+    intrinsics: &Intrinsics,
+    photos: &[Arc<Photo>],
+    depth: &[DepthMap],
+    params: &Params,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<Texture, Error> {
     let views: Vec<View> = cameras
         .iter()
         .enumerate()
@@ -105,22 +126,49 @@ pub fn build(
         })
         .collect();
 
-    let vertex_colours = mesh
-        .positions
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let normal = mesh.normals.get(i).copied().unwrap_or_else(Vector3::zeros);
-            vertex_colour(&views, intrinsics, p, &normal, params)
-        })
-        .collect();
+    let vertices = mesh.positions.len();
+    let mut vertex_colours = Vec::with_capacity(vertices);
+    for (i, p) in mesh.positions.iter().enumerate() {
+        // Every vertex is projected into every view, so this is the long half of the
+        // stage. Reporting in batches keeps the callback off the hot path.
+        if i % 4096 == 0 {
+            report(
+                on_event,
+                Stage::Texture,
+                0.5 * i as f32 / vertices.max(1) as f32,
+                format!("colouring vertex {i} of {vertices}"),
+            )?;
+        }
+        let normal = mesh.normals.get(i).copied().unwrap_or_else(Vector3::zeros);
+        vertex_colours.push(vertex_colour(&views, intrinsics, p, &normal, params));
+    }
 
+    report(
+        on_event,
+        Stage::Texture,
+        0.55,
+        "choosing the photo that sees each triangle best".to_string(),
+    )?;
     let (labels, neighbours) = choose_views(mesh, &views, intrinsics, params);
+
+    report(
+        on_event,
+        Stage::Texture,
+        0.7,
+        "grouping triangles into charts".to_string(),
+    )?;
     let charts = charts(mesh, &labels, &neighbours);
+
+    report(
+        on_event,
+        Stage::Texture,
+        0.8,
+        format!("packing {} charts into an atlas", charts.len()),
+    )?;
     let (texcoords, face_texcoords, atlas, atlas_scale) =
         pack(mesh, &views, intrinsics, &labels, &charts, params);
 
-    Texture {
+    Ok(Texture {
         vertex_colours,
         face_views: labels.iter().map(|&l| views[l].id).collect(),
         texcoords,
@@ -128,7 +176,7 @@ pub fn build(
         atlas,
         charts: charts.len(),
         atlas_scale,
-    }
+    })
 }
 
 struct View<'a> {

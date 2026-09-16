@@ -14,7 +14,7 @@ use pixelmap::{Photo, Quality, DEFAULT_SEED};
 
 use crate::ba;
 use crate::calib::{FocalSource, Intrinsics};
-use crate::depth::{self, DepthMap};
+use crate::depth::{self, DepthMap, DepthStats};
 use crate::error::Error;
 use crate::fusion::{self, Fused};
 use crate::input;
@@ -100,6 +100,8 @@ pub struct Reconstruction {
     pub adjustment: ba::Report,
     /// The depth maps.
     pub depth: Vec<DepthMap>,
+    /// Where each view's depth samples were lost.
+    pub depth_stats: Vec<DepthStats>,
     /// The fused surface.
     pub fused: Fused,
     /// The surface's colour.
@@ -190,7 +192,7 @@ pub fn reconstruct<L: PairLookup>(
             },
             Err(reason) => format!("{pair}: not usable, {reason}"),
         };
-        progress(
+        crate::progress::report(
             on_event,
             Stage::TwoView,
             (index + 1) as f32 / total as f32,
@@ -220,7 +222,7 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let registered = sfm::reconstruct(
+    let registered = sfm::reconstruct_with_progress(
         &relative,
         &tracks,
         intrinsics,
@@ -228,15 +230,11 @@ pub fn reconstruct<L: PairLookup>(
         precision,
         &params.sfm,
         &mut root.derive(u64::MAX),
+        on_event,
     )
     .map_err(|error| explain_no_usable_pair(error, &pair_reports))?;
     for warning in &registered.warnings {
-        progress(
-            on_event,
-            Stage::Registration,
-            1.0,
-            format!("warning: {warning}"),
-        )?;
+        report(on_event, Stage::Registration, format!("warning: {warning}"))?;
     }
     report(
         on_event,
@@ -255,7 +253,7 @@ pub fn reconstruct<L: PairLookup>(
         model: adjusted,
         intrinsics: refined,
         report: adjustment,
-    } = ba::adjust(
+    } = ba::adjust_with_progress(
         &registered,
         &tracks,
         intrinsics,
@@ -264,6 +262,7 @@ pub fn reconstruct<L: PairLookup>(
             refine_focal,
             ..params.ba.clone()
         },
+        on_event,
     )?;
     let mut summary = format!(
         "median reprojection error {:.2} px → {:.2} px",
@@ -277,7 +276,14 @@ pub fn reconstruct<L: PairLookup>(
     }
     report(on_event, Stage::BundleAdjustment, summary)?;
 
-    let maps = depth::estimate(graph, &adjusted.cameras, &refined, size, &params.depth);
+    let (maps, depth_stats) = depth::estimate_with_progress(
+        graph,
+        &adjusted.cameras,
+        &refined,
+        size,
+        &params.depth,
+        on_event,
+    )?;
     let valid = depth::require_coverage(&maps)?;
     report(
         on_event,
@@ -289,7 +295,13 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let fused = fusion::fuse(&maps, &adjusted.cameras, &refined, &params.fusion)?;
+    let fused = fusion::fuse_with_progress(
+        &maps,
+        &adjusted.cameras,
+        &refined,
+        &params.fusion,
+        on_event,
+    )?;
     report(
         on_event,
         Stage::Fusion,
@@ -301,14 +313,15 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let texture = texture::build(
+    let texture = texture::build_with_progress(
         &fused.mesh,
         &adjusted.cameras,
         &refined,
         photos,
         &maps,
         &params.texture,
-    );
+        on_event,
+    )?;
     report(
         on_event,
         Stage::Texture,
@@ -330,6 +343,7 @@ pub fn reconstruct<L: PairLookup>(
         adjusted,
         adjustment,
         depth: maps,
+        depth_stats,
         fused,
         texture,
     })
@@ -341,19 +355,7 @@ fn report(
     stage: Stage,
     message: String,
 ) -> Result<(), Error> {
-    progress(on_event, stage, 1.0, message)
-}
-
-fn progress(
-    on_event: &mut dyn FnMut(Event) -> Flow,
-    stage: Stage,
-    fraction: f32,
-    message: String,
-) -> Result<(), Error> {
-    if on_event(Event::new(stage, fraction, message)).is_break() {
-        return Err(Error::Cancelled { stage });
-    }
-    Ok(())
+    crate::progress::report(on_event, stage, 1.0, message)
 }
 
 /// Registration only sees the pairs two-view geometry could estimate. When none was

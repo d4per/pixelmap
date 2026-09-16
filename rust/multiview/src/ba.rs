@@ -32,6 +32,7 @@ use nalgebra::{
 use crate::calib::{FocalSource, Intrinsics};
 use crate::error::Error;
 use crate::pose::Pose;
+use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::sfm::{SparseModel, SparsePoint};
 use crate::tracks::Track;
 use crate::triangulate;
@@ -118,6 +119,21 @@ pub fn adjust(
     precision_px: f64,
     params: &Params,
 ) -> Result<Adjusted, Error> {
+    adjust_with_progress(model, tracks, intrinsics, precision_px, params, &mut silent)
+}
+
+/// [`adjust`], reporting each round through `on_event`.
+///
+/// # Errors
+/// As [`adjust`], plus [`Error::Cancelled`] if `on_event` asks the run to stop.
+pub fn adjust_with_progress(
+    model: &SparseModel,
+    tracks: &[Track],
+    intrinsics: &Intrinsics,
+    precision_px: f64,
+    params: &Params,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<Adjusted, Error> {
     let mut slot_of = vec![None; model.cameras.len()];
     let mut poses = Vec::new();
     for (view, camera) in model.cameras.iter().enumerate() {
@@ -200,6 +216,16 @@ pub fn adjust(
         let (ran, done) = problem.optimize(params.max_iterations, params.tolerance);
         iterations += ran;
         converged = done;
+        report(
+            on_event,
+            Stage::BundleAdjustment,
+            (round + 1) as f32 / rounds as f32,
+            format!(
+                "round {} of {rounds}: {ran} iterations, median error {:.2} px",
+                round + 1,
+                median(problem.errors())
+            ),
+        )?;
         if round + 1 == rounds {
             break;
         }
