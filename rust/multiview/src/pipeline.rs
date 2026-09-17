@@ -222,19 +222,29 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
+    let refine_focal = params.ba.refine_focal || intrinsics.source == FocalSource::Estimated;
     let registered = sfm::reconstruct_with_progress(
         &relative,
         &tracks,
         intrinsics,
         graph.views(),
         precision,
-        &params.sfm,
+        &sfm::Params {
+            adjust: ba::Params {
+                refine_focal,
+                ..params.sfm.adjust.clone()
+            },
+            ..params.sfm.clone()
+        },
         &mut root.derive(u64::MAX),
         on_event,
     )
     .map_err(|error| explain_no_usable_pair(error, &pair_reports))?;
+    // A view that was left out has already been reported, as it happened.
     for warning in &registered.warnings {
-        report(on_event, Stage::Registration, format!("warning: {warning}"))?;
+        if !matches!(warning, sfm::Warning::Unregistered { .. }) {
+            report(on_event, Stage::Registration, format!("warning: {warning}"))?;
+        }
     }
     report(
         on_event,
@@ -248,7 +258,6 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let refine_focal = params.ba.refine_focal || intrinsics.source == FocalSource::Estimated;
     let ba::Adjusted {
         model: adjusted,
         intrinsics: refined,
@@ -256,7 +265,7 @@ pub fn reconstruct<L: PairLookup>(
     } = ba::adjust_with_progress(
         &registered,
         &tracks,
-        intrinsics,
+        &registered.intrinsics,
         precision,
         &ba::Params {
             refine_focal,
@@ -295,13 +304,8 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let fused = fusion::fuse_with_progress(
-        &maps,
-        &adjusted.cameras,
-        &refined,
-        &params.fusion,
-        on_event,
-    )?;
+    let fused =
+        fusion::fuse_with_progress(&maps, &adjusted.cameras, &refined, &params.fusion, on_event)?;
     report(
         on_event,
         Stage::Fusion,

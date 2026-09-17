@@ -78,6 +78,56 @@ impl PairLookup for Nothing {
 }
 
 #[test]
+fn a_photo_that_cannot_be_placed_is_named_with_the_reason() {
+    let set = SyntheticSet::orbit(Scene::corner(), 3, 30.0, WIDTH, HEIGHT);
+    let graph = PairGraph::from_fn(set.views(), |pair| set.pair(pair));
+    // No view outside the seed pair can ever see this many points.
+    let params = pipeline::Params {
+        sfm: pixelmap_multiview::sfm::Params {
+            min_registration_points: usize::MAX,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut messages = Vec::new();
+    let error = pipeline::reconstruct(
+        &graph,
+        &photos(&set),
+        &set.intrinsics,
+        &params,
+        &mut |event| {
+            messages.push(event.message);
+            Flow::Continue(())
+        },
+    )
+    .expect_err("only the seed pair can be placed");
+
+    let message = error.to_string();
+    let Error::RegistrationFailed {
+        registered,
+        left_out,
+        ..
+    } = &error
+    else {
+        panic!("expected a registration failure, got {message}");
+    };
+    assert_eq!(registered.len(), 2, "{message}");
+    assert_eq!(left_out.len(), 1, "{message}");
+    let (view, reason) = &left_out[0];
+    assert!(!registered.contains(view), "{message}");
+    assert!(reason.contains("sees only"), "{message}");
+    assert!(
+        message.contains(&format!("{view} was left out: {reason}")),
+        "{message}"
+    );
+    // Reported as it happened too, so a caller showing progress sees it before the error.
+    assert!(
+        messages.iter().any(|m| m.contains("was left out")),
+        "{messages:?}"
+    );
+}
+
+#[test]
 fn photos_with_nothing_in_common_do_not_connect() {
     let set = SyntheticSet::orbit(Scene::corner(), 3, 20.0, WIDTH, HEIGHT);
     let graph = PairGraph::from_fn(3, |_| Nothing);

@@ -3,12 +3,13 @@
 //! once aligned for position and scale.
 
 use nalgebra::Point3;
+use pixelmap_multiview::calib::{FocalSource, Intrinsics};
 use pixelmap_multiview::rng::Rng;
 use pixelmap_multiview::sfm::{self, SparseModel};
 use pixelmap_multiview::synthetic::{Scene, SyntheticPair, SyntheticSet};
 use pixelmap_multiview::tracks::{self, Track};
 use pixelmap_multiview::twoview::{self, RelativePose};
-use pixelmap_multiview::{align, PairGraph};
+use pixelmap_multiview::{align, ba, PairGraph};
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -183,4 +184,52 @@ fn registers_every_view_despite_noise_and_outliers() {
     let tracks = tracks::build(&graph, SIZE, &tracks::Params::default());
     let model = reconstruct(&set, &graph, &tracks);
     assert_matches_truth(&set, &tracks, &model, 0.02);
+}
+
+#[test]
+fn a_wrong_estimated_focal_length_does_not_leave_views_out() {
+    let views = 10;
+    let set = SyntheticSet::orbit(Scene::corner(), views, 160.0, WIDTH, HEIGHT);
+    let graph = graph(&set, 0.7, 0.1);
+    let tracks = tracks::build(&graph, SIZE, &tracks::Params::default());
+    // 25% off, as a focal length estimated without EXIF can be. Registering against it
+    // skews the points, and views placed later disagree with them.
+    let intrinsics =
+        Intrinsics::from_focal(WIDTH as f64 * 1.25, WIDTH, HEIGHT, FocalSource::Estimated);
+    let register = |adjust: ba::Params| {
+        sfm::reconstruct(
+            &relatives(&set, &graph),
+            &tracks,
+            &intrinsics,
+            views,
+            graph.precision_px() as f64,
+            &sfm::Params {
+                adjust,
+                ..sfm::Params::default()
+            },
+            &mut Rng::new(3),
+        )
+        .expect("the synthetic views register")
+    };
+
+    let unadjusted = register(ba::Params {
+        max_iterations: 0,
+        ..sfm::Params::default().adjust
+    });
+    let adjusted = register(ba::Params {
+        refine_focal: true,
+        ..sfm::Params::default().adjust
+    });
+    assert!(
+        adjusted.registered().len() > unadjusted.registered().len(),
+        "{:?} placed with adjustment, {:?} without",
+        adjusted.registered(),
+        unadjusted.registered()
+    );
+    assert!(
+        (adjusted.intrinsics.fx - WIDTH as f64).abs() < 0.02 * WIDTH as f64,
+        "focal length refined to {}",
+        adjusted.intrinsics.fx
+    );
+    assert!(adjusted.registrations.iter().all(|r| r.inlier_ratio > 0.6));
 }

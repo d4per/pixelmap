@@ -303,6 +303,7 @@ pub fn adjust_with_progress(
             cameras,
             points: adjusted_points,
             seed: model.seed,
+            intrinsics: refined,
             registrations: model.registrations.clone(),
             warnings: model.warnings.clone(),
         },

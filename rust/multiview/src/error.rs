@@ -58,6 +58,8 @@ pub enum Error {
         registered: Vec<ViewId>,
         /// How many are needed.
         minimum: usize,
+        /// Each view that could not be placed, and why.
+        left_out: Vec<(ViewId, String)>,
     },
     /// Bundle adjustment did not reach an acceptable fit.
     BundleAdjustment {
@@ -167,11 +169,18 @@ impl fmt::Display for Error {
             Error::RegistrationFailed {
                 registered,
                 minimum,
-            } => write!(
-                f,
-                "only {} view(s) could be placed in a common frame (need {minimum})",
-                registered.len()
-            ),
+                left_out,
+            } => {
+                write!(
+                    f,
+                    "only {} view(s) could be placed in a common frame (need {minimum})",
+                    registered.len()
+                )?;
+                for (view, reason) in left_out {
+                    write!(f, "; {view} was left out: {reason}")?;
+                }
+                Ok(())
+            }
             Error::BundleAdjustment {
                 initial_median_px,
                 median_px,

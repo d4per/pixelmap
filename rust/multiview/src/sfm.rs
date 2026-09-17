@@ -17,6 +17,7 @@ use std::fmt;
 
 use nalgebra::Point3;
 
+use crate::ba;
 use crate::calib::Intrinsics;
 use crate::error::Error;
 use crate::input::MIN_VIEWS;
@@ -37,8 +38,15 @@ pub struct Params {
     pub max_reprojection: f64,
     /// The smallest largest-angle between a point's rays, in degrees.
     pub min_point_angle_deg: f64,
-    /// Below this PnP inlier ratio a view is left unregistered.
+    /// Below this PnP inlier ratio a view is left unregistered, unless it has
+    /// [`Params::enough_pnp_inliers`].
     pub min_pnp_inlier_ratio: f64,
+    /// A view with at least this many PnP inliers only needs
+    /// [`Params::min_pnp_inlier_ratio_when_enough`]. That many points agreeing on a pose is
+    /// no accident; the rest disagree because the points placed so far have drifted.
+    pub enough_pnp_inliers: usize,
+    /// The PnP inlier ratio a view with [`Params::enough_pnp_inliers`] needs.
+    pub min_pnp_inlier_ratio_when_enough: f64,
     /// A view needs this many triangulated points it observes to be registered.
     pub min_registration_points: usize,
     /// The most PnP RANSAC iterations per view.
@@ -48,6 +56,10 @@ pub struct Params {
     /// Below this, as a fraction of the distance between the two farthest cameras, the
     /// camera centres are reported as collinear.
     pub min_camera_spread: f64,
+    /// Bundle adjustment of the views placed so far, run while registering whenever their
+    /// number has grown by half and before views that could not be placed are retried.
+    /// Its focal length is refined only if this asks for it.
+    pub adjust: ba::Params,
 }
 
 impl Default for Params {
@@ -56,10 +68,19 @@ impl Default for Params {
             max_reprojection: 3.0,
             min_point_angle_deg: 1.5,
             min_pnp_inlier_ratio: 0.6,
+            enough_pnp_inliers: 150,
+            min_pnp_inlier_ratio_when_enough: 0.35,
             min_registration_points: 30,
             max_iterations: 1000,
             confidence: 0.999,
             min_camera_spread: 0.02,
+            adjust: ba::Params {
+                max_iterations: 15,
+                rounds: 1,
+                // The final adjustment judges the fit; this one only has to improve it.
+                max_median_error: f64::INFINITY,
+                ..ba::Params::default()
+            },
         }
     }
 }
@@ -134,6 +155,9 @@ pub struct SparseModel {
     pub points: Vec<SparsePoint>,
     /// The pair that defines the frame.
     pub seed: PairId,
+    /// The intrinsics the cameras were placed with, with the focal length refined if
+    /// adjusting during registration refined it.
+    pub intrinsics: Intrinsics,
     /// How each view other than the seed pair was registered, in the order they were.
     pub registrations: Vec<Registration>,
     /// Anything that went less than well.
@@ -197,8 +221,8 @@ pub fn reconstruct_with_progress(
     rng: &mut Rng,
     on_event: &mut dyn FnMut(Event) -> Flow,
 ) -> Result<SparseModel, Error> {
-    let focal = (intrinsics.fx + intrinsics.fy) / 2.0;
-    let threshold = params.max_reprojection * precision_px / focal;
+    let mut intrinsics = *intrinsics;
+    let mut threshold = params.max_reprojection * precision_px / mean_focal(&intrinsics);
     let min_angle = params.min_point_angle_deg.to_radians();
 
     let seed = relative
@@ -225,90 +249,124 @@ pub fn reconstruct_with_progress(
         format!("{} defines the frame; 2 of {views} views placed", seed.pair),
     )?;
 
-    let normalized: Vec<Vec<(ViewId, Norm)>> = tracks
-        .iter()
-        .map(|t| {
-            t.observations
-                .iter()
-                .map(|&(v, p)| (v, intrinsics.normalize(p)))
-                .collect()
-        })
-        .collect();
+    let mut normalized = normalize(tracks, &intrinsics);
     let mut points: Vec<Option<World>> = vec![None; tracks.len()];
     triangulate_missing(&normalized, &cameras, &mut points, threshold, min_angle);
 
     let mut registrations = Vec::new();
     let mut warnings = Vec::new();
-    let mut given_up = vec![false; views];
+    // Every registration and every adjustment changes the model. A view that could not be
+    // placed is tried again once it has, but never twice against the same model, so the
+    // loop ends: both kinds of change are bounded by the number of views.
+    let mut version = 0usize;
+    let mut tried_at: Vec<Option<usize>> = vec![None; views];
+    let mut reasons: Vec<Option<String>> = vec![None; views];
+    let mut adjusted_at = version;
+    let mut placed_at_adjustment = 2usize;
     loop {
-        // The unregistered view that sees the most points triangulated so far.
+        // The view not yet tried against this model that sees the most points.
         let candidate = (0..views)
-            .filter(|&v| cameras[v].is_none() && !given_up[v])
-            .map(|v| {
-                let view = ViewId(v as u32);
-                let count = normalized
-                    .iter()
-                    .zip(&points)
-                    .filter(|(obs, point)| point.is_some() && obs.iter().any(|(o, _)| *o == view))
-                    .count();
-                (v, count)
-            })
+            .filter(|&v| cameras[v].is_none() && tried_at[v] != Some(version))
+            .map(|v| (v, observed(&normalized, &points, ViewId(v as u32))))
             .max_by_key(|&(v, count)| (count, std::cmp::Reverse(v)));
         let Some((v, count)) = candidate else {
+            // Every view left is stuck. Adjusting what is placed may remove the drift that
+            // kept them out; if it changes the model, try them all again.
+            let stuck = cameras.iter().any(Option::is_none);
+            if stuck
+                && adjusted_at != version
+                && adjust_placed(
+                    tracks,
+                    seed.pair,
+                    precision_px,
+                    params,
+                    &mut cameras,
+                    &mut points,
+                    &mut intrinsics,
+                    on_event,
+                )?
+            {
+                normalized = normalize(tracks, &intrinsics);
+                threshold = params.max_reprojection * precision_px / mean_focal(&intrinsics);
+                triangulate_missing(&normalized, &cameras, &mut points, threshold, min_angle);
+                version += 1;
+                adjusted_at = version;
+                continue;
+            }
             break;
         };
         let view = ViewId(v as u32);
-        given_up[v] = true;
+        tried_at[v] = Some(version);
+        let placed = cameras.iter().flatten().count();
 
-        if count < params.min_registration_points {
-            warnings.push(Warning::Unregistered {
-                view,
-                reason: format!(
-                    "it sees only {count} of the points placed so far (needs {})",
-                    params.min_registration_points
-                ),
-            });
-            continue;
-        }
-
-        let (world, image): (Vec<Point3<f64>>, Vec<Norm>) = normalized
-            .iter()
-            .zip(&points)
-            .filter_map(|(obs, point)| {
-                let point = (*point)?;
-                let &(_, n) = obs.iter().find(|(o, _)| *o == view)?;
-                Some((point.0, n))
-            })
-            .unzip();
-        let Some(solution) = pnp::ransac(
-            &world,
-            &image,
-            threshold,
-            params.max_iterations,
-            params.confidence,
-            rng,
-        ) else {
-            warnings.push(Warning::Unregistered {
-                view,
-                reason: "no camera position fits the points it sees".to_string(),
-            });
-            continue;
+        let attempt = if count < params.min_registration_points {
+            Err(format!(
+                "it sees only {count} of the points placed so far (needs {})",
+                params.min_registration_points
+            ))
+        } else {
+            let (world, image): (Vec<Point3<f64>>, Vec<Norm>) = normalized
+                .iter()
+                .zip(&points)
+                .filter_map(|(obs, point)| {
+                    let point = (*point)?;
+                    let &(_, n) = obs.iter().find(|(o, _)| *o == view)?;
+                    Some((point.0, n))
+                })
+                .unzip();
+            match pnp::ransac(
+                &world,
+                &image,
+                threshold,
+                params.max_iterations,
+                params.confidence,
+                rng,
+            ) {
+                None => Err("no camera position fits the points it sees".to_string()),
+                Some(solution) => {
+                    let inliers = solution.inliers.len();
+                    let ratio = inliers as f64 / count as f64;
+                    let needed = if inliers >= params.enough_pnp_inliers {
+                        params.min_pnp_inlier_ratio_when_enough
+                    } else {
+                        params.min_pnp_inlier_ratio
+                    };
+                    if ratio >= needed {
+                        Ok((solution, ratio))
+                    } else if inliers >= params.enough_pnp_inliers {
+                        Err(format!(
+                            "only {:.0}% of the {count} points it sees agree on where it was (needs {:.0}%)",
+                            ratio * 100.0,
+                            needed * 100.0
+                        ))
+                    } else {
+                        Err(format!(
+                            "only {inliers} ({:.0}%) of the {count} points it sees agree on where it was (needs {:.0}%, or {} points and {:.0}%)",
+                            ratio * 100.0,
+                            needed * 100.0,
+                            params.enough_pnp_inliers,
+                            params.min_pnp_inlier_ratio_when_enough * 100.0
+                        ))
+                    }
+                }
+            }
+        };
+        let (solution, inlier_ratio) = match attempt {
+            Ok(found) => found,
+            Err(reason) => {
+                report(
+                    on_event,
+                    Stage::Registration,
+                    placed as f32 / views as f32,
+                    format!("{view} not placed yet: {reason}"),
+                )?;
+                reasons[v] = Some(reason);
+                continue;
+            }
         };
 
-        let inlier_ratio = solution.inliers.len() as f64 / count as f64;
-        if inlier_ratio < params.min_pnp_inlier_ratio {
-            warnings.push(Warning::Unregistered {
-                view,
-                reason: format!(
-                    "only {:.0}% of the {count} points it sees agree on where it was (needs {:.0}%)",
-                    inlier_ratio * 100.0,
-                    params.min_pnp_inlier_ratio * 100.0
-                ),
-            });
-            continue;
-        }
-
         cameras[v] = Some(solution.pose);
+        reasons[v] = None;
         registrations.push(Registration {
             view,
             candidates: count,
@@ -325,7 +383,48 @@ pub fn reconstruct_with_progress(
                 solution.inliers.len()
             ),
         )?;
+        version += 1;
         triangulate_missing(&normalized, &cameras, &mut points, threshold, min_angle);
+
+        // Adjust whenever the number of placed views has grown by half, so the drift a
+        // registration inherits stays small without adjusting after every view.
+        if 2 * placed >= 3 * placed_at_adjustment {
+            placed_at_adjustment = placed;
+            adjusted_at = version;
+            if adjust_placed(
+                tracks,
+                seed.pair,
+                precision_px,
+                params,
+                &mut cameras,
+                &mut points,
+                &mut intrinsics,
+                on_event,
+            )? {
+                normalized = normalize(tracks, &intrinsics);
+                threshold = params.max_reprojection * precision_px / mean_focal(&intrinsics);
+                triangulate_missing(&normalized, &cameras, &mut points, threshold, min_angle);
+                version += 1;
+                adjusted_at = version;
+            }
+        }
+    }
+
+    for (v, reason) in reasons.into_iter().enumerate() {
+        let (None, Some(reason)) = (cameras[v], reason) else {
+            continue;
+        };
+        let warning = Warning::Unregistered {
+            view: ViewId(v as u32),
+            reason,
+        };
+        report(
+            on_event,
+            Stage::Registration,
+            cameras.iter().flatten().count() as f32 / views as f32,
+            warning.to_string(),
+        )?;
+        warnings.push(warning);
     }
 
     let registered: Vec<ViewId> = (0..views)
@@ -336,8 +435,17 @@ pub fn reconstruct_with_progress(
         return Err(Error::RegistrationFailed {
             registered,
             minimum: MIN_VIEWS,
+            left_out: warnings
+                .into_iter()
+                .filter_map(|warning| match warning {
+                    Warning::Unregistered { view, reason } => Some((view, reason)),
+                    Warning::CollinearCameras { .. } => None,
+                })
+                .collect(),
         });
     }
+
+    let focal = mean_focal(&intrinsics);
 
     let points = normalized
         .iter()
@@ -365,9 +473,105 @@ pub fn reconstruct_with_progress(
         cameras,
         points,
         seed: seed.pair,
+        intrinsics,
         registrations,
         warnings,
     })
+}
+
+fn mean_focal(intrinsics: &Intrinsics) -> f64 {
+    (intrinsics.fx + intrinsics.fy) / 2.0
+}
+
+/// Every track's observations in normalized camera coordinates.
+fn normalize(tracks: &[Track], intrinsics: &Intrinsics) -> Vec<Vec<(ViewId, Norm)>> {
+    tracks
+        .iter()
+        .map(|t| {
+            t.observations
+                .iter()
+                .map(|&(v, p)| (v, intrinsics.normalize(p)))
+                .collect()
+        })
+        .collect()
+}
+
+/// How many of the points triangulated so far `view` observes.
+fn observed(normalized: &[Vec<(ViewId, Norm)>], points: &[Option<World>], view: ViewId) -> usize {
+    normalized
+        .iter()
+        .zip(points)
+        .filter(|(obs, point)| point.is_some() && obs.iter().any(|(o, _)| *o == view))
+        .count()
+}
+
+/// Bundle adjustment of the views placed so far, written back into `cameras`, `points`
+/// and `intrinsics`. Points it drops are cleared, for the caller to triangulate again.
+/// `false`, with nothing changed, if the adjustment did not improve the fit.
+#[allow(clippy::too_many_arguments)]
+fn adjust_placed(
+    tracks: &[Track],
+    seed: PairId,
+    precision_px: f64,
+    params: &Params,
+    cameras: &mut [Option<Pose>],
+    points: &mut [Option<World>],
+    intrinsics: &mut Intrinsics,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<bool, Error> {
+    let model = SparseModel {
+        cameras: cameras.to_vec(),
+        points: points
+            .iter()
+            .enumerate()
+            .filter_map(|(track, point)| {
+                Some(SparsePoint {
+                    position: (*point)?,
+                    track,
+                    observations: 0,
+                    error_px: 0.0,
+                    angle_deg: 0.0,
+                })
+            })
+            .collect(),
+        seed,
+        intrinsics: *intrinsics,
+        registrations: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let Ok(adjusted) = ba::adjust(&model, tracks, intrinsics, precision_px, &params.adjust) else {
+        return Ok(false);
+    };
+    let placed = cameras.iter().flatten().count();
+    let mut message = format!(
+        "adjusted the {placed} views placed so far: median reprojection error {:.2} px → {:.2} px",
+        adjusted.report.initial_median_px, adjusted.report.final_median_px
+    );
+    if params.adjust.refine_focal {
+        message += &format!(
+            "; focal length {:.1} px → {:.1} px",
+            intrinsics.fx, adjusted.intrinsics.fx
+        );
+    }
+    report(
+        on_event,
+        Stage::Registration,
+        placed as f32 / cameras.len() as f32,
+        message,
+    )?;
+
+    cameras.copy_from_slice(&adjusted.model.cameras);
+    points.fill(None);
+    for point in &adjusted.model.points {
+        points[point.track] = Some(point.position);
+    }
+    // The focal length's source stays as it was: the final adjustment decides from it
+    // whether to refine the focal length further.
+    *intrinsics = Intrinsics {
+        source: intrinsics.source,
+        ..adjusted.intrinsics
+    };
+    Ok(true)
 }
 
 /// Prefer pairs that both overlap well and see the scene from well-separated positions.
