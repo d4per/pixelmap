@@ -206,7 +206,7 @@ fn cancel_after(photos: Vec<Arc<Photo>>, options: Options, seconds: f64) -> Resu
 /// Prints an event. The many steps of mapping share one line that rewrites itself; every
 /// other event gets a line of its own.
 fn print_event(event: &Event, mapping_line: &mut bool) {
-    if let Event::PairStarted { .. } = event {
+    if let Event::PairProgress { .. } = event {
         let percent = event.progress().unwrap_or(0.0) * 100.0;
         eprint!("\r{percent:5.1}%  {:<72}", event.message());
         *mapping_line = true;
@@ -243,7 +243,10 @@ fn print_depth_stats(model: &Model) {
         )
     };
     println!("dense depth per photo:");
-    for stats in &model.diagnostics().depth_stats {
+    let Some(d) = model.diagnostics() else {
+        return;
+    };
+    for stats in &d.depth_stats {
         let total = stats.unmapped + stats.single.samples + stats.multiple.samples;
         println!(
             "  {}: {:.0}% matched to no other photo",
@@ -269,19 +272,19 @@ fn print_depth_stats(model: &Model) {
 
 /// Compares every stage of a reconstruction of a synthetic scene with the ground truth.
 fn report_truth(truth: &SyntheticSet, model: &Model) {
-    let d = model.diagnostics();
+    let Some(d) = model.diagnostics() else {
+        return;
+    };
     println!();
     println!("against the ground truth:");
     for report in &model.pairs {
-        if let Ok(estimate) = &report.estimate {
+        if let Some(pose) = &report.pose {
             let expected = truth.relative_pose(report.pair);
             println!(
                 "  {}: rotation off by {:.2}°, translation direction off by {:.2}°",
                 report.pair,
-                angle_between(&estimate.pose.rotation, &expected.rotation),
-                estimate
-                    .pose
-                    .translation
+                angle_between(&pose.rotation, &expected.rotation),
+                pose.translation
                     .angle(&expected.translation)
                     .to_degrees()
             );
@@ -423,7 +426,9 @@ fn percentile(values: &mut [f64], q: f64) -> f64 {
 /// Writes the sparse model, depth maps and textured mesh into `dir`.
 fn write_outputs(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    let d = model.diagnostics();
+    let d = model
+        .diagnostics()
+        .ok_or("the model's diagnostics were dropped")?;
 
     let points: Vec<(World, [u8; 3])> = d
         .adjusted

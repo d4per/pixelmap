@@ -77,6 +77,7 @@ impl Default for Params {
 
 /// What bundle adjustment did.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Report {
     /// Levenberg–Marquardt iterations run, over all rounds.
     pub iterations: usize,

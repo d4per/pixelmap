@@ -1,8 +1,20 @@
 [package]
 name = "pixelmap_multiview"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2021"
-publish = false
+rust-version = "1.80"
+description = "3D reconstruction from three or more photos: dense pixelmap correspondence, camera registration, bundle adjustment, depth fusion and texturing"
+repository = "https://github.com/d4per/pixelmap"
+homepage = "https://pixelmap.dogduck.com"
+documentation = "https://docs.rs/pixelmap_multiview"
+readme = "README.md"
+license = "MIT"
+keywords = ["computer-vision", "3d-reconstruction", "photogrammetry", "structure-from-motion", "mesh"]
+categories = ["computer-vision", "graphics", "multimedia::images"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Default features off so that the `parallel` passthrough below is the only way rayon gets

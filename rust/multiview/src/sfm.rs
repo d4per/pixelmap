@@ -87,6 +87,7 @@ impl Default for Params {
 
 /// A triangulated track.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SparsePoint {
     /// Where it is.
     pub position: World,
@@ -102,6 +103,7 @@ pub struct SparsePoint {
 
 /// How a view was added by PnP.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Registration {
     /// The view.
     pub view: ViewId,
@@ -115,6 +117,7 @@ pub struct Registration {
 
 /// Something worth telling the user that did not stop the reconstruction.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Warning {
     /// A view could not be placed and was left out.
     Unregistered {
@@ -148,6 +151,7 @@ impl fmt::Display for Warning {
 
 /// Cameras in one frame, and the points triangulated from them.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SparseModel {
     /// Each view's pose, or `None` for a view that could not be registered.
     pub cameras: Vec<Option<Pose>>,
@@ -233,7 +237,7 @@ pub fn reconstruct_with_progress(
             reasons: relative
                 .iter()
                 .filter_map(|r| match &r.verdict {
-                    Verdict::Degenerate(reason) => Some((r.pair, reason.to_string())),
+                    Verdict::Degenerate(reason) => Some((r.pair, reason.clone())),
                     Verdict::Usable => None,
                 })
                 .collect(),

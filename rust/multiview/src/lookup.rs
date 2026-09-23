@@ -8,6 +8,48 @@
 use crate::types::PhotoPx;
 
 /// A dense mapping between the two photos of a pair, in [`PhotoPx`] coordinates.
+///
+/// This is how [`reconstruct`](crate::reconstruct) takes correspondences that did not come
+/// from pixelmap. pixelmap's [`Correspondence`](pixelmap::Correspondence) implements it,
+/// and that is what [`run`](crate::run) uses.
+///
+/// # The contract
+///
+/// - Every point is in the pixels of the photos handed to the pipeline, x to the right and
+///   y down, as [`PhotoPx`] describes.
+/// - `a_to_b` and `b_to_a` describe one mapping read in two directions, and should agree:
+///   a point taken across and back should land near where it started. Where they do not,
+///   return `None` rather than a guess. Every stage treats `None` as "no information",
+///   and a wrong match does more harm than a missing one.
+/// - [`Self::precision_px`] scales every inlier threshold, so it should be honest. Too
+///   small rejects good geometry; too large lets bad geometry through.
+///
+/// ```
+/// use pixelmap_multiview::{PairLookup, PhotoPx};
+///
+/// /// The second photo is the first shifted 12 px to the left.
+/// struct Shift;
+///
+/// impl PairLookup for Shift {
+///     fn a_to_b(&self, p: PhotoPx) -> Option<PhotoPx> {
+///         Some(PhotoPx::new(p.x() - 12.0, p.y()))
+///     }
+///     fn b_to_a(&self, p: PhotoPx) -> Option<PhotoPx> {
+///         Some(PhotoPx::new(p.x() + 12.0, p.y()))
+///     }
+///     fn coverage(&self) -> f32 {
+///         1.0
+///     }
+///     fn native_stride(&self) -> f32 {
+///         4.0
+///     }
+///     fn precision_px(&self) -> f32 {
+///         0.5
+///     }
+/// }
+/// ```
+// A method added here must have a default body, or every implementation outside this
+// crate stops compiling.
 pub trait PairLookup {
     /// Where the pixel `p` of the pair's first photo ended up in the second, or `None`
     /// if it is not mapped.

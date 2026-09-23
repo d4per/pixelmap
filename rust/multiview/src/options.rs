@@ -64,8 +64,9 @@ impl Focal {
 ///
 /// The fields are readable so that a caller can show what a run was given; they are set
 /// through the methods so that adding a setting later does not break anyone.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
+#[must_use]
 pub struct Options {
     /// How much work pixelmap puts into each pair. The dominant cost of a run: a pair
     /// takes about 0.6 s at [`Quality::Low`] and about 2.3 s at [`Quality::Medium`], and
@@ -115,9 +116,10 @@ impl Options {
         self
     }
 
-    /// Pins the seed every random choice derives from.
-    pub fn seed(mut self, seed: u64) -> Self {
-        self.seed = Some(seed);
+    /// Pins the seed every random choice derives from. `None` goes back to
+    /// [`DEFAULT_SEED`].
+    pub fn seed(mut self, seed: impl Into<Option<u64>>) -> Self {
+        self.seed = seed.into();
         self
     }
 
@@ -164,5 +166,6 @@ mod tests {
         assert_eq!(options.max_texture_size, DEFAULT_MAX_TEXTURE_SIZE);
         assert_eq!(Options::new().seed(7).resolved_seed(), 7);
         assert_eq!(Options::new().resolved_seed(), DEFAULT_SEED);
+        assert_eq!(Options::new().seed(7).seed(None), Options::new());
     }
 }

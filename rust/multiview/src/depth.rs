@@ -81,6 +81,7 @@ impl Default for Params {
 
 /// Depths on a regular grid over one view's photo.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct DepthMap {
     /// The view.
     pub view: ViewId,
@@ -160,6 +161,7 @@ impl DepthMap {
 /// Where one view's depth samples went, split by whether a sample mapped into one other
 /// view or into several.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct DepthStats {
     /// The view.
     pub view: ViewId,
@@ -177,6 +179,7 @@ pub struct DepthStats {
 
 /// What became of one depth sample.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Fate {
     /// No other view's mapping reached it.
     Unmapped,
@@ -194,6 +197,7 @@ pub enum Fate {
 
 /// What became of a group of depth samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Counts {
     /// How many samples.
     pub samples: usize,

@@ -4,10 +4,10 @@
 //! exist, which is how the synthetic tests feed it exact correspondences. Both report every
 //! stage through the event callback and stop when it returns `Break`.
 //!
-//! [`Model`] carries what a caller came for — the mesh, its texture, and which photos made
-//! it. Everything else computed along the way is behind [`Model::diagnostics`]: a
-//! reconstruction that went wrong is diagnosed from its intermediates, but most callers
-//! never look.
+//! [`Model`] carries what a caller came for — the mesh, its texture, the cameras, and which
+//! photos made it. Everything else computed along the way is behind [`Model::diagnostics`]:
+//! a reconstruction that went wrong is diagnosed from its intermediates, but most callers
+//! never look, and [`Model::take_diagnostics`] lets them free it.
 
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use crate::lookup::PairLookup;
 use crate::mesh::Mesh;
 use crate::options::Options;
 use crate::pairs::{self, PairGraph, MIN_PAIR_COVERAGE};
+use crate::pose::Pose;
 use crate::rng::Rng;
 use crate::sfm::{self, SparseModel};
 use crate::texture::{self, Texture};
@@ -80,33 +81,69 @@ impl Params {
 
 /// What two-view geometry made of one pair.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PairReport {
     /// The pair.
     pub pair: PairId,
     /// The fraction of the first photo its mapping covers.
     pub coverage: f32,
-    /// The estimate, or why there is none.
-    pub estimate: Result<RelativePose, Degeneracy>,
+    /// The second camera in the first camera's frame, scaled so that the distance between
+    /// them is 1. `None` when the pair was rejected: a degenerate estimate is not a pose
+    /// worth showing.
+    pub pose: Option<Pose>,
+    /// The share of sampled matches that agree on one camera motion. `None` when too few
+    /// matches were found to estimate one.
+    pub inlier_ratio: Option<f64>,
+    /// The median angle between the two cameras' rays through the agreeing matches, in
+    /// degrees. `None` when no camera motion could be estimated.
+    pub median_angle_deg: Option<f64>,
+    /// Why this pair could not anchor a registration, or `None` if it could.
+    ///
+    /// A pair is unusable either because no geometry could be estimated at all, or because
+    /// the geometry that was estimated is degenerate; this does not distinguish the two.
+    pub rejection: Option<Degeneracy>,
 }
 
 impl PairReport {
-    /// Why this pair could not anchor a registration, if it could not.
-    ///
-    /// A pair is unusable either because no geometry could be estimated at all, or because
-    /// the geometry that was estimated is degenerate. Callers showing a pair's standing
-    /// rarely care which, and this collapses the two.
-    pub fn rejection(&self) -> Option<&Degeneracy> {
-        match &self.estimate {
-            Ok(estimate) => match &estimate.verdict {
-                Verdict::Usable => None,
-                Verdict::Degenerate(reason) => Some(reason),
+    fn new(
+        pair: PairId,
+        coverage: f32,
+        estimate: &Result<RelativePose, Degeneracy>,
+    ) -> PairReport {
+        let (pose, inlier_ratio, median_angle_deg, rejection) = match estimate {
+            Ok(e) => match &e.verdict {
+                Verdict::Usable => (
+                    Some(e.pose),
+                    Some(e.inlier_ratio),
+                    Some(e.median_angle_deg),
+                    None,
+                ),
+                Verdict::Degenerate(reason) => (
+                    None,
+                    Some(e.inlier_ratio),
+                    Some(e.median_angle_deg),
+                    Some(reason.clone()),
+                ),
             },
-            Err(reason) => Some(reason),
+            Err(reason) => (None, None, None, Some(reason.clone())),
+        };
+        PairReport {
+            pair,
+            coverage,
+            pose,
+            inlier_ratio,
+            median_angle_deg,
+            rejection,
         }
     }
 }
 
 /// A finished reconstruction.
+///
+/// Everything spatial is in one frame, which the seed pair defines: its first camera sits
+/// at the origin looking along +z with +y down the image, and the distance between the
+/// seed pair's two cameras is the unit of length. Nothing is metric. The exporters in
+/// [`crate::export`] turn the result half a revolution about x so viewers show it upright.
 #[derive(Clone, Debug)]
 pub struct Model {
     /// The surface, with normals.
@@ -115,6 +152,9 @@ pub struct Model {
     pub texture: Texture,
     /// The camera the later stages used, with the focal length refined if it was.
     pub intrinsics: Intrinsics,
+    /// Where each photo was taken from, indexed by [`ViewId`]. `None` for a photo that was
+    /// left out.
+    pub cameras: Vec<Option<Pose>>,
     /// How many photos went in.
     pub views: usize,
     /// The photos that made it into the model. Shorter than [`Self::views`] when one was
@@ -122,21 +162,32 @@ pub struct Model {
     pub connected: Vec<ViewId>,
     /// Every pair's two-view geometry, including the pairs that were not usable.
     pub pairs: Vec<PairReport>,
-    diagnostics: Box<Diagnostics>,
+    diagnostics: Option<Box<Diagnostics>>,
 }
 
 impl Model {
-    /// Everything computed on the way to the model.
+    /// Everything computed on the way to the model, or `None` once
+    /// [`Self::take_diagnostics`] has taken it.
     ///
     /// For working out why a reconstruction came out the way it did. Not needed to use the
-    /// result, and boxed so that a caller who never asks does not carry it around.
-    pub fn diagnostics(&self) -> &Diagnostics {
-        &self.diagnostics
+    /// result.
+    pub fn diagnostics(&self) -> Option<&Diagnostics> {
+        self.diagnostics.as_deref()
+    }
+
+    /// Takes the diagnostics out of the model.
+    ///
+    /// They hold every depth map, the fate of every depth sample, and every track, which is
+    /// usually more memory than the mesh itself. A caller that keeps the model around and
+    /// never looks at them can drop them with this.
+    pub fn take_diagnostics(&mut self) -> Option<Diagnostics> {
+        self.diagnostics.take().map(|d| *d)
     }
 }
 
 /// The intermediates a reconstruction passed through.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Diagnostics {
     /// The photos' dimensions.
     pub size: (usize, usize),
@@ -200,27 +251,42 @@ pub fn run(
     )?;
 
     let graph = pairs::compute(photos, options.quality, options.resolved_seed(), on_event)?;
-    reconstruct(&graph, photos, &intrinsics, options, on_event)
+    reconstruct_with_params(
+        &graph,
+        photos,
+        &intrinsics,
+        &Params::from_options(options),
+        on_event,
+    )
 }
 
 /// Reconstructs a textured mesh from mappings already computed between `photos`.
 ///
-/// # Errors
-/// Any [`Error`] from the stages after pairwise correspondence.
+/// For a caller that brings its own correspondences: build a [`PairGraph`] with
+/// [`PairGraph::from_fn`] over anything that implements [`PairLookup`]. [`run`] is this
+/// with pixelmap's correspondences, and apart from computing those it does the same.
 ///
-/// # Panics
-/// If `graph` does not span exactly the views in `photos`.
+/// The camera comes from `options.focal` as it does for [`run`]; `options.quality` is
+/// not used, since there is no matching left to do.
+///
+/// # Errors
+/// [`Error::GraphMismatch`] if `graph` does not span exactly one view per photo, and any
+/// [`Error`] from the stages after pairwise correspondence.
 pub fn reconstruct<L: PairLookup>(
     graph: &PairGraph<L>,
     photos: &[Arc<Photo>],
-    intrinsics: &Intrinsics,
     options: &Options,
     on_event: &mut dyn FnMut(Event) -> Flow,
 ) -> Result<Model, Error> {
+    let first = photos.first().ok_or(Error::TooFewPhotos {
+        found: 0,
+        minimum: MIN_VIEWS,
+    })?;
+    let intrinsics = options.focal.intrinsics(first.width(), first.height());
     reconstruct_with_params(
         graph,
         photos,
-        intrinsics,
+        &intrinsics,
         &Params::from_options(options),
         on_event,
     )
@@ -233,9 +299,6 @@ pub fn reconstruct<L: PairLookup>(
 ///
 /// # Errors
 /// As [`reconstruct`].
-///
-/// # Panics
-/// If `graph` does not span exactly the views in `photos`.
 #[doc(hidden)]
 pub fn reconstruct_with_params<L: PairLookup>(
     graph: &PairGraph<L>,
@@ -244,11 +307,12 @@ pub fn reconstruct_with_params<L: PairLookup>(
     params: &Params,
     on_event: &mut dyn FnMut(Event) -> Flow,
 ) -> Result<Model, Error> {
-    assert_eq!(
-        graph.views(),
-        photos.len(),
-        "one mapping graph view per photo"
-    );
+    if graph.views() != photos.len() {
+        return Err(Error::GraphMismatch {
+            views: graph.views(),
+            photos: photos.len(),
+        });
+    }
     let size = input::validate(photos, intrinsics)?;
     let precision = graph.precision_px() as f64;
 
@@ -272,6 +336,7 @@ pub fn reconstruct_with_params<L: PairLookup>(
     let root = Rng::new(params.seed);
     let total = PairId::count(graph.views());
     let mut pair_reports = Vec::with_capacity(total);
+    let mut estimates = Vec::with_capacity(total);
     for (index, (pair, lookup)) in graph.pairs().enumerate() {
         let estimate = twoview::estimate(
             pair,
@@ -281,12 +346,8 @@ pub fn reconstruct_with_params<L: PairLookup>(
             &params.twoview,
             &mut root.derive(index as u64),
         );
-        let outcome = PairReport {
-            pair,
-            coverage: lookup.coverage(),
-            estimate,
-        };
-        match outcome.rejection() {
+        let outcome = PairReport::new(pair, lookup.coverage(), &estimate);
+        match &outcome.rejection {
             Some(reason) => emit(
                 on_event,
                 Event::PairRejected {
@@ -297,8 +358,7 @@ pub fn reconstruct_with_params<L: PairLookup>(
                 },
             )?,
             None => {
-                let estimate = outcome
-                    .estimate
+                let estimate = estimate
                     .as_ref()
                     .expect("a pair with nothing against it has an estimate");
                 report(
@@ -315,12 +375,12 @@ pub fn reconstruct_with_params<L: PairLookup>(
             }
         }
         pair_reports.push(outcome);
+        estimates.push(estimate);
     }
-    let relative: Vec<RelativePose> = pair_reports
-        .iter()
-        .filter_map(|r| r.estimate.as_ref().ok())
+    let relative: Vec<RelativePose> = estimates
+        .into_iter()
+        .filter_map(Result::ok)
         .filter(|r| connected.contains(&r.pair.a()) && connected.contains(&r.pair.b()))
-        .cloned()
         .collect();
 
     let tracks = tracks::build(graph, size, &params.tracks);
@@ -472,10 +532,11 @@ pub fn reconstruct_with_params<L: PairLookup>(
         mesh,
         texture,
         intrinsics: refined,
+        cameras: adjusted.cameras.clone(),
         views: graph.views(),
         connected,
         pairs: pair_reports,
-        diagnostics: Box::new(Diagnostics {
+        diagnostics: Some(Box::new(Diagnostics {
             size,
             tracks,
             registered,
@@ -487,7 +548,7 @@ pub fn reconstruct_with_params<L: PairLookup>(
             blocks,
             largest_component,
             dropped_triangles,
-        }),
+        })),
     })
 }
 
@@ -498,7 +559,7 @@ fn explain_no_usable_pair(error: Error, reports: &[PairReport]) -> Error {
         Error::NoUsablePair { .. } => Error::NoUsablePair {
             reasons: reports
                 .iter()
-                .filter_map(|r| Some((r.pair, r.rejection()?.to_string())))
+                .filter_map(|r| Some((r.pair, r.rejection.clone()?)))
                 .collect(),
         },
         other => other,

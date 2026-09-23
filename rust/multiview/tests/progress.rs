@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use pixelmap::Photo;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::{pipeline, Event, Flow, Options, PairGraph, Stage, ViewId};
+use pixelmap_multiview::{pipeline, Event, Flow, Focal, Options, PairGraph, Stage, ViewId};
 
 fn photos(set: &SyntheticSet) -> Vec<Arc<Photo>> {
     (0..set.views())
@@ -25,8 +25,7 @@ fn events_of_a_run() -> Vec<Event> {
     pipeline::reconstruct(
         &graph,
         &photos(&set),
-        &set.intrinsics,
-        &Options::new(),
+        &Options::new().focal(Focal::Pixels(set.intrinsics.fx)),
         &mut |event| {
             events.push(event);
             Flow::Continue(())
@@ -92,7 +91,7 @@ fn no_pair_is_mapped_when_the_mappings_were_given() {
     // reporting no pair at all, rather than by reporting pairs with nothing in them.
     assert!(!events_of_a_run()
         .iter()
-        .any(|event| matches!(event, Event::PairStarted { .. } | Event::PairMapped { .. })));
+        .any(|event| matches!(event, Event::PairProgress { .. } | Event::PairMapped { .. })));
 }
 
 #[test]

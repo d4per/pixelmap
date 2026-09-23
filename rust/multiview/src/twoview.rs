@@ -120,6 +120,7 @@ impl RelativePose {
 
 /// The outcome of triage.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Verdict {
     /// Fit to seed or anchor a registration.
     Usable,
@@ -130,6 +131,7 @@ pub enum Verdict {
 
 /// Why a pair cannot anchor a registration.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Degeneracy {
     /// Too few correspondences were mapped to estimate anything.
     TooFewMatches {
@@ -287,7 +289,7 @@ pub fn estimate<L: PairLookup + ?Sized>(
             continue;
         };
         let count = count_inliers(&e, &x1, &x2, threshold_sq);
-        if best.is_none_or(|(_, c)| count > c) {
+        if best.map_or(true, |(_, c)| count > c) {
             best = Some((e, count));
             let ratio = count as f64 / n as f64;
             needed = ransac_iterations(ratio, 8, params.confidence).min(params.max_iterations);

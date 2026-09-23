@@ -64,6 +64,7 @@ impl Default for Params {
 
 /// Colour for a mesh.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Texture {
     /// One colour per mesh vertex.
     pub vertex_colours: Vec<[u8; 3]>,
@@ -494,7 +495,7 @@ fn pack(
     };
 
     let mut rgba = vec![128u8; width * height * 4];
-    for pixel in rgba.as_chunks_mut::<4>().0 {
+    for pixel in rgba.chunks_exact_mut(4) {
         pixel[3] = 255;
     }
     for (chart, faces) in charts.iter().enumerate() {

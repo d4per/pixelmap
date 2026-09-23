@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-pixelmap_multiview = { path = "../multiview", default-features = false }
+pixelmap_multiview = { path = "../multiview", version = "0.1.0", default-features = false }
 pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
 # Comparing estimated rotations with the ground truth of synthetic scenes.
 nalgebra = "0.33"

@@ -158,6 +158,16 @@ impl Job {
     }
 }
 
+impl std::fmt::Debug for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Job")
+            .field("status", &self.status())
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("finished", &self.worker.as_ref().map_or(true, |w| w.is_finished()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         // Joined already, so there is nothing running to stop.

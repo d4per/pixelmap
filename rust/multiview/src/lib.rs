@@ -65,6 +65,13 @@
 //!   model returns an [`Error`] naming the stage and the reason, rather than a
 //!   plausible-looking wrong model.
 //!
+//! # Dependencies in the API
+//!
+//! Positions, normals and poses are [`nalgebra`] types, and photos, quality and
+//! correspondences are [`pixelmap`] types. Both crates are re-exported, so
+//! `pixelmap_multiview::nalgebra` and `pixelmap_multiview::pixelmap` are always the versions
+//! this crate was built against. A new major version of either is a breaking change here.
+//!
 //! # Feature flags
 //!
 //! - **`parallel`** *(default)* — passed through to pixelmap. Turn it off for wasm.
@@ -73,10 +80,13 @@
 //!   what `Job` drives underneath.
 
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
+pub use nalgebra;
+pub use pixelmap;
 
 pub mod export;
 pub mod pipeline;
-pub mod synthetic;
 
 #[cfg(feature = "threads")]
 pub mod job;
@@ -108,6 +118,10 @@ pub mod pnp;
 pub mod rng;
 #[doc(hidden)]
 pub mod sfm;
+// Scenes with known geometry, rendered and matched exactly. For this crate's tests and the
+// command-line tool's `--synthetic` mode, not for building on.
+#[doc(hidden)]
+pub mod synthetic;
 #[doc(hidden)]
 pub mod texture;
 #[doc(hidden)]
@@ -146,6 +160,6 @@ pub use job::{Cancel, Job};
 
 // Reached through `Model::diagnostics`, so they have to be nameable.
 pub use ba::Report as AdjustmentReport;
-pub use depth::{DepthMap, DepthStats};
-pub use sfm::SparseModel;
+pub use depth::{Counts as DepthCounts, DepthMap, DepthStats, Fate as SampleFate};
+pub use sfm::{Registration, SparseModel, SparsePoint, Warning as RegistrationWarning};
 pub use tracks::Track;

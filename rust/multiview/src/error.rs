@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::event::Stage;
+use crate::twoview::Degeneracy;
 use crate::types::{PairId, ViewId};
 
 /// Why a reconstruction could not continue.
@@ -40,6 +41,14 @@ pub enum Error {
     },
     /// The intrinsics have a non-finite parameter or a focal length that is not positive.
     InvalidIntrinsics,
+    /// A [`PairGraph`](crate::PairGraph) handed to [`reconstruct`](crate::reconstruct)
+    /// spans a different number of views than there are photos.
+    GraphMismatch {
+        /// How many views the graph spans.
+        views: usize,
+        /// How many photos were passed.
+        photos: usize,
+    },
     /// Too few points could be followed across three or more views.
     TooFewTracks {
         /// How many tracks reach three or more views.
@@ -50,7 +59,7 @@ pub enum Error {
     /// No pair of views is usable as the starting point of a registration.
     NoUsablePair {
         /// Each pair that was not usable, and why.
-        reasons: Vec<(PairId, String)>,
+        reasons: Vec<(PairId, Degeneracy)>,
     },
     /// Too few views could be placed in one frame.
     RegistrationFailed {
@@ -116,7 +125,8 @@ impl Error {
             Error::TooFewPhotos { .. }
             | Error::SizeMismatch { .. }
             | Error::PhotoTooSmall { .. }
-            | Error::InvalidIntrinsics => Stage::Input,
+            | Error::InvalidIntrinsics
+            | Error::GraphMismatch { .. } => Stage::Input,
             Error::Cancelled { stage } => *stage,
             Error::Correspondence { .. } | Error::DisconnectedViews { .. } => Stage::Pairs,
             Error::TooFewTracks { .. } => Stage::Tracks,
@@ -153,6 +163,10 @@ impl fmt::Display for Error {
             ),
             Error::InvalidIntrinsics => f.write_str(
                 "camera intrinsics must be finite, with a positive focal length",
+            ),
+            Error::GraphMismatch { views, photos } => write!(
+                f,
+                "the correspondence graph spans {views} views but {photos} photos were given"
             ),
             Error::TooFewTracks { found, required } => write!(
                 f,

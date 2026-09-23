@@ -150,9 +150,10 @@ impl Stage {
     /// The share of a typical run's time spent in this stage. Used to turn per-stage
     /// progress into one overall fraction.
     ///
-    /// These are estimates until the stages exist and can be timed. Pairwise
-    /// correspondence dominates, since it is N(N−1)/2 solver runs, and fusion is the only
-    /// other stage expected to take noticeable time.
+    /// Rough shares, not a measurement of any one run: the real split moves with the
+    /// quality and the number of photos. Pairwise correspondence dominates, since it is
+    /// N(N−1)/2 solver runs; dense depth and fusion are the only other stages that take
+    /// noticeable time.
     fn weight(self) -> f32 {
         match self {
             Stage::Input => 0.01,
@@ -213,7 +214,7 @@ pub enum Event {
     },
 
     /// The solver advanced within one pair's mapping.
-    PairStarted {
+    PairProgress {
         /// The pair.
         pair: PairId,
         /// Its position in the run, from zero.
@@ -279,7 +280,7 @@ impl Event {
         match self {
             Event::Started { .. } => Stage::Input,
             Event::Stage { stage, .. } => *stage,
-            Event::PairStarted { .. } | Event::PairMapped { .. } => Stage::Pairs,
+            Event::PairProgress { .. } | Event::PairMapped { .. } => Stage::Pairs,
             Event::PairRejected { .. } => Stage::TwoView,
             Event::ViewDropped { stage, .. } | Event::Log { stage, .. } => *stage,
         }
@@ -297,7 +298,7 @@ impl Event {
         let fraction = match self {
             Event::Started { .. } => 0.0,
             Event::Stage { fraction, .. } => *fraction,
-            Event::PairStarted {
+            Event::PairProgress {
                 index,
                 of,
                 step,
@@ -322,7 +323,7 @@ impl Event {
                 Cow::Owned(format!("{views} photos, {pairs} pairs to map"))
             }
             Event::Stage { message, .. } => Cow::Borrowed(message),
-            Event::PairStarted {
+            Event::PairProgress {
                 pair, step, steps, ..
             } => Cow::Owned(format!("mapping {pair}, step {step}/{steps}")),
             Event::PairMapped { pair, map, .. } => Cow::Owned(format!(
@@ -486,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_pair_reports_where_it_is_without_the_caller_counting() {
-        let started = Event::PairStarted {
+        let started = Event::PairProgress {
             pair: PairId::new(ViewId(0), ViewId(2)).expect("distinct views"),
             index: 1,
             of: 3,

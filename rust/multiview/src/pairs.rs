@@ -14,6 +14,11 @@ use crate::lookup::{Directed, PairLookup};
 use crate::types::{PairId, PhotoPx, ViewId};
 
 /// The coverage below which a pair is not trusted to connect its two views.
+///
+/// A pair whose [`PairMap::coverage`] falls below this does not count as a link between
+/// its photos, and a photo with no such link is left out. It is public so that a caller
+/// showing pairs can judge them by the same number the reconstruction does, rather than
+/// keeping a copy that drifts. The name is stable; the value may be retuned in any release.
 pub const MIN_PAIR_COVERAGE: f32 = 0.25;
 
 impl PairLookup for Correspondence {
@@ -41,6 +46,10 @@ impl PairLookup for Correspondence {
 }
 
 /// One mapping per pair of views.
+///
+/// [`run`](crate::run) builds one of these from pixelmap's correspondences. To reconstruct
+/// from correspondences of your own, build one with [`Self::from_fn`] and hand it to
+/// [`reconstruct`](crate::reconstruct).
 #[derive(Clone, Debug)]
 pub struct PairGraph<L> {
     views: usize,
@@ -62,24 +71,17 @@ impl<L: PairLookup> PairGraph<L> {
         self.views
     }
 
-    /// The mapping of `pair`, from its first view to its second.
-    ///
-    /// # Panics
-    /// If either view is outside the graph.
-    pub fn get(&self, pair: PairId) -> &L {
-        assert!(
-            pair.b().index() < self.views,
-            "{pair} is outside a graph of {} views",
-            self.views
-        );
-        &self.maps[index(self.views, pair)]
+    /// The mapping of `pair`, from its first view to its second. `None` if either view is
+    /// outside the graph.
+    pub fn get(&self, pair: PairId) -> Option<&L> {
+        (pair.b().index() < self.views).then(|| &self.maps[index(self.views, pair)])
     }
 
     /// The mapping from `from` to `to`, whichever order it is stored in. `None` if the
     /// views are equal or outside the graph.
     pub fn directed(&self, from: ViewId, to: ViewId) -> Option<Directed<'_, L>> {
         let pair = PairId::new(from, to)?;
-        (pair.b().index() < self.views).then(|| Directed::new(self.get(pair), from > to))
+        Some(Directed::new(self.get(pair)?, from > to))
     }
 
     /// The largest typical localization error among the mappings, in photo pixels.
@@ -157,7 +159,7 @@ pub fn compute(
                 photos[pair.a().index()].clone(),
                 photos[pair.b().index()].clone(),
                 |p| {
-                    on_event(Event::PairStarted {
+                    on_event(Event::PairProgress {
                         pair,
                         index,
                         of: total,
@@ -215,7 +217,7 @@ pub fn connected_views<L: PairLookup>(graph: &PairGraph<L>, min_coverage: f32) -
                 }
                 let pair = PairId::new(ViewId(v as u32), ViewId(w as u32))
                     .expect("v is seen and w is not, so they differ");
-                if graph.get(pair).coverage() >= min_coverage {
+                if graph.get(pair).is_some_and(|m| m.coverage() >= min_coverage) {
                     *seen_w = true;
                     members.push(w);
                 }

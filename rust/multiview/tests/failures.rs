@@ -6,7 +6,8 @@ use std::sync::Arc;
 use pixelmap::Photo;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::{
-    pipeline, Error, Event, Flow, Model, Options, PairGraph, PairLookup, PhotoPx, Stage, ViewId,
+    pipeline, Degeneracy, Error, Event, Flow, Focal, Model, Options, PairGraph, PairLookup, PhotoPx,
+    Stage, ViewId,
 };
 
 const WIDTH: usize = 320;
@@ -23,8 +24,7 @@ fn attempt(set: &SyntheticSet) -> Result<Model, Error> {
     pipeline::reconstruct(
         &graph,
         &photos(set),
-        &set.intrinsics,
-        &Options::new(),
+        &Options::new().focal(Focal::Pixels(set.intrinsics.fx)),
         &mut |_| Flow::Continue(()),
     )
 }
@@ -51,7 +51,9 @@ fn a_flat_scene_is_reported_as_flat() {
     assert!(message.contains("flat"), "{message}");
     if let Error::NoUsablePair { reasons } = &error {
         assert!(
-            reasons.iter().all(|(_, reason)| reason.contains("flat")),
+            reasons
+                .iter()
+                .all(|(_, reason)| matches!(reason, Degeneracy::Planar { .. })),
             "every pair should be blamed on the flat scene: {message}"
         );
     }
@@ -137,8 +139,7 @@ fn photos_with_nothing_in_common_do_not_connect() {
     let error = pipeline::reconstruct(
         &graph,
         &photos(&set),
-        &set.intrinsics,
-        &Options::new(),
+        &Options::new().focal(Focal::Pixels(set.intrinsics.fx)),
         &mut |_| Flow::Continue(()),
     )
     .expect_err("nothing links the views");
@@ -155,8 +156,7 @@ fn a_run_stops_when_asked() {
     let result = pipeline::reconstruct(
         &graph,
         &photos(&set),
-        &set.intrinsics,
-        &Options::new(),
+        &Options::new().focal(Focal::Pixels(set.intrinsics.fx)),
         &mut |event| {
             stages.push(event.stage());
             if let Event::Stage {

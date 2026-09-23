@@ -41,6 +41,7 @@ impl Default for Params {
 
 /// One scene point, observed in two or more views.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Track {
     /// The view the track was started from. Its observation is a grid point rather than
     /// a measurement.
