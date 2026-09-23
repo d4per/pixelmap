@@ -4,11 +4,10 @@
 use std::sync::Arc;
 
 use pixelmap::Photo;
-use pixelmap_multiview::pipeline::{self, Reconstruction};
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::{align, Flow, PairGraph, ViewId, World};
+use pixelmap_multiview::{align, pipeline, Flow, Model, Options, PairGraph, ViewId, World};
 
-fn reconstruct(set: &SyntheticSet) -> (Vec<Arc<Photo>>, Reconstruction) {
+fn reconstruct(set: &SyntheticSet) -> (Vec<Arc<Photo>>, Model) {
     let photos: Vec<_> = (0..set.views())
         .map(|v| Arc::new(set.render(ViewId(v as u32))))
         .collect();
@@ -17,7 +16,7 @@ fn reconstruct(set: &SyntheticSet) -> (Vec<Arc<Photo>>, Reconstruction) {
         &graph,
         &photos,
         &set.intrinsics,
-        &pipeline::Params::default(),
+        &Options::new(),
         &mut |_| Flow::Continue(()),
     )
     .expect("the synthetic scene reconstructs");
@@ -25,15 +24,16 @@ fn reconstruct(set: &SyntheticSet) -> (Vec<Arc<Photo>>, Reconstruction) {
 }
 
 /// The similarity from the reconstruction's frame to the truth's.
-fn alignment(set: &SyntheticSet, r: &Reconstruction) -> align::Similarity {
+fn alignment(set: &SyntheticSet, r: &Model) -> align::Similarity {
     let mut estimated = Vec::new();
     let mut expected = Vec::new();
-    for view in r.adjusted.registered() {
-        estimated.push(r.adjusted.cameras[view.index()].unwrap().centre());
+    let adjusted = &r.diagnostics().adjusted;
+    for view in adjusted.registered() {
+        estimated.push(adjusted.cameras[view.index()].unwrap().centre());
         expected.push(set.poses[view.index()].centre());
     }
-    for point in &r.adjusted.points {
-        let track = &r.tracks[point.track];
+    for point in &adjusted.points {
+        let track = &r.diagnostics().tracks[point.track];
         if let Some(surface) =
             set.surface_point(track.anchor, track.observation(track.anchor).unwrap())
         {
@@ -63,7 +63,7 @@ fn colours_the_mesh_from_the_photos() {
     let (_, r) = reconstruct(&set);
     let similarity = alignment(&set, &r);
 
-    let mesh = &r.fused.mesh;
+    let mesh = &r.mesh;
     assert_eq!(r.texture.vertex_colours.len(), mesh.positions.len());
     let mut errors: Vec<f64> = mesh
         .positions
@@ -87,7 +87,7 @@ fn the_atlas_holds_the_chosen_photo_under_each_triangle() {
     let set = SyntheticSet::orbit(Scene::sphere(), 4, 36.0, 640, 480);
     let (photos, r) = reconstruct(&set);
     let texture = &r.texture;
-    let mesh = &r.fused.mesh;
+    let mesh = &r.mesh;
     let atlas = &texture.atlas;
     assert!(texture.charts > 0);
     assert!(atlas.width().is_power_of_two() && atlas.height().is_power_of_two());
@@ -100,7 +100,7 @@ fn the_atlas_holds_the_chosen_photo_under_each_triangle() {
     let mut errors = Vec::new();
     for (f, triangle) in mesh.triangles.iter().enumerate().step_by(7) {
         let view = texture.face_views[f];
-        let pose = r.adjusted.cameras[view.index()].unwrap();
+        let pose = r.diagnostics().adjusted.cameras[view.index()].unwrap();
         for (corner, &v) in triangle.iter().enumerate() {
             let [u, t] = texture.texcoords[texture.face_texcoords[f][corner] as usize];
             let ax = u as f64 * atlas.width() as f64 - 0.5;

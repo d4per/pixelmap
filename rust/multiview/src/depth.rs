@@ -20,10 +20,10 @@ use nalgebra::{Point3, Vector3};
 
 use crate::calib::Intrinsics;
 use crate::error::Error;
+use crate::event::{report, silent, Event, Flow, Stage};
 use crate::lookup::PairLookup;
 use crate::pairs::PairGraph;
 use crate::pose::Pose;
-use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::triangulate;
 use crate::types::{Norm, PhotoPx, ViewId, World};
 

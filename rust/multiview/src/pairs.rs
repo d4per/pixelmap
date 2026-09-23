@@ -8,9 +8,9 @@ use std::sync::Arc;
 use pixelmap::{Correspondence, Photo, Quality};
 
 use crate::error::Error;
+use crate::event::{emit, Event, Flow, PairMap, Stage};
 use crate::input::MIN_VIEWS;
 use crate::lookup::{Directed, PairLookup};
-use crate::progress::{Event, Flow, PairMap, Stage};
 use crate::types::{PairId, PhotoPx, ViewId};
 
 /// The coverage below which a pair is not trusted to connect its two views.
@@ -130,8 +130,9 @@ fn pair_map(pair: PairId, mapping: &Correspondence) -> PairMap {
 
 /// Runs pixelmap over every pair of `photos`, one pair at a time.
 ///
-/// Reports progress through `on_event`. A `Break` takes effect once the pair being
-/// mapped is finished, since a pixelmap run cannot be interrupted partway.
+/// Reports progress through `on_event`. A `Break` stops the run at the next pixelmap
+/// schedule step, so the longest it waits is one step of the pair being mapped — the last
+/// steps of [`Quality::High`] work at 1600 px and are the slowest.
 ///
 /// The event that finishes each pair carries that pair's [`PairMap`], so a caller can show
 /// the correspondence as it is found.
@@ -149,31 +150,42 @@ pub fn compute(
     let mut maps = Vec::with_capacity(total);
 
     for (index, pair) in PairId::all(views as u32).enumerate() {
-        let mut stop = false;
         let mapping = Correspondence::builder()
             .quality(quality)
             .seed(seed)
-            .run_with_progress(
+            .run_with_control(
                 photos[pair.a().index()].clone(),
                 photos[pair.b().index()].clone(),
                 |p| {
-                    let fraction = (index as f32 + p.fraction()) / total as f32;
-                    let message = format!("mapping {pair}, step {}/{}", p.step, p.total);
-                    stop |= on_event(Event::new(Stage::Pairs, fraction, message)).is_break();
+                    on_event(Event::PairStarted {
+                        pair,
+                        index,
+                        of: total,
+                        step: p.step as u32,
+                        steps: p.total as u32,
+                    })
                 },
             )
             .map_err(|source| Error::Correspondence { pair, source })?;
 
-        let message = format!("mapped {pair}: {:.0}% coverage", mapping.coverage() * 100.0);
-        let map = pair_map(pair, &mapping);
-        maps.push(mapping);
-        let fraction = (index + 1) as f32 / total as f32;
-        stop |= on_event(Event::new(Stage::Pairs, fraction, message).with_map(map)).is_break();
-        if stop {
+        // pixelmap gives nothing back when the callback asked it to stop.
+        let Some(mapping) = mapping else {
             return Err(Error::Cancelled {
                 stage: Stage::Pairs,
             });
-        }
+        };
+
+        let map = pair_map(pair, &mapping);
+        maps.push(mapping);
+        emit(
+            on_event,
+            Event::PairMapped {
+                pair,
+                index,
+                of: total,
+                map: Box::new(map),
+            },
+        )?;
     }
 
     Ok(PairGraph { views, maps })

@@ -1,12 +1,12 @@
 [package]
 name = "pixelmap_multiview_cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 
 [dependencies]
 pixelmap_multiview = { path = "../multiview", default-features = false }
-pixelmap = { path = "../pixelmap", version = "0.2.0", default-features = false }
+pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
 # Comparing estimated rotations with the ground truth of synthetic scenes.
 nalgebra = "0.33"
 clap = { version = "4.5.27", features = ["derive"] }
@@ -18,8 +18,10 @@ image = { version = ">=0.25, <0.25.10", default-features = false, features = ["j
 kamadak-exif = "0.6"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "threads"]
 parallel = ["pixelmap_multiview/parallel", "pixelmap/parallel"]
+# `Job`, which `--cancel-after` runs the reconstruction on so it can be stopped partway.
+threads = ["pixelmap_multiview/threads"]
 
 [[bin]]
 name = "pixelmap-multiview"

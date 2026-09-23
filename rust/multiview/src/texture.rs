@@ -25,9 +25,9 @@ use pixelmap::Photo;
 use crate::calib::Intrinsics;
 use crate::depth::DepthMap;
 use crate::error::Error;
+use crate::event::{report, silent, Event, Flow, Stage};
 use crate::mesh::Mesh;
 use crate::pose::Pose;
-use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::types::{PhotoPx, ViewId};
 
 /// Tuning for [`build`].
@@ -92,8 +92,16 @@ pub fn build(
     params: &Params,
 ) -> Texture {
     // `silent` never breaks, so the only error this form could return cannot happen.
-    build_with_progress(mesh, cameras, intrinsics, photos, depth, params, &mut silent)
-        .expect("a callback that never breaks cannot cancel")
+    build_with_progress(
+        mesh,
+        cameras,
+        intrinsics,
+        photos,
+        depth,
+        params,
+        &mut silent,
+    )
+    .expect("a callback that never breaks cannot cancel")
 }
 
 /// [`build`], reporting each phase through `on_event`.

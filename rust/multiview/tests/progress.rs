@@ -1,16 +1,15 @@
 //! The feedback a caller gets while a reconstruction runs.
 //!
-//! A web frontend drives this crate through the progress callback alone, so what the
-//! callback sees is part of the contract: the overall fraction has to move forwards, and
-//! every stage that takes noticeable time has to report from inside itself rather than
-//! only once it is already done.
+//! A web frontend drives this crate through the event callback alone, so what the callback
+//! sees is part of the contract: progress has to move forwards, every stage that takes
+//! noticeable time has to report from inside itself rather than only once it is already
+//! done, and the facts a caller needs have to be fields rather than prose to be parsed.
 
 use std::sync::Arc;
 
 use pixelmap::Photo;
-use pixelmap_multiview::pipeline;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::{Event, Flow, PairGraph, Stage, ViewId};
+use pixelmap_multiview::{pipeline, Event, Flow, Options, PairGraph, Stage, ViewId};
 
 fn photos(set: &SyntheticSet) -> Vec<Arc<Photo>> {
     (0..set.views())
@@ -27,7 +26,7 @@ fn events_of_a_run() -> Vec<Event> {
         &graph,
         &photos(&set),
         &set.intrinsics,
-        &pipeline::Params::default(),
+        &Options::new(),
         &mut |event| {
             events.push(event);
             Flow::Continue(())
@@ -38,20 +37,25 @@ fn events_of_a_run() -> Vec<Event> {
 }
 
 #[test]
-fn the_overall_fraction_only_moves_forwards() {
+fn progress_only_moves_forwards() {
     let events = events_of_a_run();
     assert!(events.len() > 20, "only {} events", events.len());
 
     let mut last = 0.0;
     for event in &events {
-        let fraction = event.fraction();
+        // A log line or a dropped view says nothing about progress, by design: it can
+        // happen anywhere within a stage, and reporting the stage's start would drive a
+        // progress bar backwards.
+        let Some(progress) = event.progress() else {
+            continue;
+        };
         assert!(
-            fraction >= last,
-            "{} went backwards, from {last} to {fraction}: {}",
-            event.stage,
-            event.message
+            progress >= last,
+            "{} went backwards, from {last} to {progress}: {}",
+            event.stage(),
+            event.message()
         );
-        last = fraction;
+        last = progress;
     }
     assert!((last - 1.0).abs() < 1e-4, "a finished run ends at {last}");
 }
@@ -71,14 +75,33 @@ fn every_slow_stage_reports_before_it_finishes() {
     ] {
         let partial = events
             .iter()
-            .filter(|e| e.stage == stage && e.stage_fraction < 1.0)
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Stage { stage: s, fraction, .. } if *s == stage && *fraction < 1.0
+                )
+            })
             .count();
         assert!(partial > 0, "{stage} reported nothing before it finished");
     }
 }
 
 #[test]
-fn only_the_events_that_finish_a_pair_carry_a_map() {
-    // No pair is mapped here, so no event should carry one.
-    assert!(events_of_a_run().iter().all(|e| e.map.is_none()));
+fn no_pair_is_mapped_when_the_mappings_were_given() {
+    // `reconstruct` is handed its correspondences, so it maps nothing and should say so by
+    // reporting no pair at all, rather than by reporting pairs with nothing in them.
+    assert!(!events_of_a_run()
+        .iter()
+        .any(|event| matches!(event, Event::PairStarted { .. } | Event::PairMapped { .. })));
+}
+
+#[test]
+fn every_event_says_which_stage_it_came_from() {
+    // The stage is what a caller groups a log by, so it is answerable for every event,
+    // including the ones that carry no progress.
+    for event in events_of_a_run() {
+        let stage = event.stage();
+        assert!(Stage::ALL.contains(&stage), "{stage} is not a known stage");
+        assert!(!event.message().is_empty(), "{stage} reported nothing");
+    }
 }

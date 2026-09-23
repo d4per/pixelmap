@@ -1,20 +1,25 @@
 [package]
 name = "pixelmap_multiview"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 
 [dependencies]
 # Default features off so that the `parallel` passthrough below is the only way rayon gets
 # in: the wasm build has to be able to leave it out.
-pixelmap = { path = "../pixelmap", version = "0.2.0", default-features = false }
+pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
 # All of the geometry — essential matrices, PnP, triangulation, bundle adjustment — is
 # written here on nalgebra rather than taken from rust-cv, whose crates pin nalgebra 0.21.
 nalgebra = "0.33"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "threads"]
 parallel = ["pixelmap/parallel"]
+# `Job`, which runs a reconstruction on a worker thread. Off for wasm32-unknown-unknown,
+# which has no threads to hand out without SharedArrayBuffer and cross-origin isolation;
+# `run` works there and is what `Job` drives underneath, so nothing is lost but the
+# convenience.
+threads = []
 
 [lib]
 name = "pixelmap_multiview"

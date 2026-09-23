@@ -8,7 +8,7 @@ use pixelmap_multiview::pairs::{self, MIN_PAIR_COVERAGE};
 use pixelmap_multiview::rng::Rng;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::twoview::{self, Params};
-use pixelmap_multiview::{Error, Flow, PairLookup, Stage, ViewId};
+use pixelmap_multiview::{Error, Event, Flow, PairLookup, Stage, ViewId};
 
 fn rendered(set: &SyntheticSet) -> Vec<Arc<pixelmap::Photo>> {
     (0..set.views())
@@ -23,7 +23,7 @@ fn maps_rendered_views_and_recovers_their_motion() {
 
     let mut events = 0;
     let graph = pairs::compute(&photos, Quality::Low, DEFAULT_SEED, &mut |event| {
-        assert_eq!(event.stage, Stage::Pairs);
+        assert_eq!(event.stage(), Stage::Pairs);
         events += 1;
         Flow::Continue(())
     })
@@ -88,9 +88,8 @@ fn hands_back_the_dense_map_of_every_pair() {
 
     let mut maps = Vec::new();
     let graph = pairs::compute(&photos, Quality::Low, DEFAULT_SEED, &mut |event| {
-        let stage = event.stage;
-        if let Some(map) = event.map {
-            assert_eq!(stage, Stage::Pairs);
+        if let Event::PairMapped { pair, map, .. } = event {
+            assert_eq!(map.pair, pair, "a map belongs to the pair it finished");
             maps.push(*map);
         }
         Flow::Continue(())
@@ -120,9 +119,10 @@ fn hands_back_the_dense_map_of_every_pair() {
         let (mut compared, mut close) = (0, 0);
         for row in 0..rows {
             for column in 0..columns {
-                let (Some(found), Some(expected)) =
-                    (map.point(column, row), mapping.a_to_b(map.pixel(column, row)))
-                else {
+                let (Some(found), Some(expected)) = (
+                    map.point(column, row),
+                    mapping.a_to_b(map.pixel(column, row)),
+                ) else {
                     continue;
                 };
                 compared += 1;

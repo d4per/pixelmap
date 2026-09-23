@@ -4,9 +4,10 @@
 use std::sync::Arc;
 
 use pixelmap::Photo;
-use pixelmap_multiview::pipeline::{self, Reconstruction};
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::{Error, Flow, PairGraph, PairLookup, PhotoPx, Stage, ViewId};
+use pixelmap_multiview::{
+    pipeline, Error, Event, Flow, Model, Options, PairGraph, PairLookup, PhotoPx, Stage, ViewId,
+};
 
 const WIDTH: usize = 320;
 const HEIGHT: usize = 240;
@@ -17,13 +18,13 @@ fn photos(set: &SyntheticSet) -> Vec<Arc<Photo>> {
         .collect()
 }
 
-fn attempt(set: &SyntheticSet) -> Result<Reconstruction, Error> {
+fn attempt(set: &SyntheticSet) -> Result<Model, Error> {
     let graph = PairGraph::from_fn(set.views(), |pair| set.pair(pair));
     pipeline::reconstruct(
         &graph,
         &photos(set),
         &set.intrinsics,
-        &pipeline::Params::default(),
+        &Options::new(),
         &mut |_| Flow::Continue(()),
     )
 }
@@ -82,6 +83,8 @@ fn a_photo_that_cannot_be_placed_is_named_with_the_reason() {
     let set = SyntheticSet::orbit(Scene::corner(), 3, 30.0, WIDTH, HEIGHT);
     let graph = PairGraph::from_fn(set.views(), |pair| set.pair(pair));
     // No view outside the seed pair can ever see this many points.
+    // Driving one stage to a chosen outcome needs the threshold itself, which `Options`
+    // deliberately does not expose. `reconstruct_with_params` is hidden for exactly this.
     let params = pipeline::Params {
         sfm: pixelmap_multiview::sfm::Params {
             min_registration_points: usize::MAX,
@@ -90,13 +93,13 @@ fn a_photo_that_cannot_be_placed_is_named_with_the_reason() {
         ..Default::default()
     };
     let mut messages = Vec::new();
-    let error = pipeline::reconstruct(
+    let error = pipeline::reconstruct_with_params(
         &graph,
         &photos(&set),
         &set.intrinsics,
         &params,
         &mut |event| {
-            messages.push(event.message);
+            messages.push(event.message().into_owned());
             Flow::Continue(())
         },
     )
@@ -135,7 +138,7 @@ fn photos_with_nothing_in_common_do_not_connect() {
         &graph,
         &photos(&set),
         &set.intrinsics,
-        &pipeline::Params::default(),
+        &Options::new(),
         &mut |_| Flow::Continue(()),
     )
     .expect_err("nothing links the views");
@@ -153,11 +156,16 @@ fn a_run_stops_when_asked() {
         &graph,
         &photos(&set),
         &set.intrinsics,
-        &pipeline::Params::default(),
+        &Options::new(),
         &mut |event| {
-            stages.push(event.stage);
-            if event.stage == Stage::Depth {
-                first_depth.get_or_insert(event.stage_fraction);
+            stages.push(event.stage());
+            if let Event::Stage {
+                stage: Stage::Depth,
+                fraction,
+                ..
+            } = event
+            {
+                first_depth.get_or_insert(fraction);
                 Flow::Break(())
             } else {
                 Flow::Continue(())

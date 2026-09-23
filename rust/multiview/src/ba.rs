@@ -31,8 +31,8 @@ use nalgebra::{
 
 use crate::calib::{FocalSource, Intrinsics};
 use crate::error::Error;
+use crate::event::{report, silent, Event, Flow, Stage};
 use crate::pose::Pose;
-use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::sfm::{SparseModel, SparsePoint};
 use crate::tracks::Track;
 use crate::triangulate;

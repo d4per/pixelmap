@@ -1,5 +1,6 @@
 //! The crate's entry point: run the pipeline over a pair of photos and hold the result.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::dense_photo_map::DensePhotoMap;
@@ -8,7 +9,8 @@ use crate::photo::Photo;
 use crate::pixelmap_processor::{PixelMapProcessor, DEFAULT_SEED};
 use crate::processing_mode::{IterationParams, Quality};
 
-/// How far along a run is, reported to [`Builder::run_with_progress`].
+/// How far along a run is, reported to [`Builder::run_with_progress`] and
+/// [`Builder::run_with_control`].
 ///
 /// The library never prints: a caller who wants to show progress asks for it, and one
 /// who does not is not made to pay for output they did not ask for.
@@ -216,6 +218,35 @@ impl Builder {
         photo2: impl Into<Arc<Photo>>,
         mut on_progress: impl FnMut(Progress),
     ) -> Result<Correspondence, Error> {
+        let mapping = self.run_with_control(photo1, photo2, |progress| {
+            on_progress(progress);
+            ControlFlow::Continue(())
+        })?;
+        Ok(mapping.expect("a callback that never breaks cannot stop the run"))
+    }
+
+    /// Runs the pipeline, letting `on_progress` stop it partway.
+    ///
+    /// The callback is invoked after the initial matching pass and after every schedule
+    /// step, exactly as in [`Self::run_with_progress`]. Returning
+    /// `ControlFlow::Break(())` abandons the run and yields `Ok(None)`.
+    ///
+    /// A stopped run is not an error: nothing about the input was wrong, and the caller
+    /// asked for it. That is why this returns an `Option` rather than adding a variant to
+    /// [`Error`], every one of which describes a problem with the input.
+    ///
+    /// A run is abandoned only between steps, so the longest a `Break` waits is one
+    /// schedule step — the final steps of [`Quality::High`] work at 1600 px and are the
+    /// slowest. Cancelling costs the work done so far; there is no partial mapping.
+    ///
+    /// # Errors
+    /// As [`Self::run`].
+    pub fn run_with_control(
+        &self,
+        photo1: impl Into<Arc<Photo>>,
+        photo2: impl Into<Arc<Photo>>,
+        mut on_progress: impl FnMut(Progress) -> ControlFlow<()>,
+    ) -> Result<Option<Correspondence>, Error> {
         let photo1 = photo1.into();
         let photo2 = photo2.into();
         let source_size = (photo1.width(), photo1.height());
@@ -240,24 +271,30 @@ impl Builder {
         let mut processor =
             PixelMapProcessor::with_seed(photo1, photo2, self.quality.photo_width(), self.seed);
         processor.init();
-        on_progress(Progress { step: 1, total });
+        if on_progress(Progress { step: 1, total }).is_break() {
+            return Ok(None);
+        }
 
         for (index, params) in steps.iter().enumerate() {
             params.apply(&mut processor);
-            on_progress(Progress {
+            if on_progress(Progress {
                 step: index + 2,
                 total,
-            });
+            })
+            .is_break()
+            {
+                return Ok(None);
+            }
         }
 
         let comparisons = processor.total_comparisons();
         let (forward, backward) = processor.finish(self.final_max_dist);
-        Ok(Correspondence {
+        Ok(Some(Correspondence {
             forward,
             backward,
             comparisons,
             source_size,
-        })
+        }))
     }
 }
 

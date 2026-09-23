@@ -20,10 +20,10 @@ use nalgebra::Point3;
 use crate::ba;
 use crate::calib::Intrinsics;
 use crate::error::Error;
+use crate::event::{emit, report, silent, Event, Flow, Stage};
 use crate::input::MIN_VIEWS;
 use crate::pnp;
 use crate::pose::Pose;
-use crate::progress::{report, silent, Event, Flow, Stage};
 use crate::rng::Rng;
 use crate::tracks::Track;
 use crate::triangulate;
@@ -414,17 +414,16 @@ pub fn reconstruct_with_progress(
         let (None, Some(reason)) = (cameras[v], reason) else {
             continue;
         };
-        let warning = Warning::Unregistered {
-            view: ViewId(v as u32),
-            reason,
-        };
-        report(
+        let view = ViewId(v as u32);
+        emit(
             on_event,
-            Stage::Registration,
-            cameras.iter().flatten().count() as f32 / views as f32,
-            warning.to_string(),
+            Event::ViewDropped {
+                stage: Stage::Registration,
+                view,
+                reason: reason.clone(),
+            },
         )?;
-        warnings.push(warning);
+        warnings.push(Warning::Unregistered { view, reason });
     }
 
     let registered: Vec<ViewId> = (0..views)

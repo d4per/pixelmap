@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::progress::Stage;
+use crate::event::Stage;
 use crate::types::{PairId, ViewId};
 
 /// Why a reconstruction could not continue.

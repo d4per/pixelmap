@@ -1,6 +1,6 @@
 //! `pixelmap-multiview`: reconstruct a scene from three or more photos on disc.
 //!
-//! The library takes RGBA buffers and intrinsics. Everything that touches files happens
+//! The library takes RGBA buffers and options. Everything that touches files happens
 //! here: decoding, EXIF orientation and focal length, resizing every photo to one common
 //! size, and writing the results.
 
@@ -9,7 +9,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use image::imageops::FilterType;
@@ -17,12 +17,10 @@ use image::DynamicImage;
 use nalgebra::Rotation3;
 use pixelmap::{Correspondence, Photo, ProcessingMode, DEFAULT_SEED};
 use pixelmap_multiview::depth::{self, DepthMap};
-use pixelmap_multiview::pipeline::{self, Reconstruction};
-use pixelmap_multiview::sfm::SparseModel;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
-use pixelmap_multiview::tracks::Track;
 use pixelmap_multiview::{
-    align, export, input, Event, Flow, FocalSource, Intrinsics, PairId, Pose, Stage, ViewId, World,
+    align, export, input, Error, Event, Flow, Focal, FocalSource, Job, Model, Options, PairId,
+    Pose, SparseModel, Track, ViewId, World,
 };
 
 #[derive(Parser, Debug)]
@@ -76,6 +74,13 @@ struct Args {
     /// no EXIF focal length.
     #[arg(long)]
     refine_focal: bool,
+
+    /// Ask the run to stop after this many seconds, and report how long it actually took
+    /// to stop. How promptly a run can be cancelled is a claim worth measuring rather than
+    /// assuming: the wait is bounded by one pixelmap schedule step, which grows with
+    /// `--processing-mode`.
+    #[arg(long, value_name = "SECONDS")]
+    cancel_after: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -91,20 +96,24 @@ fn main() -> ExitCode {
 /// Photos ready for the library, and the ground truth when they were rendered.
 struct Input {
     photos: Vec<Arc<Photo>>,
-    intrinsics: Intrinsics,
+    focal: Focal,
     truth: Option<SyntheticSet>,
 }
 
 fn run(args: Args) -> Result<(), String> {
     let Input {
         photos,
-        intrinsics,
+        focal,
         truth,
     } = match &args.synthetic {
         Some(name) => synthetic_input(&args, name)?,
         None => photo_input(&args)?,
     };
 
+    // The library works this out for itself from the options; asking the same question
+    // here gives something to show before the run starts.
+    let first = photos.first().ok_or("no photos")?;
+    let intrinsics = focal.intrinsics(first.width(), first.height());
     let (width, height) = input::validate(&photos, &intrinsics).map_err(|e| e.to_string())?;
     eprintln!(
         "{} photos at {width}×{height}, {} pairs",
@@ -134,40 +143,72 @@ fn run(args: Args) -> Result<(), String> {
         return time_pair(&args, &photos, seed);
     }
 
-    let mut params = pipeline::Params {
-        quality: args.processing_mode,
-        seed,
-        ..pipeline::Params::default()
-    };
-    params.ba.refine_focal = args.refine_focal;
+    let options = Options::new()
+        .quality(args.processing_mode)
+        .focal(focal)
+        .seed(seed)
+        .refine_focal(args.refine_focal);
 
     let start = Instant::now();
-    let mut mapping_line = false;
-    let result = pipeline::run(&photos, &intrinsics, &params, &mut |event| {
-        print_event(&event, &mut mapping_line);
-        Flow::Continue(())
-    });
-    if mapping_line {
-        eprintln!();
-    }
-    let reconstruction = result.map_err(|e| e.to_string())?;
+    let result = match args.cancel_after {
+        Some(seconds) => cancel_after(photos.clone(), options, seconds),
+        None => {
+            let mut mapping_line = false;
+            let result = pixelmap_multiview::run(&photos, &options, &mut |event| {
+                print_event(&event, &mut mapping_line);
+                Flow::Continue(())
+            });
+            if mapping_line {
+                eprintln!();
+            }
+            result
+        }
+    };
+    let model = result.map_err(|e| e.to_string())?;
     println!("reconstructed in {:.1} s", start.elapsed().as_secs_f64());
-    print_depth_stats(&reconstruction);
+    print_depth_stats(&model);
 
     if let Some(truth) = &truth {
-        report_truth(truth, &reconstruction);
+        report_truth(truth, &model);
     }
     if let Some(dir) = &args.dump_dir {
-        write_outputs(dir, &photos, &reconstruction)?;
+        write_outputs(dir, &photos, &model)?;
     }
     Ok(())
 }
 
-/// Prints a progress event. The many steps of mapping share one line that rewrites
-/// itself; every stage summary gets a line of its own.
+/// Runs on a worker thread and stops it after `seconds`, reporting how long the stop took
+/// to take effect.
+fn cancel_after(photos: Vec<Arc<Photo>>, options: Options, seconds: f64) -> Result<Model, Error> {
+    let job = Job::start(photos, options);
+    let canceller = job.canceller();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f64(seconds));
+        canceller.cancel();
+    });
+
+    let asked_at = Instant::now();
+    let mut mapping_line = false;
+    for event in job.events() {
+        print_event(&event, &mut mapping_line);
+    }
+    if mapping_line {
+        eprintln!();
+    }
+    let elapsed = asked_at.elapsed().as_secs_f64();
+    println!(
+        "asked to stop after {seconds:.1} s; the run ended {:.2} s later, at {elapsed:.2} s",
+        (elapsed - seconds).max(0.0)
+    );
+    job.join()
+}
+
+/// Prints an event. The many steps of mapping share one line that rewrites itself; every
+/// other event gets a line of its own.
 fn print_event(event: &Event, mapping_line: &mut bool) {
-    if event.stage == Stage::Pairs && event.message.starts_with("mapping ") {
-        eprint!("\r{:5.1}%  {:<72}", event.fraction() * 100.0, event.message);
+    if let Event::PairStarted { .. } = event {
+        let percent = event.progress().unwrap_or(0.0) * 100.0;
+        eprint!("\r{percent:5.1}%  {:<72}", event.message());
         *mapping_line = true;
         return;
     }
@@ -175,16 +216,20 @@ fn print_event(event: &Event, mapping_line: &mut bool) {
         eprint!("\r{:<80}\r", "");
         *mapping_line = false;
     }
-    println!(
-        "{:5.1}%  {}: {}",
-        event.fraction() * 100.0,
-        event.stage,
-        event.message
-    );
+    match event.progress() {
+        Some(progress) => println!(
+            "{:5.1}%  {}: {}",
+            progress * 100.0,
+            event.stage(),
+            event.message()
+        ),
+        // A log line or a dropped view says nothing about how far along the run is.
+        None => println!("        {}: {}", event.stage(), event.message()),
+    }
 }
 
 /// How dense depth treated each photo's samples, by how many other photos they map into.
-fn print_depth_stats(r: &Reconstruction) {
+fn print_depth_stats(model: &Model) {
     let percent = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
     let describe = |counts: &depth::Counts| {
         format!(
@@ -198,7 +243,7 @@ fn print_depth_stats(r: &Reconstruction) {
         )
     };
     println!("dense depth per photo:");
-    for stats in &r.depth_stats {
+    for stats in &model.diagnostics().depth_stats {
         let total = stats.unmapped + stats.single.samples + stats.multiple.samples;
         println!(
             "  {}: {:.0}% matched to no other photo",
@@ -223,10 +268,11 @@ fn print_depth_stats(r: &Reconstruction) {
 }
 
 /// Compares every stage of a reconstruction of a synthetic scene with the ground truth.
-fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
+fn report_truth(truth: &SyntheticSet, model: &Model) {
+    let d = model.diagnostics();
     println!();
     println!("against the ground truth:");
-    for report in &r.pairs {
+    for report in &model.pairs {
         if let Ok(estimate) = &report.estimate {
             let expected = truth.relative_pose(report.pair);
             println!(
@@ -241,12 +287,12 @@ fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
             );
         }
     }
-    if let Some((_, cameras, points)) = align_with_truth(truth, &r.tracks, &r.registered) {
+    if let Some((_, cameras, points)) = align_with_truth(truth, &d.tracks, &d.registered) {
         println!(
             "  registered: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
         );
     }
-    let Some((similarity, cameras, points)) = align_with_truth(truth, &r.tracks, &r.adjusted)
+    let Some((similarity, cameras, points)) = align_with_truth(truth, &d.tracks, &d.adjusted)
     else {
         eprintln!("could not align the reconstruction with the ground truth");
         return;
@@ -255,7 +301,7 @@ fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
         "  bundle adjusted: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
     );
 
-    let mut depth_errors: Vec<f64> = r
+    let mut depth_errors: Vec<f64> = d
         .depth
         .iter()
         .flat_map(|map| {
@@ -263,9 +309,9 @@ fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
                 .flat_map(move |row| (0..map.columns).map(move |column| (map, column, row)))
         })
         .filter_map(|(map, column, row)| {
-            let d = map.get(column, row)? as f64 * similarity.scale;
+            let depth = map.get(column, row)? as f64 * similarity.scale;
             let t = truth.depth(map.view, map.pixel(column, row))?;
-            Some((d - t).abs() / t * 100.0)
+            Some((depth - t).abs() / t * 100.0)
         })
         .collect();
     if !depth_errors.is_empty() {
@@ -277,7 +323,7 @@ fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
     }
 
     let extent = camera_spread(truth);
-    let mesh = &r.fused.mesh;
+    let mesh = &model.mesh;
     let mut distances: Vec<f64> = mesh
         .positions
         .iter()
@@ -286,7 +332,7 @@ fn report_truth(truth: &SyntheticSet, r: &Reconstruction) {
     let mut colour_errors: Vec<f64> = mesh
         .positions
         .iter()
-        .zip(&r.texture.vertex_colours)
+        .zip(&model.texture.vertex_colours)
         .map(|(p, colour)| {
             let expected = truth.scene.colour(&similarity.apply(p));
             (0..3)
@@ -375,15 +421,16 @@ fn percentile(values: &mut [f64], q: f64) -> f64 {
 }
 
 /// Writes the sparse model, depth maps and textured mesh into `dir`.
-fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Result<(), String> {
+fn write_outputs(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let d = model.diagnostics();
 
-    let points: Vec<(World, [u8; 3])> = r
+    let points: Vec<(World, [u8; 3])> = d
         .adjusted
         .points
         .iter()
         .map(|p| {
-            let track = &r.tracks[p.track];
+            let track = &d.tracks[p.track];
             let anchor = track
                 .observation(track.anchor)
                 .expect("a track observes its anchor");
@@ -391,15 +438,15 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Resul
             (p.position, colour)
         })
         .collect();
-    let cameras: Vec<Pose> = r.adjusted.cameras.iter().flatten().copied().collect();
+    let cameras: Vec<Pose> = d.adjusted.cameras.iter().flatten().copied().collect();
     write_file(&dir.join("sparse.ply"), |out| {
-        export::write_ply(out, &points, &cameras, &r.intrinsics, r.size, 0.3)
+        export::write_ply(out, &points, &cameras, &model.intrinsics, d.size, 0.3)
     })?;
 
-    for map in &r.depth {
+    for map in &d.depth {
         write_depth_png(&dir.join(format!("depth_{}.png", map.view.0)), map)?;
     }
-    for (map, stats) in r.depth.iter().zip(&r.depth_stats) {
+    for (map, stats) in d.depth.iter().zip(&d.depth_stats) {
         write_coverage_png(
             &dir.join(format!("coverage_{}.png", map.view.0)),
             &photos[map.view.index()],
@@ -408,19 +455,19 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], r: &Reconstruction) -> Resul
         )?;
     }
 
-    let mesh = &r.fused.mesh;
+    let mesh = &model.mesh;
     write_file(&dir.join("mesh.obj"), |out| {
-        export::write_textured_obj(out, mesh, &r.texture, "mesh.mtl")
+        export::write_textured_obj(out, mesh, &model.texture, "mesh.mtl")
     })?;
     write_file(&dir.join("mesh.mtl"), |out| {
         export::write_mtl(out, "mesh_texture.png")
     })?;
-    save_photo(&dir.join("mesh_texture.png"), &r.texture.atlas)?;
+    save_photo(&dir.join("mesh_texture.png"), &model.texture.atlas)?;
     write_file(&dir.join("mesh.x3d"), |out| {
-        export::write_textured_x3d(out, mesh, &r.texture, "mesh_texture.png")
+        export::write_textured_x3d(out, mesh, &model.texture, "mesh_texture.png")
     })?;
     write_file(&dir.join("mesh_colours.ply"), |out| {
-        export::write_ply_mesh(out, mesh, &r.texture.vertex_colours)
+        export::write_ply_mesh(out, mesh, &model.texture.vertex_colours)
     })?;
 
     eprintln!(
@@ -549,9 +596,11 @@ fn synthetic_input(args: &Args, name: &str) -> Result<Input, String> {
     let photos = (0..set.views())
         .map(|v| Arc::new(set.render(ViewId(v as u32))))
         .collect();
+    // The renderer's own camera, said in the terms the library takes.
+    let focal = Focal::Pixels(set.intrinsics.fx);
     Ok(Input {
         photos,
-        intrinsics: set.intrinsics,
+        focal,
         truth: Some(set),
     })
 }
@@ -591,7 +640,7 @@ fn photo_input(args: &Args) -> Result<Input, String> {
     );
     let (width, height) = (size.0 as usize, size.1 as usize);
 
-    let intrinsics = intrinsics(args, &loaded, original, size)?;
+    let focal = focal_of(args, &loaded, original, size)?;
 
     let photos = loaded
         .into_iter()
@@ -612,7 +661,7 @@ fn photo_input(args: &Args) -> Result<Input, String> {
 
     Ok(Input {
         photos,
-        intrinsics,
+        focal,
         truth: None,
     })
 }
@@ -664,22 +713,18 @@ fn upright(image: DynamicImage, orientation: u32) -> DynamicImage {
     }
 }
 
-/// The camera for the resized photos: `--focal-px` first, then EXIF, then a guess.
-fn intrinsics(
+/// What is known about the camera for the resized photos: `--focal-px` first, then EXIF,
+/// then nothing, which the library treats as a guess worth refining.
+fn focal_of(
     args: &Args,
     loaded: &[Loaded],
     original: (u32, u32),
     size: (u32, u32),
-) -> Result<Intrinsics, String> {
-    let (width, height) = (size.0 as usize, size.1 as usize);
+) -> Result<Focal, String> {
     if let Some(focal) = args.focal_px {
+        // Given for the originals, so it scales with them.
         let factor = size.0 as f64 / original.0 as f64;
-        return Ok(Intrinsics::from_focal(
-            focal * factor,
-            width,
-            height,
-            FocalSource::Provided,
-        ));
+        return Ok(Focal::Pixels(focal * factor));
     }
 
     let focal = loaded[0].focal_35mm;
@@ -694,9 +739,10 @@ fn intrinsics(
         ));
     }
 
+    // The 35 mm equivalent does not depend on pixel count, so resizing leaves it alone.
     Ok(match focal {
-        Some(focal) => Intrinsics::from_35mm(focal, width, height),
-        None => Intrinsics::estimated(width, height),
+        Some(focal) => Focal::Equivalent35mm(focal),
+        None => Focal::Unknown,
     })
 }
 

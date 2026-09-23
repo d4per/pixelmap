@@ -1,26 +1,29 @@
 //! The whole reconstruction, from photos to a textured mesh, in one call.
 //!
-//! [`run`] takes photos and intrinsics; [`reconstruct`] starts from mappings that already
+//! [`run`] takes photos and [`Options`]; [`reconstruct`] starts from mappings that already
 //! exist, which is how the synthetic tests feed it exact correspondences. Both report every
-//! stage through the progress callback, with a one-line summary as each stage finishes,
-//! and stop at the next stage boundary when the callback returns `Break`.
+//! stage through the event callback and stop when it returns `Break`.
 //!
-//! Everything computed along the way is returned, not only the mesh. A reconstruction
-//! that went wrong is diagnosed from its intermediates.
+//! [`Model`] carries what a caller came for — the mesh, its texture, and which photos made
+//! it. Everything else computed along the way is behind [`Model::diagnostics`]: a
+//! reconstruction that went wrong is diagnosed from its intermediates, but most callers
+//! never look.
 
 use std::sync::Arc;
 
-use pixelmap::{Photo, Quality, DEFAULT_SEED};
+use pixelmap::Photo;
 
 use crate::ba;
 use crate::calib::{FocalSource, Intrinsics};
 use crate::depth::{self, DepthMap, DepthStats};
 use crate::error::Error;
+use crate::event::{emit, report, Event, Flow, Level, Stage};
 use crate::fusion::{self, Fused};
-use crate::input;
+use crate::input::{self, MIN_VIEWS};
 use crate::lookup::PairLookup;
+use crate::mesh::Mesh;
+use crate::options::Options;
 use crate::pairs::{self, PairGraph, MIN_PAIR_COVERAGE};
-use crate::progress::{Event, Flow, Stage};
 use crate::rng::Rng;
 use crate::sfm::{self, SparseModel};
 use crate::texture::{self, Texture};
@@ -29,41 +32,48 @@ use crate::twoview::{self, Degeneracy, RelativePose, Verdict};
 use crate::types::{PairId, ViewId};
 
 /// Settings for every stage.
+///
+/// Derived from [`Options`]: these are tuning decisions, not choices a caller should have
+/// to make, so they are not part of the crate's contract. There are about fifty of them and
+/// they are meaningful only together. Reachable, and hidden, so that this crate's own tests
+/// can drive a single stage to a chosen outcome; nothing outside should build on it.
+#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct Params {
-    /// How much work pixelmap puts into each pair.
-    pub quality: Quality,
-    /// The seed for pixelmap and for every random choice after it.
     pub seed: u64,
-    /// Two-view geometry.
     pub twoview: twoview::Params,
-    /// Tracks.
     pub tracks: tracks::Params,
-    /// Registration.
     pub sfm: sfm::Params,
-    /// Bundle adjustment. The focal length is refined when this asks for it, and always
-    /// when the intrinsics' focal length was only estimated.
     pub ba: ba::Params,
-    /// Dense depth.
     pub depth: depth::Params,
-    /// Fusion.
     pub fusion: fusion::Params,
-    /// Texturing.
     pub texture: texture::Params,
 }
 
 impl Default for Params {
     fn default() -> Self {
+        Params::from_options(&Options::default())
+    }
+}
+
+impl Params {
+    /// The thresholds a run with these options judges by.
+    pub(crate) fn from_options(options: &Options) -> Self {
         Params {
-            quality: Quality::Low,
-            seed: DEFAULT_SEED,
+            seed: options.resolved_seed(),
             twoview: twoview::Params::default(),
             tracks: tracks::Params::default(),
             sfm: sfm::Params::default(),
-            ba: ba::Params::default(),
+            ba: ba::Params {
+                refine_focal: options.refine_focal,
+                ..ba::Params::default()
+            },
             depth: depth::Params::default(),
             fusion: fusion::Params::default(),
-            texture: texture::Params::default(),
+            texture: texture::Params {
+                max_atlas_size: options.max_texture_size,
+                ..texture::Params::default()
+            },
         }
     }
 }
@@ -79,17 +89,57 @@ pub struct PairReport {
     pub estimate: Result<RelativePose, Degeneracy>,
 }
 
-/// A finished reconstruction and everything computed on the way to it.
+impl PairReport {
+    /// Why this pair could not anchor a registration, if it could not.
+    ///
+    /// A pair is unusable either because no geometry could be estimated at all, or because
+    /// the geometry that was estimated is degenerate. Callers showing a pair's standing
+    /// rarely care which, and this collapses the two.
+    pub fn rejection(&self) -> Option<&Degeneracy> {
+        match &self.estimate {
+            Ok(estimate) => match &estimate.verdict {
+                Verdict::Usable => None,
+                Verdict::Degenerate(reason) => Some(reason),
+            },
+            Err(reason) => Some(reason),
+        }
+    }
+}
+
+/// A finished reconstruction.
 #[derive(Clone, Debug)]
-pub struct Reconstruction {
+pub struct Model {
+    /// The surface, with normals.
+    pub mesh: Mesh,
+    /// Its colour, per vertex and as a texture atlas.
+    pub texture: Texture,
+    /// The camera the later stages used, with the focal length refined if it was.
+    pub intrinsics: Intrinsics,
+    /// How many photos went in.
+    pub views: usize,
+    /// The photos that made it into the model. Shorter than [`Self::views`] when one was
+    /// left out; every such photo was reported as an [`Event::ViewDropped`] as it happened.
+    pub connected: Vec<ViewId>,
+    /// Every pair's two-view geometry, including the pairs that were not usable.
+    pub pairs: Vec<PairReport>,
+    diagnostics: Box<Diagnostics>,
+}
+
+impl Model {
+    /// Everything computed on the way to the model.
+    ///
+    /// For working out why a reconstruction came out the way it did. Not needed to use the
+    /// result, and boxed so that a caller who never asks does not carry it around.
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+}
+
+/// The intermediates a reconstruction passed through.
+#[derive(Clone, Debug)]
+pub struct Diagnostics {
     /// The photos' dimensions.
     pub size: (usize, usize),
-    /// The intrinsics the later stages used, with the focal length refined if it was.
-    pub intrinsics: Intrinsics,
-    /// The views linked by well-mapped pairs.
-    pub connected: Vec<ViewId>,
-    /// Every pair's two-view geometry.
-    pub pairs: Vec<PairReport>,
     /// The tracks.
     pub tracks: Vec<Track>,
     /// The cameras and points as registered, before bundle adjustment.
@@ -102,30 +152,55 @@ pub struct Reconstruction {
     pub depth: Vec<DepthMap>,
     /// Where each view's depth samples were lost.
     pub depth_stats: Vec<DepthStats>,
-    /// The fused surface.
-    pub fused: Fused,
-    /// The surface's colour.
-    pub texture: Texture,
+    /// The voxel edge length fusion used, in reconstruction units.
+    pub voxel_size: f64,
+    /// Allocated blocks of 8³ voxels.
+    pub blocks: usize,
+    /// The share of triangles in the largest connected piece, before small pieces were
+    /// dropped.
+    pub largest_component: f64,
+    /// Triangles dropped with the small pieces.
+    pub dropped_triangles: usize,
 }
 
 /// Reconstructs a textured mesh from `photos`.
+///
+/// The photos must all come from one camera at one fixed zoom, and there must be at least
+/// [`MIN_VIEWS`] of them. `on_event` hears about every stage and can stop the run by
+/// returning [`Flow::Break`](std::ops::ControlFlow::Break).
 ///
 /// # Errors
 /// Any [`Error`]; each one names the stage that failed and why.
 pub fn run(
     photos: &[Arc<Photo>],
-    intrinsics: &Intrinsics,
-    params: &Params,
+    options: &Options,
     on_event: &mut dyn FnMut(Event) -> Flow,
-) -> Result<Reconstruction, Error> {
-    let (width, height) = input::validate(photos, intrinsics)?;
+) -> Result<Model, Error> {
+    // The camera depends on the photos' dimensions and validation depends on the camera,
+    // so take the dimensions from the first photo and let validation judge the rest.
+    let first = photos.first().ok_or(Error::TooFewPhotos {
+        found: 0,
+        minimum: MIN_VIEWS,
+    })?;
+    let intrinsics = options.focal.intrinsics(first.width(), first.height());
+
+    let (width, height) = input::validate(photos, &intrinsics)?;
+    emit(
+        on_event,
+        Event::Started {
+            views: photos.len(),
+            pairs: PairId::count(photos.len()),
+        },
+    )?;
     report(
         on_event,
         Stage::Input,
+        1.0,
         format!("{} photos at {width}×{height}", photos.len()),
     )?;
-    let graph = pairs::compute(photos, params.quality, params.seed, on_event)?;
-    reconstruct(&graph, photos, intrinsics, params, on_event)
+
+    let graph = pairs::compute(photos, options.quality, options.resolved_seed(), on_event)?;
+    reconstruct(&graph, photos, &intrinsics, options, on_event)
 }
 
 /// Reconstructs a textured mesh from mappings already computed between `photos`.
@@ -139,9 +214,36 @@ pub fn reconstruct<L: PairLookup>(
     graph: &PairGraph<L>,
     photos: &[Arc<Photo>],
     intrinsics: &Intrinsics,
+    options: &Options,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<Model, Error> {
+    reconstruct_with_params(
+        graph,
+        photos,
+        intrinsics,
+        &Params::from_options(options),
+        on_event,
+    )
+}
+
+/// [`reconstruct`], with every stage's thresholds given outright.
+///
+/// For this crate's own tests, which drive one stage to a chosen outcome. Not part of the
+/// contract; use [`reconstruct`].
+///
+/// # Errors
+/// As [`reconstruct`].
+///
+/// # Panics
+/// If `graph` does not span exactly the views in `photos`.
+#[doc(hidden)]
+pub fn reconstruct_with_params<L: PairLookup>(
+    graph: &PairGraph<L>,
+    photos: &[Arc<Photo>],
+    intrinsics: &Intrinsics,
     params: &Params,
     on_event: &mut dyn FnMut(Event) -> Flow,
-) -> Result<Reconstruction, Error> {
+) -> Result<Model, Error> {
     assert_eq!(
         graph.views(),
         photos.len(),
@@ -151,21 +253,20 @@ pub fn reconstruct<L: PairLookup>(
     let precision = graph.precision_px() as f64;
 
     let connected = pairs::require_connected(graph, MIN_PAIR_COVERAGE)?;
-    if connected.len() < graph.views() {
-        let dropped: Vec<String> = (0..graph.views() as u32)
-            .map(ViewId)
-            .filter(|v| !connected.contains(v))
-            .map(|v| v.to_string())
-            .collect();
-        report(
-            on_event,
-            Stage::Pairs,
-            format!(
-                "leaving out {}: no pair with at least {:.0}% coverage links it to the others",
-                dropped.join(", "),
-                MIN_PAIR_COVERAGE * 100.0
-            ),
-        )?;
+    for view in (0..graph.views() as u32).map(ViewId) {
+        if !connected.contains(&view) {
+            emit(
+                on_event,
+                Event::ViewDropped {
+                    stage: Stage::Pairs,
+                    view,
+                    reason: format!(
+                        "no pair with at least {:.0}% coverage links it to the others",
+                        MIN_PAIR_COVERAGE * 100.0
+                    ),
+                },
+            )?;
+        }
     }
 
     let root = Rng::new(params.seed);
@@ -180,29 +281,40 @@ pub fn reconstruct<L: PairLookup>(
             &params.twoview,
             &mut root.derive(index as u64),
         );
-        let summary = match &estimate {
-            Ok(r) => match &r.verdict {
-                Verdict::Usable => format!(
-                    "{pair}: usable; {:.0}% mapped, {:.0}% of matches agree, {:.1}° between rays",
-                    r.coverage * 100.0,
-                    r.inlier_ratio * 100.0,
-                    r.median_angle_deg
-                ),
-                Verdict::Degenerate(reason) => format!("{pair}: not usable, {reason}"),
-            },
-            Err(reason) => format!("{pair}: not usable, {reason}"),
-        };
-        crate::progress::report(
-            on_event,
-            Stage::TwoView,
-            (index + 1) as f32 / total as f32,
-            summary,
-        )?;
-        pair_reports.push(PairReport {
+        let outcome = PairReport {
             pair,
             coverage: lookup.coverage(),
             estimate,
-        });
+        };
+        match outcome.rejection() {
+            Some(reason) => emit(
+                on_event,
+                Event::PairRejected {
+                    pair,
+                    index,
+                    of: total,
+                    reason: reason.clone(),
+                },
+            )?,
+            None => {
+                let estimate = outcome
+                    .estimate
+                    .as_ref()
+                    .expect("a pair with nothing against it has an estimate");
+                report(
+                    on_event,
+                    Stage::TwoView,
+                    (index + 1) as f32 / total as f32,
+                    format!(
+                        "{pair}: usable; {:.0}% mapped, {:.0}% of matches agree, {:.1}° between rays",
+                        estimate.coverage * 100.0,
+                        estimate.inlier_ratio * 100.0,
+                        estimate.median_angle_deg
+                    ),
+                )?;
+            }
+        }
+        pair_reports.push(outcome);
     }
     let relative: Vec<RelativePose> = pair_reports
         .iter()
@@ -216,6 +328,7 @@ pub fn reconstruct<L: PairLookup>(
     report(
         on_event,
         Stage::Tracks,
+        1.0,
         format!(
             "{} tracks, {multi} of them seen in three or more views",
             tracks.len()
@@ -240,15 +353,24 @@ pub fn reconstruct<L: PairLookup>(
         on_event,
     )
     .map_err(|error| explain_no_usable_pair(error, &pair_reports))?;
-    // A view that was left out has already been reported, as it happened.
     for warning in &registered.warnings {
-        if !matches!(warning, sfm::Warning::Unregistered { .. }) {
-            report(on_event, Stage::Registration, format!("warning: {warning}"))?;
+        match warning {
+            // A view that was left out has already been reported, as it happened.
+            sfm::Warning::Unregistered { .. } => {}
+            other => emit(
+                on_event,
+                Event::Log {
+                    stage: Stage::Registration,
+                    level: Level::Warning,
+                    message: other.to_string(),
+                },
+            )?,
         }
     }
     report(
         on_event,
         Stage::Registration,
+        1.0,
         format!(
             "{} of {} views placed, starting from {}; {} points",
             registered.registered().len(),
@@ -283,7 +405,7 @@ pub fn reconstruct<L: PairLookup>(
             intrinsics.fx, refined.fx
         );
     }
-    report(on_event, Stage::BundleAdjustment, summary)?;
+    report(on_event, Stage::BundleAdjustment, 1.0, summary)?;
 
     let (maps, depth_stats) = depth::estimate_with_progress(
         graph,
@@ -297,6 +419,7 @@ pub fn reconstruct<L: PairLookup>(
     report(
         on_event,
         Stage::Depth,
+        1.0,
         format!(
             "{:.0}% of samples have a depth, one sample every {} px",
             valid * 100.0,
@@ -304,21 +427,28 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    let fused =
-        fusion::fuse_with_progress(&maps, &adjusted.cameras, &refined, &params.fusion, on_event)?;
+    // Taken apart rather than kept whole: the mesh belongs to the model, and copying it
+    // into the diagnostics as well would duplicate megabytes for nothing.
+    let Fused {
+        mesh,
+        voxel_size,
+        blocks,
+        largest_component,
+        dropped_triangles,
+    } = fusion::fuse_with_progress(&maps, &adjusted.cameras, &refined, &params.fusion, on_event)?;
     report(
         on_event,
         Stage::Fusion,
+        1.0,
         format!(
-            "{} vertices, {} triangles, voxel size {:.4}",
-            fused.mesh.positions.len(),
-            fused.mesh.triangles.len(),
-            fused.voxel_size
+            "{} vertices, {} triangles, voxel size {voxel_size:.4}",
+            mesh.positions.len(),
+            mesh.triangles.len()
         ),
     )?;
 
     let texture = texture::build_with_progress(
-        &fused.mesh,
+        &mesh,
         &adjusted.cameras,
         &refined,
         photos,
@@ -329,6 +459,7 @@ pub fn reconstruct<L: PairLookup>(
     report(
         on_event,
         Stage::Texture,
+        1.0,
         format!(
             "{} charts in a {}×{} atlas",
             texture.charts,
@@ -337,29 +468,27 @@ pub fn reconstruct<L: PairLookup>(
         ),
     )?;
 
-    Ok(Reconstruction {
-        size,
+    Ok(Model {
+        mesh,
+        texture,
         intrinsics: refined,
+        views: graph.views(),
         connected,
         pairs: pair_reports,
-        tracks,
-        registered,
-        adjusted,
-        adjustment,
-        depth: maps,
-        depth_stats,
-        fused,
-        texture,
+        diagnostics: Box::new(Diagnostics {
+            size,
+            tracks,
+            registered,
+            adjusted,
+            adjustment,
+            depth: maps,
+            depth_stats,
+            voxel_size,
+            blocks,
+            largest_component,
+            dropped_triangles,
+        }),
     })
-}
-
-/// Reports a stage as finished.
-fn report(
-    on_event: &mut dyn FnMut(Event) -> Flow,
-    stage: Stage,
-    message: String,
-) -> Result<(), Error> {
-    crate::progress::report(on_event, stage, 1.0, message)
 }
 
 /// Registration only sees the pairs two-view geometry could estimate. When none was
@@ -369,16 +498,7 @@ fn explain_no_usable_pair(error: Error, reports: &[PairReport]) -> Error {
         Error::NoUsablePair { .. } => Error::NoUsablePair {
             reasons: reports
                 .iter()
-                .filter_map(|r| {
-                    let reason = match &r.estimate {
-                        Ok(estimate) => match &estimate.verdict {
-                            Verdict::Usable => return None,
-                            Verdict::Degenerate(reason) => reason.to_string(),
-                        },
-                        Err(reason) => reason.to_string(),
-                    };
-                    Some((r.pair, reason))
-                })
+                .filter_map(|r| Some((r.pair, r.rejection()?.to_string())))
                 .collect(),
         },
         other => other,
