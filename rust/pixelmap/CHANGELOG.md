@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.3.0 - 2026-09-17
+## 0.3.0 - 2026-09-24
 
 ### Added
 
@@ -14,6 +14,19 @@ All notable changes to this crate are documented here. The format follows
   problem with the input, and a caller asking a run to stop is not one. A run is abandoned
   only between schedule steps, so a `Break` waits at most one step.
   `run_with_progress` now delegates to it with a callback that never breaks.
+
+### Changed
+
+- Faster and leaner, with output unchanged: for the same input and seed the dense map is
+  bit-identical to 0.2.0 at every `Quality`. The forward and backward solvers now run
+  concurrently, descriptor rows are streamed into the matcher instead of being held all at
+  once, the packed photo words are shared between the passes that read them, `prepare()`
+  drops the original photos once they are no longer needed, and `scaled_to_width` runs in
+  parallel. The kd-tree keeps only one point per distinct descriptor key: flat image
+  regions produce the same key hundreds of thousands of times, and every query landing on
+  it had to visit all of them, which made matching quadratic. On one pair of test photos
+  `High` went from 9.2 s to 4.8 s and from 318 MB to 215 MB peak memory; on a pair with
+  large flat regions it went from 93 s to 2.8 s.
 
 ## 0.2.0 - 2026-09-07
 
