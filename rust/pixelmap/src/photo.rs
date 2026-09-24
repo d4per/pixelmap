@@ -220,61 +220,56 @@ impl Photo {
         let scale_factor = new_width as f32 / self.width as f32;
         let new_height = (self.height as f32 * scale_factor).round() as usize;
 
-        // Create a new vector to store the pixel data (RGBA) for the scaled image
-        let mut new_img_data = vec![0u8; new_width * new_height * 4];
+        // The inclusive range of source pixels, along one axis, that output pixel `i`
+        // averages. Both ends need clamping, not just the far one: when upscaling, `start`
+        // can also land past the last pixel, and an inclusive range whose start exceeds
+        // its end is empty — leaving the pixel count at zero and dividing by it below.
+        // Clamping `end` up to `start` keeps every output pixel backed by at least one
+        // source pixel.
+        let span = |i: usize, len: usize| -> (usize, usize) {
+            let start = ((i as f32) / scale_factor).round() as usize;
+            let end = (((i + 1) as f32) / scale_factor).round() as usize;
+            let start = start.min(len - 1);
+            (start, end.min(len - 1).max(start))
+        };
+        // Every row uses the same column ranges, so they are worked out once rather than
+        // once per output pixel.
+        let columns: Vec<(usize, usize)> = (0..new_width).map(|x| span(x, self.width)).collect();
 
-        // Iterate over each pixel in the new image
-        for new_y in 0..new_height {
-            for new_x in 0..new_width {
-                // Calculate which portion of the original image this new pixel corresponds to
-                let orig_x_start = ((new_x as f32) / scale_factor).round() as usize;
-                let orig_y_start = ((new_y as f32) / scale_factor).round() as usize;
-                let orig_x_end = (((new_x + 1) as f32) / scale_factor).round() as usize;
-                let orig_y_end = (((new_y + 1) as f32) / scale_factor).round() as usize;
-
-                // Ensure that the indices are within the original image's bounds.
-                // Both ends need clamping, not just the far one: when upscaling, `start`
-                // can also land past the last column, and an inclusive range whose start
-                // exceeds its end is empty — leaving `pixel_count` at zero and dividing
-                // by it below. Clamping `end` up to `start` keeps every output pixel
-                // backed by at least one source pixel.
-                let orig_x_start = orig_x_start.min(self.width - 1);
-                let orig_y_start = orig_y_start.min(self.height - 1);
-                let orig_x_end = orig_x_end.min(self.width - 1).max(orig_x_start);
-                let orig_y_end = orig_y_end.min(self.height - 1).max(orig_y_start);
-
-                // Accumulators for RGBA values, plus a pixel count
-                let mut r_total: u32 = 0;
-                let mut g_total: u32 = 0;
-                let mut b_total: u32 = 0;
-                let mut a_total: u32 = 0;
-                let mut pixel_count: u32 = 0;
-
-                // Iterate over the block of original pixels that map to this new pixel
-                for orig_y in orig_y_start..=orig_y_end {
-                    for orig_x in orig_x_start..=orig_x_end {
-                        let orig_index = (orig_y * self.width + orig_x) * 4;
-                        r_total += self.img_data[orig_index] as u32;
-                        g_total += self.img_data[orig_index + 1] as u32;
-                        b_total += self.img_data[orig_index + 2] as u32;
-                        a_total += self.img_data[orig_index + 3] as u32;
-                        pixel_count += 1;
+        // Each output pixel is the plain average of its source block, RGBA alike.
+        let fill_row = |new_y: usize, out: &mut [u8]| {
+            let (y_start, y_end) = span(new_y, self.height);
+            for (pixel, &(x_start, x_end)) in out.chunks_exact_mut(4).zip(&columns) {
+                let mut total = [0u32; 4];
+                for orig_y in y_start..=y_end {
+                    let row = orig_y * self.width;
+                    let block = &self.img_data[(row + x_start) * 4..(row + x_end + 1) * 4];
+                    for source in block.chunks_exact(4) {
+                        for c in 0..4 {
+                            total[c] += source[c] as u32;
+                        }
                     }
                 }
-
-                // Compute the average color value for each channel
-                let r_avg = (r_total / pixel_count) as u8;
-                let g_avg = (g_total / pixel_count) as u8;
-                let b_avg = (b_total / pixel_count) as u8;
-                let a_avg = (a_total / pixel_count) as u8;
-
-                // Store the pixel value in the new image
-                let new_index = (new_y * new_width + new_x) * 4;
-                new_img_data[new_index] = r_avg;
-                new_img_data[new_index + 1] = g_avg;
-                new_img_data[new_index + 2] = b_avg;
-                new_img_data[new_index + 3] = a_avg; // Preserve the alpha channel
+                let pixel_count = ((y_end - y_start + 1) * (x_end - x_start + 1)) as u32;
+                for c in 0..4 {
+                    pixel[c] = (total[c] / pixel_count) as u8;
+                }
             }
+        };
+
+        // Rows are independent, so they can be filled on any thread in any order.
+        let mut new_img_data = vec![0u8; new_width * new_height * 4];
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            new_img_data
+                .par_chunks_mut(new_width * 4)
+                .enumerate()
+                .for_each(|(y, out)| fill_row(y, out));
+        }
+        #[cfg(not(feature = "parallel"))]
+        for (y, out) in new_img_data.chunks_mut(new_width * 4).enumerate() {
+            fill_row(y, out);
         }
 
         // Return the scaled image as a new Photo structure

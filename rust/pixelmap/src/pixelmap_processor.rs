@@ -1,10 +1,13 @@
 //! The pipeline driver behind [`crate::Correspondence`].
 
-use crate::circular_feature_descriptor_matcher::CircularFeatureDescriptorMatcher;
-use crate::circular_feature_grid;
+use crate::circular_feature_descriptor_matcher::{
+    CircularFeatureDescriptorMatcher, DEFAULT_MATCH_STRIDE,
+};
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
+use crate::correspondence_scoring::PackedPhoto;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
+use crate::processing_mode::IterationParams;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,11 +26,12 @@ pub const DEFAULT_SEED: u64 = 0x5049_5845_4C4D_4150; // "PIXELMAP"
 /// 3. Iterative refinement steps that remove outliers, smooth the mappings, and further optimize.
 /// 4. Producing final [DensePhotoMap]s describing forward (`photo1` → `photo2`) and backward (`photo2` → `photo1`) transformations.
 pub struct PixelMapProcessor {
-    /// The first image to be matched/registered.
-    photo1: Arc<Photo>,
+    /// The two full-resolution images to be matched, until [`Self::prepare`] has
+    /// scaled everything the run will need from them and let them go.
+    sources: Option<(Arc<Photo>, Arc<Photo>)>,
 
-    /// The second image to be matched/registered.
-    photo2: Arc<Photo>,
+    /// Width of the full-resolution images, which outlives them.
+    source_width: usize,
 
     /// An algorithm that manages local transformations and outlier filtering
     /// from `photo1` to `photo2`.
@@ -57,7 +61,10 @@ pub struct PixelMapProcessor {
     /// from full resolution, even though the schedule only ever asks for three distinct
     /// widths and the two managers of one iteration need the very same pair of images
     /// with their roles swapped. At `high` that was 52 resamples of a 4096x2304 source.
-    scaled: HashMap<(usize, usize), Arc<Photo>>,
+    ///
+    /// Each entry carries its packed words as well (see [`PackedPhoto`]), so both solvers
+    /// of every step at that width share one copy instead of packing their own.
+    scaled: HashMap<(usize, usize), PackedPhoto>,
 }
 
 impl PixelMapProcessor {
@@ -97,8 +104,8 @@ impl PixelMapProcessor {
         let dummy_photo = Photo::default();
 
         PixelMapProcessor {
-            photo1,
-            photo2,
+            source_width: photo1.width,
+            sources: Some((photo1, photo2)),
             ocm_manager1: CorrespondenceMappingAlgorithm::new(
                 photo_width,
                 &dummy_photo,
@@ -136,54 +143,69 @@ impl PixelMapProcessor {
 
     /// Returns `photo1` (`which == 0`) or `photo2` (`which == 1`) scaled to `width`,
     /// computing it at most once per `(photo, width)` pair.
-    fn scaled(&mut self, which: usize, width: usize) -> Arc<Photo> {
+    ///
+    /// # Panics
+    /// If the width was not scaled before [`Self::prepare`] released the sources. Only
+    /// [`crate::Builder`] calls `prepare`, with the whole schedule it is about to run.
+    fn scaled(&mut self, which: usize, width: usize) -> PackedPhoto {
         if let Some(p) = self.scaled.get(&(which, width)) {
             return p.clone();
         }
-        let src = if which == 0 {
-            &self.photo1
-        } else {
-            &self.photo2
-        };
-        let p = Arc::new(src.scaled_to_width(width));
+        let (photo1, photo2) = self
+            .sources
+            .as_ref()
+            .expect("every working width is scaled before the sources are released");
+        let src = if which == 0 { photo1 } else { photo2 };
+        let p = PackedPhoto::new(Arc::new(src.scaled_to_width(width)));
         self.scaled.insert((which, width), p.clone());
         p
     }
 
+    /// The width [`Self::init`] works at.
+    fn init_width(&self) -> usize {
+        usize::min(self.initial_photo_width, self.source_width)
+    }
+
+    /// Scales the photos to every width [`Self::init`] and `steps` will ask for, then
+    /// drops the full-resolution originals.
+    ///
+    /// Those are by far the largest buffers of a run — 75 MB for a 4096x2304 pair — and
+    /// nothing reads them once each working width has been made, so holding them for the
+    /// whole run only raised the peak. They are freed only if this processor held the
+    /// last reference to them.
+    pub(crate) fn prepare(&mut self, steps: &[IterationParams]) {
+        let widths = std::iter::once(self.init_width()).chain(steps.iter().map(|s| s.photo_width));
+        for width in widths {
+            self.scaled(0, width);
+            self.scaled(1, width);
+        }
+        self.sources = None;
+    }
+
     /// Performs the initial matching step:
     /// 1. Scales both `photo1` and `photo2` to `initial_photo_width` (if needed).
-    /// 2. Uses `CircularFeatureGrid` to extract circular feature descriptors.
-    /// 3. Matches these descriptors with `CircularFeatureDescriptorMatcher`.
-    /// 4. Initializes new `CorrespondenceMappingAlgorithm` instances with the matched points.
-    /// 5. Runs both correspondence managers until completion.
+    /// 2. Extracts circular feature descriptors and matches them with
+    ///    `CircularFeatureDescriptorMatcher`.
+    /// 3. Initializes new `CorrespondenceMappingAlgorithm` instances with the matched points.
+    /// 4. Runs both correspondence managers until completion.
     ///
     /// Upon completion, `total_comparisons` is updated with the sum of both managers' comparisons.
     pub fn init(&mut self) {
         // Scale down images if needed.
-        let width = usize::min(self.initial_photo_width, self.photo1.width);
+        let width = self.init_width();
         let photo1scaled = self.scaled(0, width);
         let photo2scaled = self.scaled(1, width);
 
-        // Create circular feature grids.
-        let image1 = circular_feature_grid::CircularFeatureGrid::new(
-            &photo1scaled,
-            photo1scaled.width,
-            photo1scaled.height,
+        // Extract circular feature descriptors and match them across the two images.
+        let pairs = CircularFeatureDescriptorMatcher::match_photos(
+            &photo1scaled.photo,
+            &photo2scaled.photo,
             10,
+            DEFAULT_MATCH_STRIDE,
         );
-        let image2 = circular_feature_grid::CircularFeatureGrid::new(
-            &photo2scaled,
-            photo2scaled.width,
-            photo2scaled.height,
-            10,
-        );
-
-        // Match features across the two scaled images.
-        let circle_area_info_matcher = CircularFeatureDescriptorMatcher::new();
-        let pairs = circle_area_info_matcher.match_areas(&image1, &image2);
 
         // Create new managers for the scaled images.
-        let w = photo1scaled.width;
+        let w = photo1scaled.photo.width;
         let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
         let (seed1, seed2) = (self.next_seed(), self.next_seed());
         let mut ocm_manager1 =
@@ -202,8 +224,7 @@ impl PixelMapProcessor {
         }
 
         // Run both managers to completion.
-        ocm_manager1.run_until_done();
-        ocm_manager2.run_until_done();
+        run_both(&mut ocm_manager1, &mut ocm_manager2);
 
         // Update total comparisons, store the managers.
         self.total_comparisons =
@@ -249,8 +270,10 @@ impl PixelMapProcessor {
         pm2.remove_outliers(&pm1, clean_max_dist);
 
         // Smooth the remaining mapping.
-        let pm1_smooth = pm1.smooth_grid_points_n_times(smooth_iterations);
-        let pm2_smooth = pm2.smooth_grid_points_n_times(smooth_iterations);
+        let (pm1_smooth, pm2_smooth) = join(
+            || pm1.smooth_grid_points_n_times(smooth_iterations),
+            || pm2.smooth_grid_points_n_times(smooth_iterations),
+        );
 
         // Re-initialize managers with the smoothed maps.
         let (s1, s2) = (self.scaled(0, photo_width), self.scaled(1, photo_width));
@@ -273,8 +296,7 @@ impl PixelMapProcessor {
         ocm_manager2.init_from_photomapping(&pm2_smooth);
 
         // Run again with the updated maps.
-        ocm_manager1.run_until_done();
-        ocm_manager2.run_until_done();
+        run_both(&mut ocm_manager1, &mut ocm_manager2);
 
         // Accumulate total comparisons.
         self.total_comparisons +=
@@ -313,16 +335,45 @@ impl PixelMapProcessor {
     /// # Returns
     /// The fraction of valid cells in the forward map, a value between 0.0 and 1.0.
     pub fn matched_area(&self) -> f32 {
-        let pm1 = self.ocm_manager1.get_photo_mapping();
-        let pm2 = self.ocm_manager2.get_photo_mapping();
-
-        // Clone to avoid mutating the originals during outlier removal.
-        let mut pm1 = pm1.clone();
-        let mut pm2 = pm2.clone();
+        // `get_photo_mapping` builds fresh maps, so cleaning them leaves the managers alone.
+        let mut pm1 = self.ocm_manager1.get_photo_mapping();
+        let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
         pm1.remove_outliers(&pm2, 2.0);
         pm2.remove_outliers(&pm1, 2.0);
 
         pm1.calculate_used_area()
     }
+}
+
+/// Runs the forward and the backward solver to completion, side by side when the
+/// `parallel` feature is on.
+///
+/// The two share nothing mutable — each owns its grid, its queue and its RNG stream, and
+/// the photos they read are immutable — so running them at once changes only when the
+/// work happens, not what it computes. The mapping is bit-identical to the serial order.
+fn run_both(a: &mut CorrespondenceMappingAlgorithm, b: &mut CorrespondenceMappingAlgorithm) {
+    join(|| a.run_until_done(), || b.run_until_done());
+}
+
+/// `rayon::join` under the `parallel` feature, and the two closures one after the other
+/// without it — the configuration a `wasm32-unknown-unknown` build uses.
+#[cfg(feature = "parallel")]
+fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    rayon::join(a, b)
+}
+
+#[cfg(not(feature = "parallel"))]
+fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA,
+    B: FnOnce() -> RB,
+{
+    (a(), b())
 }
