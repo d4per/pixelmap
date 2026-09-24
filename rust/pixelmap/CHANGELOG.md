@@ -4,6 +4,17 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0 - 2026-09-17
+
+### Added
+
+- `Builder::run_with_control`, which runs the pipeline with a progress callback that can
+  stop it. Returning `ControlFlow::Break(())` abandons the run and yields `Ok(None)`.
+  Cancellation is deliberately not an `Error` variant: every one of those describes a
+  problem with the input, and a caller asking a run to stop is not one. A run is abandoned
+  only between schedule steps, so a `Break` waits at most one step.
+  `run_with_progress` now delegates to it with a callback that never breaks.
+
 ## 0.2.0 - 2026-09-07
 
 Fixes the unmapped bands that could open up in the correspondence grid, and the dead

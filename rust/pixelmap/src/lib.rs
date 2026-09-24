@@ -60,6 +60,12 @@
 //! **Threading.** Everything the caller holds is `Send + Sync`, so a mapping can be
 //! computed on a worker thread and the result shared afterwards.
 //!
+//! **Progress and cancelling.** [`Builder::run_with_progress`] reports a [`Progress`] after
+//! the initial matching pass and after every schedule step;
+//! [`Builder::run_with_control`] additionally lets the callback stop the run, which comes
+//! back as `Ok(None)`. A run is abandoned only between steps, so a `Break` waits at most
+//! one schedule step.
+//!
 //! **Cost.** Roughly linear in pixels at the working resolution, times the number of
 //! schedule steps. See [`Quality`].
 //!

@@ -69,6 +69,24 @@ reduced resolution internally; `forward()` and `backward()` expose those raw gri
 `Builder::schedule` takes an explicit list of `IterationParams` for callers tuning the
 algorithm itself.
 
+## Progress and cancelling
+
+`Builder::run_with_progress` reports a `Progress` after the initial matching pass and after
+every schedule step. `Builder::run_with_control` does the same but lets the callback return
+`ControlFlow::Break(())` to abandon the run, which comes back as `Ok(None)`:
+
+```rust,no_run
+let mapping = Correspondence::builder()
+    .run_with_control(a, b, |p| {
+        if stop_requested() { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    })?;
+```
+
+A stopped run is not an error — nothing about the input was wrong — so it is an `Option`
+rather than an `Error` variant. A run is abandoned only between steps, so a `Break` waits at
+most one schedule step; the final steps of `High` work at 1600 px and are the slowest.
+Cancelling discards the work done so far: there is no partial mapping.
+
 ## Reproducibility
 
 The order in which the solver drains its queue decides which local optimum the relaxation

@@ -1,0 +1,28 @@
+[package]
+name = "pixelmap_multiview_cli"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pixelmap_multiview = { path = "../multiview", version = "0.1.0", default-features = false }
+pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
+# Comparing estimated rotations with the ground truth of synthetic scenes.
+nalgebra = "0.33"
+clap = { version = "4.5.27", features = ["derive"] }
+# Only the codecs this tool actually reads and writes: the default feature set pulls in
+# every format image supports, including an AVIF encoder with a heavy C-adjacent tree.
+# Upper-bounded: image 0.25.10 depends on a `zune-core` release that does not exist.
+image = { version = ">=0.25, <0.25.10", default-features = false, features = ["jpeg", "png"] }
+# Focal length and orientation, read from the file bytes: decoding throws EXIF away.
+kamadak-exif = "0.6"
+
+[features]
+default = ["parallel", "threads"]
+parallel = ["pixelmap_multiview/parallel", "pixelmap/parallel"]
+# `Job`, which `--cancel-after` runs the reconstruction on so it can be stopped partway.
+threads = ["pixelmap_multiview/threads"]
+
+[[bin]]
+name = "pixelmap-multiview"
+path = "src/main.rs"

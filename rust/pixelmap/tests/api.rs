@@ -1,6 +1,7 @@
 //! Integration tests exercising the crate the way a downstream user would: only through
 //! its public API, with no access to internals.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use pixelmap::{
@@ -663,6 +664,68 @@ fn small_photos_do_not_panic_when_the_schedule_upscales_them() {
         mapping.working_scale() > 1.0,
         "this case should be an upscale"
     );
+}
+
+/// A callback that asks to stop abandons the run, and says so with `None` rather than an
+/// error: nothing about the input was wrong.
+#[test]
+fn a_run_stops_when_the_callback_breaks() {
+    let (photo1, photo2) = shifted_pair(64, 48, 3, 2);
+    let mut seen = 0;
+    let mapping = Correspondence::builder()
+        .run_with_control(photo1, photo2, |_| {
+            seen += 1;
+            ControlFlow::Break(())
+        })
+        .expect("stopping is not a failure of the input");
+
+    assert!(mapping.is_none(), "a stopped run has no mapping to give");
+    assert_eq!(seen, 1, "the run should stop at the first opportunity");
+}
+
+/// Stopping partway through the schedule works too, not only before the first step.
+#[test]
+fn a_run_can_be_stopped_partway_through_the_schedule() {
+    let (photo1, photo2) = shifted_pair(64, 48, 3, 2);
+    let mut seen = 0;
+    let mapping = Correspondence::builder()
+        .run_with_control(photo1, photo2, |p| {
+            seen += 1;
+            if p.step >= 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .expect("stopping is not a failure of the input");
+
+    assert!(mapping.is_none());
+    assert_eq!(seen, 3);
+}
+
+/// `run_with_progress` delegates to `run_with_control` with a callback that never breaks,
+/// and relies on that to unwrap the result. Guard both halves of that: the run finishes,
+/// and it still gives the same mapping as the plain form.
+#[test]
+fn a_callback_that_never_breaks_finishes_the_run() {
+    let (photo1, photo2) = shifted_pair(64, 48, 3, 2);
+    let controlled = Correspondence::builder()
+        .seed(DEFAULT_SEED)
+        .run_with_control(
+            photo1.clone(),
+            photo2.clone(),
+            |_| ControlFlow::Continue(()),
+        )
+        .expect("synthetic photos are valid input")
+        .expect("a callback that never breaks cannot stop the run");
+    let plain = run(photo1, photo2, DEFAULT_SEED);
+
+    assert_eq!(
+        controlled.forward().grid_dimensions(),
+        plain.forward().grid_dimensions()
+    );
+    assert_eq!(controlled.coverage(), plain.coverage());
+    assert_eq!(controlled.lookup(20.0, 15.0), plain.lookup(20.0, 15.0));
 }
 
 /// The progress callback fires once per schedule step, and reaches 1.0.

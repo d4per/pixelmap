@@ -31,6 +31,7 @@ jobs:
       - run: cargo test --workspace
       # The serial fallback has to stay correct: it is what wasm builds use.
       - run: cargo test -p pixelmap --no-default-features
+      - run: cargo test -p pixelmap_multiview --no-default-features
       - run: cargo test -p pixelmap --all-features
 
   msrv:
@@ -72,6 +73,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p pixelmap --all-features --all-targets -- -D warnings
       - run: cargo clippy -p pixelmap --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p pixelmap_multiview --no-default-features --all-targets -- -D warnings
 
   wasm:
     name: wasm32
@@ -86,6 +88,11 @@ jobs:
           workspaces: rust
       # No threads there, so the matcher's serial fallback is the only option.
       - run: cargo build -p pixelmap --no-default-features --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: ""
+      # The reconstruction library has to stay free of anything that cannot run in a
+      # browser: it is what a wasm frontend will be built on.
+      - run: cargo build -p pixelmap_multiview --no-default-features --target wasm32-unknown-unknown
         env:
           RUSTFLAGS: ""
 

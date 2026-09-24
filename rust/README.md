@@ -1,6 +1,6 @@
 # Rust implementation of the PIXELMAP framework
 
-The workspace contains four crates:
+The workspace contains six crates:
 
 - `pixelmap` — the library implementing the framework. This is the part published to
   [crates.io](https://crates.io/crates/pixelmap); see [pixelmap/README.md](pixelmap/README.md)
@@ -9,7 +9,12 @@ The workspace contains four crates:
   mesh and writes it as X3D. Kept out of the published library: it consumes the
   algorithm rather than being part of it, and it is the only crate here that needs a
   linear-algebra dependency.
+- `multiview` — `pixelmap_multiview`, 3D reconstruction from three or more photos: every
+  pair is mapped, the cameras are registered into one frame, and the views are fused into
+  one mesh. Under construction; see [multiview/README.md](multiview/README.md).
 - `command_line_tool` — the `pixelmap` binary, which writes interpolated images to disc.
+- `multiview_cli` — the `pixelmap-multiview` binary, which runs `pixelmap_multiview` on
+  photos from disc.
 - `viewer` — the `pixelmap-viewer` binary, which animates the interpolation in a window.
 
 ## Using the library
