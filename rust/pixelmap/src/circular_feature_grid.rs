@@ -4,11 +4,14 @@ use crate::photo::Photo;
 /// A grid that computes and stores `CircularFeatureDescriptor` values for each
 /// (x, y) location in an image. Each descriptor captures the "center of mass"
 /// of the R/G/B channels in a circular neighborhood around that point.
+#[cfg(any(test, feature = "bench"))]
 pub struct CircularFeatureGrid {
     /// A vector of circular feature descriptors, one per position in the grid.
     feature_descriptors: Vec<CircularFeatureDescriptor>,
 }
 
+#[cfg(any(test, feature = "bench"))]
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 impl CircularFeatureGrid {
     /// Creates a new `CircularFeatureGrid` without manually specifying rotation handling.
     pub fn new(photo: &Photo, width: usize, height: usize, circle_radius: usize) -> Self {
@@ -37,25 +40,13 @@ impl CircularFeatureGrid {
         circle_radius: usize,
         _rotation: bool,
     ) -> Self {
-        let radius = circle_radius as isize;
-
-        // Half-width of the disc for each row, computed once here instead of
-        // being recomputed (with a `sqrt` and a `round`) for every descriptor.
-        let row_half_width: Vec<isize> = (-radius..=radius)
-            .map(|dy| (((radius * radius) as f64 - (dy * dy) as f64).sqrt().round()) as isize)
-            .collect();
-
+        let rows = DescriptorRows::with_size(photo, width, height, circle_radius);
         let mut feature_descriptors = vec![CircularFeatureDescriptor::default(); width * height];
-
-        Self::populate_feature_descriptors(
-            &photo.img_data,
-            width,
-            height,
-            radius,
-            &row_half_width,
-            &mut feature_descriptors,
-        );
-
+        if width > 0 {
+            for (y, out) in feature_descriptors.chunks_exact_mut(width).enumerate() {
+                rows.fill_row(y, out);
+            }
+        }
         CircularFeatureGrid {
             feature_descriptors,
         }
@@ -65,8 +56,54 @@ impl CircularFeatureGrid {
     pub fn get_infos(&self) -> &Vec<CircularFeatureDescriptor> {
         &self.feature_descriptors
     }
+}
 
-    /// Fills in the `feature_descriptors` for every position in the grid.
+/// Computes the descriptors of one image a row at a time, without storing the grid.
+///
+/// Every row is independent of every other — the sliding sums are re-seeded at the start
+/// of each — so rows can be produced in any order, on any thread, into any buffer, and a
+/// caller that only needs part of each row can consume it and throw it away. The matcher
+/// does exactly that; see
+/// [`CircularFeatureDescriptorMatcher::match_photos`](crate::circular_feature_descriptor_matcher::CircularFeatureDescriptorMatcher::match_photos).
+pub(crate) struct DescriptorRows<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    radius: isize,
+    /// Half-width of the disc for each row, computed once here instead of being
+    /// recomputed (with a `sqrt` and a `round`) for every descriptor.
+    row_half_width: Vec<isize>,
+}
+
+impl<'a> DescriptorRows<'a> {
+    /// Descriptors over the whole of `photo`, with discs of `circle_radius`.
+    pub(crate) fn new(photo: &'a Photo, circle_radius: usize) -> Self {
+        Self::with_size(photo, photo.width, photo.height, circle_radius)
+    }
+
+    fn with_size(photo: &'a Photo, width: usize, height: usize, circle_radius: usize) -> Self {
+        let radius = circle_radius as isize;
+        let row_half_width = (-radius..=radius)
+            .map(|dy| (((radius * radius) as f64 - (dy * dy) as f64).sqrt().round()) as isize)
+            .collect();
+        DescriptorRows {
+            data: &photo.img_data,
+            width,
+            height,
+            radius,
+            row_half_width,
+        }
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Writes the descriptors of row `y` into `out`, which must be `width` long.
     ///
     /// Along the interior of a row the disc is *slid* rather than re-walked: consecutive
     /// centres overlap in all but one column per disc row, so [`AbsSums`] can update the
@@ -77,55 +114,56 @@ impl CircularFeatureGrid {
     ///
     /// Only the border ring, where the disc wraps toroidally and the overlap argument
     /// does not hold, still walks the full disc.
-    fn populate_feature_descriptors(
-        data: &[u8],
-        width: usize,
-        height: usize,
-        radius: isize,
-        row_half_width: &[isize],
-        out: &mut [CircularFeatureDescriptor],
-    ) {
-        let (w, h) = (width as isize, height as isize);
+    pub(crate) fn fill_row(&self, y: usize, out: &mut [CircularFeatureDescriptor]) {
+        let (data, radius, row_half_width) = (self.data, self.radius, &self.row_half_width[..]);
+        let (w, h) = (self.width as isize, self.height as isize);
+        let y = y as isize;
+        assert_eq!(
+            out.len(),
+            self.width,
+            "a row buffer must be one image row long"
+        );
         let interior_x = radius < w - radius;
-        for y in 0..h {
-            let interior_row = y >= radius && y < h - radius && interior_x;
-            if !interior_row {
-                for x in 0..w {
-                    let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
-                    out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
-                }
-                continue;
+        let interior_row = y >= radius && y < h - radius && interior_x;
+        let wrapping = |x: isize| {
+            let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
+            Self::finish_descriptor(x, y, sums)
+        };
+        if !interior_row {
+            for x in 0..w {
+                out[x as usize] = wrapping(x);
             }
-            for x in 0..radius {
-                let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
-                out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
-            }
-            // Seed the running sums at the first interior centre of this row.
-            let mut acc = AbsSums::default();
-            for (i, &half) in row_half_width.iter().enumerate() {
-                let py = y + i as isize - radius;
-                for px in (radius - half)..=(radius + half) {
-                    acc.add(px, py, data, w);
-                }
-            }
-            for x in radius..(w - radius) {
-                if x > radius {
-                    // Slide one column right: one pixel out and one in per disc row.
-                    for (i, &half) in row_half_width.iter().enumerate() {
-                        let py = y + i as isize - radius;
-                        acc.sub(x - 1 - half, py, data, w);
-                        acc.add(x + half, py, data, w);
-                    }
-                }
-                out[(x + y * w) as usize] = Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
-            }
-            for x in (w - radius)..w {
-                let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
-                out[(x + y * w) as usize] = Self::finish_descriptor(x, y, sums);
+            return;
+        }
+        for x in 0..radius {
+            out[x as usize] = wrapping(x);
+        }
+        // Seed the running sums at the first interior centre of this row.
+        let mut acc = AbsSums::default();
+        for (i, &half) in row_half_width.iter().enumerate() {
+            let py = y + i as isize - radius;
+            for px in (radius - half)..=(radius + half) {
+                acc.add(px, py, data, w);
             }
         }
+        for x in radius..(w - radius) {
+            if x > radius {
+                // Slide one column right: one pixel out and one in per disc row.
+                for (i, &half) in row_half_width.iter().enumerate() {
+                    let py = y + i as isize - radius;
+                    acc.sub(x - 1 - half, py, data, w);
+                    acc.add(x + half, py, data, w);
+                }
+            }
+            out[x as usize] = Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
+        }
+        for x in (w - radius)..w {
+            out[x as usize] = wrapping(x);
+        }
     }
+}
 
+impl DescriptorRows<'_> {
     /// Accumulates the disc sums for a centre near an edge, wrapping toroidally.
     fn disc_sums_wrapping(
         data: &[u8],
