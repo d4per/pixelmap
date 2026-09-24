@@ -26,13 +26,19 @@ fn reconstruct(set: &SyntheticSet) -> (Vec<Arc<Photo>>, Model) {
 fn alignment(set: &SyntheticSet, r: &Model) -> align::Similarity {
     let mut estimated = Vec::new();
     let mut expected = Vec::new();
-    let adjusted = &r.diagnostics().expect("a fresh model has diagnostics").adjusted;
+    let adjusted = &r
+        .diagnostics()
+        .expect("a fresh model has diagnostics")
+        .adjusted;
     for view in adjusted.registered() {
         estimated.push(adjusted.cameras[view.index()].unwrap().centre());
         expected.push(set.poses[view.index()].centre());
     }
     for point in &adjusted.points {
-        let track = &r.diagnostics().expect("a fresh model has diagnostics").tracks[point.track];
+        let track = &r
+            .diagnostics()
+            .expect("a fresh model has diagnostics")
+            .tracks[point.track];
         if let Some(surface) =
             set.surface_point(track.anchor, track.observation(track.anchor).unwrap())
         {
@@ -99,7 +105,12 @@ fn the_atlas_holds_the_chosen_photo_under_each_triangle() {
     let mut errors = Vec::new();
     for (f, triangle) in mesh.triangles.iter().enumerate().step_by(7) {
         let view = texture.face_views[f];
-        let pose = r.diagnostics().expect("a fresh model has diagnostics").adjusted.cameras[view.index()].unwrap();
+        let pose = r
+            .diagnostics()
+            .expect("a fresh model has diagnostics")
+            .adjusted
+            .cameras[view.index()]
+        .unwrap();
         for (corner, &v) in triangle.iter().enumerate() {
             let [u, t] = texture.texcoords[texture.face_texcoords[f][corner] as usize];
             let ax = u as f64 * atlas.width() as f64 - 0.5;

@@ -217,7 +217,10 @@ pub fn connected_views<L: PairLookup>(graph: &PairGraph<L>, min_coverage: f32) -
                 }
                 let pair = PairId::new(ViewId(v as u32), ViewId(w as u32))
                     .expect("v is seen and w is not, so they differ");
-                if graph.get(pair).is_some_and(|m| m.coverage() >= min_coverage) {
+                if graph
+                    .get(pair)
+                    .is_some_and(|m| m.coverage() >= min_coverage)
+                {
                     *seen_w = true;
                     members.push(w);
                 }

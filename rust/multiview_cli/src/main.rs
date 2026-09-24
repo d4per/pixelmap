@@ -284,9 +284,7 @@ fn report_truth(truth: &SyntheticSet, model: &Model) {
                 "  {}: rotation off by {:.2}°, translation direction off by {:.2}°",
                 report.pair,
                 angle_between(&pose.rotation, &expected.rotation),
-                pose.translation
-                    .angle(&expected.translation)
-                    .to_degrees()
+                pose.translation.angle(&expected.translation).to_degrees()
             );
         }
     }

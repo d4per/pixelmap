@@ -163,7 +163,10 @@ impl std::fmt::Debug for Job {
         f.debug_struct("Job")
             .field("status", &self.status())
             .field("cancelled", &self.cancel.is_cancelled())
-            .field("finished", &self.worker.as_ref().map_or(true, |w| w.is_finished()))
+            .field(
+                "finished",
+                &self.worker.as_ref().map_or(true, |w| w.is_finished()),
+            )
             .finish_non_exhaustive()
     }
 }

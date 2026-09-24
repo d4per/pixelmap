@@ -6,8 +6,8 @@ use std::sync::Arc;
 use pixelmap::Photo;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::{
-    pipeline, Degeneracy, Error, Event, Flow, Focal, Model, Options, PairGraph, PairLookup, PhotoPx,
-    Stage, ViewId,
+    pipeline, Degeneracy, Error, Event, Flow, Focal, Model, Options, PairGraph, PairLookup,
+    PhotoPx, Stage, ViewId,
 };
 
 const WIDTH: usize = 320;

@@ -105,11 +105,7 @@ pub struct PairReport {
 }
 
 impl PairReport {
-    fn new(
-        pair: PairId,
-        coverage: f32,
-        estimate: &Result<RelativePose, Degeneracy>,
-    ) -> PairReport {
+    fn new(pair: PairId, coverage: f32, estimate: &Result<RelativePose, Degeneracy>) -> PairReport {
         let (pose, inlier_ratio, median_angle_deg, rejection) = match estimate {
             Ok(e) => match &e.verdict {
                 Verdict::Usable => (
