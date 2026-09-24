@@ -25,6 +25,31 @@ struct Samples {
     len: usize,
 }
 
+/// A working-resolution photo together with its pixels packed one `0x00BBGGRR` word each,
+/// which is the form [`CorrespondenceScoring`] reads.
+///
+/// Packing used to happen inside every scorer, and each schedule step builds two solvers
+/// over the same pair of photos with their roles swapped, so every step packed both
+/// photos twice and kept four copies alive. Carrying the words with the photo lets
+/// [`crate::pixelmap_processor::PixelMapProcessor`] pack each photo once per working
+/// width and share it between both solvers and across steps.
+#[derive(Clone)]
+pub(crate) struct PackedPhoto {
+    pub photo: Arc<Photo>,
+    pub words: Arc<[u32]>,
+}
+
+impl PackedPhoto {
+    pub(crate) fn new(photo: Arc<Photo>) -> Self {
+        let words = photo
+            .img_data
+            .chunks_exact(4)
+            .map(|q| u32::from_le_bytes([q[0], q[1], q[2], 0]))
+            .collect();
+        PackedPhoto { photo, words }
+    }
+}
+
 /// The `CorrespondenceScoring` struct is responsible for evaluating the similarity between two photos
 /// using pixel comparisons within a circular neighborhood. This similarity is computed based on color
 /// differences between corresponding regions of the photos.
@@ -39,9 +64,9 @@ pub struct CorrespondenceScoring {
     /// and two shifts, which matters because the `photo2` side of the inner loop is a
     /// gather: the three bytes were three separate address computations against the same
     /// cache line. Costs one extra copy of each image, which the scoring loop pays back
-    /// immediately.
-    p1_words: Vec<u32>,
-    p2_words: Vec<u32>,
+    /// immediately. Shared with the other solver over the same pair; see [`PackedPhoto`].
+    p1_words: Arc<[u32]>,
+    p2_words: Arc<[u32]>,
     /// Precomputed table of maximum x-offsets for each y-offset in the circular neighborhood.
     sqrt_table: Vec<i32>,
     /// Radius of the circular neighborhood used for comparisons.
@@ -114,7 +139,23 @@ impl CorrespondenceScoring {
     /// This method precomputes a `sqrt_table` to optimize calculations of maximum x-offsets
     /// for each y-offset in the circular neighborhood, packs both images into one word per
     /// pixel, and sizes the sample scratch to the largest disc that can occur.
+    #[cfg(test)]
     pub fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, neighborhood_radius: isize) -> Self {
+        Self::with_packed(
+            PackedPhoto::new(photo1),
+            PackedPhoto::new(photo2),
+            neighborhood_radius,
+        )
+    }
+
+    /// [`Self::new`] over photos whose words are already packed.
+    pub(crate) fn with_packed(
+        packed1: PackedPhoto,
+        packed2: PackedPhoto,
+        neighborhood_radius: isize,
+    ) -> Self {
+        let (photo1, photo2) = (packed1.photo, packed2.photo);
+        let (p1_words, p2_words) = (packed1.words, packed2.words);
         let neighborhood_radius = neighborhood_radius as i32;
         let diameter = (2 * neighborhood_radius + 1) as usize;
         let mut sqrt_table = vec![0i32; diameter];
@@ -134,13 +175,6 @@ impl CorrespondenceScoring {
             "neighborhood_radius {neighborhood_radius} would overflow the i32 accumulators"
         );
 
-        let pack = |p: &Photo| -> Vec<u32> {
-            p.img_data
-                .chunks_exact(4)
-                .map(|q| u32::from_le_bytes([q[0], q[1], q[2], 0]))
-                .collect()
-        };
-        let (p1_words, p2_words) = (pack(&photo1), pack(&photo2));
         let capacity = diameter * diameter;
 
         CorrespondenceScoring {

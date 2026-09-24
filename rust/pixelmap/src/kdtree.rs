@@ -92,6 +92,7 @@ impl KdTree {
     }
 
     fn build_with<const PARALLEL: bool>(mut points: Vec<Point>) -> Self {
+        dedup_keys::<PARALLEL>(&mut points);
         build_recursive::<PARALLEL>(&mut points, 0);
         KdTree { points }
     }
@@ -112,7 +113,7 @@ impl KdTree {
         Some(best)
     }
 
-    /// How many points the tree holds.
+    /// How many points the tree holds: one per distinct key, see [`dedup_keys`].
     #[allow(dead_code)] // Used by tests and by `matcher_bench`.
     pub(crate) fn len(&self) -> usize {
         self.points.len()
@@ -123,6 +124,33 @@ impl KdTree {
     pub(crate) fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
+}
+
+/// Keeps only the lowest-id point of every distinct key.
+///
+/// The others can never be an answer: any query sees them at exactly the same distance as
+/// their lowest-id twin, and [`consider`] breaks that tie in the twin's favour. Dropping
+/// them therefore changes no result — but it changes the cost a great deal. The search has
+/// to explore exact ties (the `<=` prune in [`search_recursive`]), so a query landing on a
+/// key shared by `m` points used to visit all `m`. Flat image regions produce one key
+/// hundreds of thousands of times over, which made the match quadratic: on a 4096x2304 pair
+/// at `high` it took 99 s, against 0.3 s with the duplicates dropped.
+///
+/// Sorting by `(key, id)` puts each run of duplicates together with its lowest id first.
+/// The ids are distinct, so the unstable sort is still a total order and the result is
+/// the same in the serial and parallel builds.
+fn dedup_keys<const PARALLEL: bool>(points: &mut Vec<Point>) {
+    let order = |a: &Point, b: &Point| a.v.cmp(&b.v).then(a.id.cmp(&b.id));
+    #[cfg(feature = "parallel")]
+    if PARALLEL {
+        use rayon::slice::ParallelSliceMut;
+        points.par_sort_unstable_by(order);
+    } else {
+        points.sort_unstable_by(order);
+    }
+    #[cfg(not(feature = "parallel"))]
+    points.sort_unstable_by(order);
+    points.dedup_by(|later, first| later.v == first.v);
 }
 
 /// Arranges `points` so that the median on this level's axis is at the midpoint.

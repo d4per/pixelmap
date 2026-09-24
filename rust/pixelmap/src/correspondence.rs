@@ -194,6 +194,10 @@ impl Builder {
 
     /// Runs the pipeline.
     ///
+    /// Pass the photos by value when you no longer need them: the run scales them to
+    /// its working widths up front and then drops the full-resolution originals, which
+    /// only frees them if no other `Arc` to them is still alive.
+    ///
     /// # Errors
     /// [`Error::SizeMismatch`] if the photos differ in size, [`Error::EmptyPhoto`] or
     /// [`Error::PhotoTooSmall`] if either is unusable.
@@ -239,6 +243,7 @@ impl Builder {
 
         let mut processor =
             PixelMapProcessor::with_seed(photo1, photo2, self.quality.photo_width(), self.seed);
+        processor.prepare(steps);
         processor.init();
         on_progress(Progress { step: 1, total });
 

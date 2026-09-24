@@ -1,6 +1,6 @@
 use crate::ac_grid::ACGrid;
 use crate::affine_transform::AffineTransform;
-use crate::correspondence_scoring::CorrespondenceScoring;
+use crate::correspondence_scoring::{CorrespondenceScoring, PackedPhoto};
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use crate::rng::Rng;
@@ -77,17 +77,17 @@ impl CorrespondenceMappingAlgorithm {
         seed: u64,
     ) -> Self {
         // Scale the original photos to the specified width.
-        let photo1a = Arc::new(photo1.scaled_to_width(photo_width));
-        let photo2a = Arc::new(photo2.scaled_to_width(photo_width));
+        let photo1a = PackedPhoto::new(Arc::new(photo1.scaled_to_width(photo_width)));
+        let photo2a = PackedPhoto::new(Arc::new(photo2.scaled_to_width(photo_width)));
         Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius, seed)
     }
 
     /// Same as [`Self::new`], but takes photos that have already been scaled to the
     /// working width. Callers that build several algorithms over the same pair of
-    /// images can then scale once instead of once per algorithm.
-    pub fn with_scaled(
-        photo1a: Arc<Photo>,
-        photo2a: Arc<Photo>,
+    /// images can then scale and pack once instead of once per algorithm.
+    pub(crate) fn with_scaled(
+        packed1: PackedPhoto,
+        packed2: PackedPhoto,
         grid_cell_size: usize,
         neighborhood_radius: usize,
         seed: u64,
@@ -98,17 +98,18 @@ impl CorrespondenceMappingAlgorithm {
         // column past the image, where `resolve_disc` finds no pixels to score and the
         // cell can never be filled. That dead column and row then took their neighbours
         // with them through `remove_outliers`, and counted against `coverage()` besides.
+        let (photo1a, photo2a) = (packed1.photo.clone(), packed2.photo.clone());
         let grid_width = photo1a.width.saturating_sub(1) / grid_cell_size + 1;
         let grid_height = photo1a.height.saturating_sub(1) / grid_cell_size + 1;
 
         CorrespondenceMappingAlgorithm {
-            photo1: photo1a.clone(),
-            photo2: photo2a.clone(),
+            photo1: photo1a,
+            photo2: photo2a,
             grid_cell_size,
             queue: vec![],
-            scorer: CorrespondenceScoring::new(
-                photo1a.clone(),
-                photo2a.clone(),
+            scorer: CorrespondenceScoring::with_packed(
+                packed1,
+                packed2,
                 neighborhood_radius as isize,
             ),
             ac_grid: ACGrid::new(grid_width, grid_height),
