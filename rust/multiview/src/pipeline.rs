@@ -26,7 +26,7 @@ use crate::options::Options;
 use crate::pairs::{self, PairGraph, MIN_PAIR_COVERAGE};
 use crate::pose::Pose;
 use crate::rng::Rng;
-use crate::sfm::{self, SparseModel};
+use crate::sfm::{self, DropReason, SparseModel};
 use crate::texture::{self, Texture};
 use crate::tracks::{self, Track};
 use crate::twoview::{self, Degeneracy, RelativePose, Verdict};
@@ -320,10 +320,9 @@ pub fn reconstruct_with_params<L: PairLookup>(
                 Event::ViewDropped {
                     stage: Stage::Pairs,
                     view,
-                    reason: format!(
-                        "no pair with at least {:.0}% coverage links it to the others",
-                        MIN_PAIR_COVERAGE * 100.0
-                    ),
+                    reason: DropReason::NotLinked {
+                        min_coverage: MIN_PAIR_COVERAGE,
+                    },
                 },
             )?;
         }

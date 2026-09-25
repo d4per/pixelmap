@@ -22,7 +22,7 @@
 //!     .focal(Focal::Equivalent35mm(28.0));
 //!
 //! let model = pixelmap_multiview::run(&photos, &options, &mut |event: Event| {
-//!     println!("{:?} {}", event.stage(), event.message());
+//!     println!("{}: {}", event.stage(), event.message());
 //!     Flow::Continue(())
 //! })?;
 //!
@@ -80,7 +80,7 @@
 //!   what `Job` drives underneath.
 
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use nalgebra;
 pub use pixelmap;
@@ -151,6 +151,7 @@ pub use options::{Focal, Options, DEFAULT_MAX_TEXTURE_SIZE};
 pub use pairs::{PairGraph, MIN_PAIR_COVERAGE};
 pub use pipeline::{reconstruct, run, Diagnostics, Model, PairReport};
 pub use pose::Pose;
+pub use sfm::DropReason;
 pub use texture::Texture;
 pub use twoview::Degeneracy;
 pub use types::{Norm, PairId, PhotoPx, ViewId, World};

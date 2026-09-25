@@ -27,3 +27,5 @@ pixelmap 0.3.
   judge pairs by the same threshold.
 - `export`, with writers for PLY, OBJ with MTL, and X3D.
 - `Error`, which names the stage that failed and what to change about the photos.
+- `DropReason`, why a photo was left out, carried by `Event::ViewDropped`,
+  `Error::RegistrationFailed` and `RegistrationWarning::Unregistered`.

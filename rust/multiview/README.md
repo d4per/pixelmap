@@ -1,11 +1,23 @@
 # pixelmap_multiview
 
-3D reconstruction from three or more photos of the same scene.
+Turn a set of ordinary photos of a scene into a 3D model.
 
-`pixelmap_model_3d` lifts a single mapping between two photos into a surface. This crate
+[`pixelmap_model_3d`](https://github.com/d4per/pixelmap/tree/main/rust/model_3d) lifts a single mapping between two photos into a surface. This crate
 goes further: it maps every pair of N ≥ 3 photos with [`pixelmap`](https://crates.io/crates/pixelmap), recovers
 where each photo was taken from, and fuses all of the views into one mesh in a single
 frame.
+
+## From photos to a 3D model
+
+These 23 photos were taken with a phone while walking once around a statue. Nothing else
+went in: no calibration, no markers, no measurements.
+
+![Twenty-three photos of a bronze statue of a woman carrying a child, taken from all sides while walking around it](https://raw.githubusercontent.com/d4per/pixelmap/main/images/docs/landala.webp)
+
+`pixelmap_multiview` worked out where each photo was taken from and fused all 23 views into
+this mesh, shown here untextured in MeshLab from three sides:
+
+![The reconstructed 3D mesh of the statue, seen from three different angles](https://raw.githubusercontent.com/d4per/pixelmap/main/images/docs/landala3D.webp)
 
 ## Using it
 
@@ -81,9 +93,7 @@ differently.
 A run is minutes of work, so the caller hears about it throughout. `Event` carries data
 rather than prose: which pair is being mapped and how far through it, why a pair was
 rejected, which photo was left out and why. Showing progress never means parsing a
-sentence — an earlier version reported everything as formatted English, and the frontend
-ended up recovering the facts with regular expressions, which made the exact wording, down
-to the en dash in a `PairId`, part of the contract by accident.
+sentence, and the wording of a message is never part of the contract.
 
 | Variant | Carries |
 |---|---|
@@ -113,7 +123,7 @@ Returning `Flow::Break(())` from the callback stops the run, which comes back as
 checkpoint. Within pairwise correspondence that is one pixelmap schedule step, which is the
 longest a stop ever waits; every other stage reports often enough to be prompt.
 
-Measured on the three tri1 photos at 1200 px, asking a run to stop at various points:
+Measured on three photos of stone steps at 1200 px, asking a run to stop at various points:
 
 | Quality | One pair | Typical wait | Worst seen |
 |---------|----------|--------------|------------|
@@ -168,6 +178,6 @@ The input size barely matters, because pixelmap scales every photo to a fixed wo
 width (400 px for low, 800 px for medium, 1600 px for high) before it starts. What the input
 resolution buys is the precision of the geometry that follows, not matching time.
 
-End to end, the three tri1 photos at 1200 px and low quality reconstruct in 1.9 s into a
+End to end, those three photos of stone steps at 1200 px and low quality reconstruct in 1.9 s into a
 mesh of 23,314 vertices and 45,708 triangles, textured from 1,528 charts in a 2048 × 2048
 atlas.

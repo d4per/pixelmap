@@ -24,10 +24,8 @@ fn photo() -> Arc<Photo> {
 /// A correspondence field with real depth in it: a horizontal disparity that varies
 /// quadratically across the frame, as a surface bulging towards the camera would produce.
 ///
-/// The variation has to be non-linear. A pure translation — or any disparity linear in
-/// `(x, y)` — leaves the four columns `[X, Y, dataX, dataY]` spanning only two
-/// dimensions, the third principal component is then pure noise, and every cell washes
-/// out to `NaN` when it is rescaled.
+/// The variation has to be non-linear: any disparity linear in `(x, y)` is explained
+/// entirely by the affine fit, and carries no depth at all (see [`a_linear_disparity_is_a_flat_surface`]).
 fn bulging_surface() -> DensePhotoMap {
     let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
     let cell = map.grid_cell_size() as f32;
@@ -71,6 +69,27 @@ fn builds_a_textured_grid_from_a_mapping() {
         valid * 2 > cells,
         "only {valid} of {cells} cells were reconstructed"
     );
+}
+
+#[test]
+fn a_linear_disparity_is_a_flat_surface() {
+    let mut map = DensePhotoMap::new(photo(), photo(), GRID_WIDTH, GRID_HEIGHT);
+    let cell = map.grid_cell_size() as f32;
+    for y in 0..GRID_HEIGHT {
+        for x in 0..GRID_WIDTH {
+            map.set_grid_coordinates(x, y, x as f32 * cell - 6.0, y as f32 * cell);
+        }
+    }
+
+    let model = Model3D::new(&map);
+    for y in 0..GRID_HEIGHT {
+        for x in 0..GRID_WIDTH {
+            let p = model.get_texture_point(x, y);
+            assert!(!p.x.is_nan(), "cell ({x}, {y}) was dropped");
+            assert_eq!(p.z, 0.0, "cell ({x}, {y}) has depth {}", p.z);
+        }
+    }
+    assert!(!between(&model.to_x3d(), "coordIndex='", "'").trim().is_empty());
 }
 
 #[test]

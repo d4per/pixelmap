@@ -79,6 +79,9 @@ impl<L: PairLookup> PairGraph<L> {
 
     /// The mapping from `from` to `to`, whichever order it is stored in. `None` if the
     /// views are equal or outside the graph.
+    // Hidden: `Directed` belongs to the stages, which are hidden for the reasons given in
+    // lib.rs.
+    #[doc(hidden)]
     pub fn directed(&self, from: ViewId, to: ViewId) -> Option<Directed<'_, L>> {
         let pair = PairId::new(from, to)?;
         Some(Directed::new(self.get(pair)?, from > to))

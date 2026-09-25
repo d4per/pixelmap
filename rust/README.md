@@ -11,7 +11,7 @@ The workspace contains six crates:
   linear-algebra dependency.
 - `multiview` — `pixelmap_multiview`, 3D reconstruction from three or more photos: every
   pair is mapped, the cameras are registered into one frame, and the views are fused into
-  one mesh. Under construction; see [multiview/README.md](multiview/README.md).
+  one mesh. See [multiview/README.md](multiview/README.md).
 - `command_line_tool` — the `pixelmap` binary, which writes interpolated images to disc.
 - `multiview_cli` — the `pixelmap-multiview` binary, which runs `pixelmap_multiview` on
   photos from disc.
