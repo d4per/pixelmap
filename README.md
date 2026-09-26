@@ -28,6 +28,12 @@ The rest of the [rust](rust) folder builds on it: a command line tool that write
 interpolated images to disc, a viewer that animates them in a window, and
 `pixelmap_model_3d`, which lifts a finished mapping into a textured 3D mesh.
 
+**[`pixelmap_multiview`](https://crates.io/crates/pixelmap_multiview)** goes from three or
+more photos of a scene to one textured mesh: it maps every pair with pixelmap, works out
+where each photo was taken from, and fuses the views
+([API docs](https://docs.rs/pixelmap_multiview), and
+[rust/multiview/README.md](rust/multiview/README.md)).
+
 
 ---
 

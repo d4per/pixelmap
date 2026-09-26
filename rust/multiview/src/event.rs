@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::ops::ControlFlow;
 
+use crate::sfm::DropReason;
 use crate::twoview::Degeneracy;
 use crate::types::{PairId, PhotoPx, ViewId};
 
@@ -260,7 +261,7 @@ pub enum Event {
         /// The photo.
         view: ViewId,
         /// Why.
-        reason: String,
+        reason: DropReason,
     },
 
     /// Something worth saying that is not progress.

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use pixelmap::Photo;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::{
-    pipeline, Degeneracy, Error, Event, Flow, Focal, Model, Options, PairGraph, PairLookup,
-    PhotoPx, Stage, ViewId,
+    pipeline, Degeneracy, DropReason, Error, Event, Flow, Focal, Model, Options, PairGraph,
+    PairLookup, PhotoPx, Stage, ViewId,
 };
 
 const WIDTH: usize = 320;
@@ -120,7 +120,10 @@ fn a_photo_that_cannot_be_placed_is_named_with_the_reason() {
     assert_eq!(left_out.len(), 1, "{message}");
     let (view, reason) = &left_out[0];
     assert!(!registered.contains(view), "{message}");
-    assert!(reason.contains("sees only"), "{message}");
+    assert!(
+        matches!(reason, DropReason::TooFewPoints { .. }),
+        "{message}"
+    );
     assert!(
         message.contains(&format!("{view} was left out: {reason}")),
         "{message}"

@@ -124,7 +124,7 @@ pub enum Warning {
         /// The view.
         view: ViewId,
         /// Why.
-        reason: String,
+        reason: DropReason,
     },
     /// The camera centres lie nearly on one line, which constrains depth along it weakly.
     CollinearCameras {
@@ -132,6 +132,84 @@ pub enum Warning {
         /// centres, as a fraction of their distance.
         deviation: f64,
     },
+}
+
+/// Why a photo was left out of a reconstruction.
+///
+/// Its [`Display`](fmt::Display) form is a clause that reads after "left out: ".
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// No pair with enough coverage links the photo to the others.
+    NotLinked {
+        /// The coverage a pair needed to count as a link.
+        min_coverage: f32,
+    },
+    /// The photo sees too few of the points placed so far to be positioned from them.
+    TooFewPoints {
+        /// How many placed points it sees.
+        seen: usize,
+        /// How many it needs to see.
+        required: usize,
+    },
+    /// No camera position fits the points the photo sees.
+    NoPose,
+    /// A camera position was found, but too few of the points agree with it.
+    TooFewInliers {
+        /// The points that agree with the position found.
+        inliers: usize,
+        /// The placed points the photo sees.
+        points: usize,
+        /// The share of `points` that had to agree.
+        required_ratio: f64,
+        /// With at least this many agreeing points, `ratio_when_enough` is the share that
+        /// has to agree instead.
+        enough_inliers: usize,
+        /// The share that has to agree once `enough_inliers` do.
+        ratio_when_enough: f64,
+    },
+}
+
+impl fmt::Display for DropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            DropReason::NotLinked { min_coverage } => write!(
+                f,
+                "no pair with at least {:.0}% coverage links it to the others",
+                min_coverage * 100.0
+            ),
+            DropReason::TooFewPoints { seen, required } => write!(
+                f,
+                "it sees only {seen} of the points placed so far (needs {required})"
+            ),
+            DropReason::NoPose => f.write_str("no camera position fits the points it sees"),
+            DropReason::TooFewInliers {
+                inliers,
+                points,
+                required_ratio,
+                enough_inliers,
+                ratio_when_enough,
+            } => {
+                let ratio = inliers as f64 / points as f64;
+                if inliers >= enough_inliers {
+                    write!(
+                        f,
+                        "only {:.0}% of the {points} points it sees agree on where it was (needs {:.0}%)",
+                        ratio * 100.0,
+                        required_ratio * 100.0
+                    )
+                } else {
+                    write!(
+                        f,
+                        "only {inliers} ({:.0}%) of the {points} points it sees agree on where it was (needs {:.0}%, or {enough_inliers} points and {:.0}%)",
+                        ratio * 100.0,
+                        required_ratio * 100.0,
+                        ratio_when_enough * 100.0
+                    )
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for Warning {
@@ -264,7 +342,7 @@ pub fn reconstruct_with_progress(
     // loop ends: both kinds of change are bounded by the number of views.
     let mut version = 0usize;
     let mut tried_at: Vec<Option<usize>> = vec![None; views];
-    let mut reasons: Vec<Option<String>> = vec![None; views];
+    let mut reasons: Vec<Option<DropReason>> = vec![None; views];
     let mut adjusted_at = version;
     let mut placed_at_adjustment = 2usize;
     loop {
@@ -304,10 +382,10 @@ pub fn reconstruct_with_progress(
         let placed = cameras.iter().flatten().count();
 
         let attempt = if count < params.min_registration_points {
-            Err(format!(
-                "it sees only {count} of the points placed so far (needs {})",
-                params.min_registration_points
-            ))
+            Err(DropReason::TooFewPoints {
+                seen: count,
+                required: params.min_registration_points,
+            })
         } else {
             let (world, image): (Vec<Point3<f64>>, Vec<Norm>) = normalized
                 .iter()
@@ -326,7 +404,7 @@ pub fn reconstruct_with_progress(
                 params.confidence,
                 rng,
             ) {
-                None => Err("no camera position fits the points it sees".to_string()),
+                None => Err(DropReason::NoPose),
                 Some(solution) => {
                     let inliers = solution.inliers.len();
                     let ratio = inliers as f64 / count as f64;
@@ -337,20 +415,14 @@ pub fn reconstruct_with_progress(
                     };
                     if ratio >= needed {
                         Ok((solution, ratio))
-                    } else if inliers >= params.enough_pnp_inliers {
-                        Err(format!(
-                            "only {:.0}% of the {count} points it sees agree on where it was (needs {:.0}%)",
-                            ratio * 100.0,
-                            needed * 100.0
-                        ))
                     } else {
-                        Err(format!(
-                            "only {inliers} ({:.0}%) of the {count} points it sees agree on where it was (needs {:.0}%, or {} points and {:.0}%)",
-                            ratio * 100.0,
-                            needed * 100.0,
-                            params.enough_pnp_inliers,
-                            params.min_pnp_inlier_ratio_when_enough * 100.0
-                        ))
+                        Err(DropReason::TooFewInliers {
+                            inliers,
+                            points: count,
+                            required_ratio: needed,
+                            enough_inliers: params.enough_pnp_inliers,
+                            ratio_when_enough: params.min_pnp_inlier_ratio_when_enough,
+                        })
                     }
                 }
             }

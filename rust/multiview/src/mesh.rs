@@ -34,7 +34,7 @@ impl Mesh {
 
     /// The connected piece each triangle belongs to, numbered from 0 in order of first
     /// appearance, and each piece's triangle count.
-    pub fn components(&self) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn components(&self) -> (Vec<usize>, Vec<usize>) {
         let mut parent: Vec<usize> = (0..self.positions.len()).collect();
         fn root(parent: &mut [usize], mut i: usize) -> usize {
             while parent[i] != i {
@@ -74,7 +74,7 @@ impl Mesh {
     /// Drops every connected piece with fewer than `min_fraction` of all triangles, and
     /// any vertices left unused. Returns the fraction of triangles in the largest piece,
     /// measured before dropping anything.
-    pub fn keep_large_components(&mut self, min_fraction: f64) -> f64 {
+    pub(crate) fn keep_large_components(&mut self, min_fraction: f64) -> f64 {
         if self.triangles.is_empty() {
             return 0.0;
         }

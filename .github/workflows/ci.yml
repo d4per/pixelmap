@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Only the library is published and only the library declares an MSRV. The two
+      # Only the libraries are published and only they declare an MSRV. The two
       # binaries depend on `image`, whose tree needs edition 2024, so they follow
       # rust-toolchain.toml instead.
       - uses: dtolnay/rust-toolchain@master
@@ -55,6 +55,8 @@ jobs:
       - run: cargo +1.80 build -p pixelmap
       - run: cargo +1.80 test -p pixelmap
       - run: cargo +1.80 build -p pixelmap --no-default-features
+      - run: cargo +1.80 build -p pixelmap_multiview
+      - run: cargo +1.80 build -p pixelmap_multiview --no-default-features
 
   lint:
     name: fmt + clippy
@@ -111,4 +113,27 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: Verify the crate is publishable
         run: cargo publish --dry-run -p pixelmap
+      - name: Document pixelmap_multiview with warnings denied
+        run: cargo doc -p pixelmap_multiview --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: Verify pixelmap_multiview is publishable
+        run: cargo publish --dry-run -p pixelmap_multiview
+
+  docsrs:
+    name: docs.rs build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # docs.rs builds on nightly with `--cfg docsrs`, which switches on the unstable
+      # `doc_cfg` attribute. Nightly renames and removes such features without notice, and
+      # nothing else here would notice. `+nightly` beats the rust-toolchain.toml pin, as
+      # `+1.80` does in the MSRV job.
+      - run: cargo +nightly doc -p pixelmap -p pixelmap_multiview --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs"
 

@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::event::Stage;
+use crate::sfm::DropReason;
 use crate::twoview::Degeneracy;
 use crate::types::{PairId, ViewId};
 
@@ -68,7 +69,7 @@ pub enum Error {
         /// How many are needed.
         minimum: usize,
         /// Each view that could not be placed, and why.
-        left_out: Vec<(ViewId, String)>,
+        left_out: Vec<(ViewId, DropReason)>,
     },
     /// Bundle adjustment did not reach an acceptable fit.
     BundleAdjustment {
