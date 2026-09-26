@@ -14,13 +14,10 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use image::imageops::FilterType;
 use image::DynamicImage;
-use nalgebra::Rotation3;
 use pixelmap::{Correspondence, Photo, ProcessingMode, DEFAULT_SEED};
 use pixelmap_multiview::depth::{self, DepthMap};
-use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::{
-    align, export, input, Error, Event, Flow, Focal, FocalSource, Job, Model, Options, PairId,
-    Pose, SparseModel, Track, ViewId, World,
+    export, input, Error, Event, Flow, Focal, FocalSource, Job, Model, Options, PairId, Pose, World,
 };
 
 #[derive(Parser, Debug)]
@@ -31,24 +28,11 @@ use pixelmap_multiview::{
 )]
 struct Args {
     /// Photos of the scene, all from the same camera at the same zoom. At least three.
-    #[arg(required_unless_present = "synthetic", num_args = 3..)]
+    #[arg(required = true, num_args = 3..)]
     photos: Vec<PathBuf>,
 
-    /// Render views of a synthetic scene instead of reading photos: plane, sphere or
-    /// corner. The results are then checked against the known geometry.
-    #[arg(long, value_name = "SCENE", conflicts_with = "photos")]
-    synthetic: Option<String>,
-
-    /// How many views of the synthetic scene to render.
-    #[arg(long, default_value_t = 4)]
-    views: usize,
-
-    /// The angle, in degrees, the synthetic cameras spread across.
-    #[arg(long, default_value_t = 30.0)]
-    spread: f64,
-
     /// Scale photos down so their long edge is at most this many pixels. 0 keeps them as
-    /// they are. For a synthetic scene, the width to render at.
+    /// they are.
     #[arg(long, default_value_t = 1200)]
     long_edge: u32,
 
@@ -93,22 +77,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// Photos ready for the library, and the ground truth when they were rendered.
+/// Photos ready for the library.
 struct Input {
     photos: Vec<Arc<Photo>>,
     focal: Focal,
-    truth: Option<SyntheticSet>,
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let Input {
-        photos,
-        focal,
-        truth,
-    } = match &args.synthetic {
-        Some(name) => synthetic_input(&args, name)?,
-        None => photo_input(&args)?,
-    };
+    let Input { photos, focal } = photo_input(&args)?;
 
     // The library works this out for itself from the options; asking the same question
     // here gives something to show before the run starts.
@@ -168,9 +144,6 @@ fn run(args: Args) -> Result<(), String> {
     println!("reconstructed in {:.1} s", start.elapsed().as_secs_f64());
     print_depth_stats(&model);
 
-    if let Some(truth) = &truth {
-        report_truth(truth, &model);
-    }
     if let Some(dir) = &args.dump_dir {
         write_outputs(dir, &photos, &model)?;
     }
@@ -268,157 +241,6 @@ fn print_depth_stats(model: &Model) {
             describe(&stats.multiple)
         );
     }
-}
-
-/// Compares every stage of a reconstruction of a synthetic scene with the ground truth.
-fn report_truth(truth: &SyntheticSet, model: &Model) {
-    let Some(d) = model.diagnostics() else {
-        return;
-    };
-    println!();
-    println!("against the ground truth:");
-    for report in &model.pairs {
-        if let Some(pose) = &report.pose {
-            let expected = truth.relative_pose(report.pair);
-            println!(
-                "  {}: rotation off by {:.2}°, translation direction off by {:.2}°",
-                report.pair,
-                angle_between(&pose.rotation, &expected.rotation),
-                pose.translation.angle(&expected.translation).to_degrees()
-            );
-        }
-    }
-    if let Some((_, cameras, points)) = align_with_truth(truth, &d.tracks, &d.registered) {
-        println!(
-            "  registered: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
-        );
-    }
-    let Some((similarity, cameras, points)) = align_with_truth(truth, &d.tracks, &d.adjusted)
-    else {
-        eprintln!("could not align the reconstruction with the ground truth");
-        return;
-    };
-    println!(
-        "  bundle adjusted: cameras off by at most {cameras:.2}%, points by a median {points:.2}% of the camera spread"
-    );
-
-    let mut depth_errors: Vec<f64> = d
-        .depth
-        .iter()
-        .flat_map(|map| {
-            (0..map.rows)
-                .flat_map(move |row| (0..map.columns).map(move |column| (map, column, row)))
-        })
-        .filter_map(|(map, column, row)| {
-            let depth = map.get(column, row)? as f64 * similarity.scale;
-            let t = truth.depth(map.view, map.pixel(column, row))?;
-            Some((depth - t).abs() / t * 100.0)
-        })
-        .collect();
-    if !depth_errors.is_empty() {
-        println!(
-            "  depth: median error {:.2}%, 95th percentile {:.2}%",
-            percentile(&mut depth_errors, 0.5),
-            percentile(&mut depth_errors, 0.95)
-        );
-    }
-
-    let extent = camera_spread(truth);
-    let mesh = &model.mesh;
-    let mut distances: Vec<f64> = mesh
-        .positions
-        .iter()
-        .map(|p| truth.scene.distance(&similarity.apply(p)) / extent * 100.0)
-        .collect();
-    let mut colour_errors: Vec<f64> = mesh
-        .positions
-        .iter()
-        .zip(&model.texture.vertex_colours)
-        .map(|(p, colour)| {
-            let expected = truth.scene.colour(&similarity.apply(p));
-            (0..3)
-                .map(|k| (colour[k] as f64 - expected[k] as f64).abs())
-                .sum::<f64>()
-                / 3.0
-        })
-        .collect();
-    if !distances.is_empty() {
-        println!(
-            "  mesh: median distance {:.2}%, 90th percentile {:.2}% of the camera spread",
-            percentile(&mut distances, 0.5),
-            percentile(&mut distances, 0.9)
-        );
-        println!(
-            "  vertex colours: off by a median {:.1}, 90th percentile {:.1} levels of 255",
-            percentile(&mut colour_errors, 0.5),
-            percentile(&mut colour_errors, 0.9)
-        );
-    }
-}
-
-/// Aligns `model` to the truth on its cameras and points together. Returns the
-/// similarity, the largest camera error and the median point error, both as percentages
-/// of the true cameras' spread.
-fn align_with_truth(
-    truth: &SyntheticSet,
-    tracks: &[Track],
-    model: &SparseModel,
-) -> Option<(align::Similarity, f64, f64)> {
-    let mut estimated = Vec::new();
-    let mut expected = Vec::new();
-    for view in model.registered() {
-        estimated.push(model.cameras[view.index()]?.centre());
-        expected.push(truth.poses[view.index()].centre());
-    }
-    let cameras = estimated.len();
-    for point in &model.points {
-        let track = &tracks[point.track];
-        let surface = track
-            .observation(track.anchor)
-            .and_then(|p| truth.surface_point(track.anchor, p));
-        if let Some(surface) = surface {
-            estimated.push(point.position.0);
-            expected.push(surface.0);
-        }
-    }
-    let similarity = align::umeyama(&estimated, &expected)?;
-    let extent = camera_spread(truth);
-    let mut errors: Vec<f64> = estimated
-        .iter()
-        .zip(&expected)
-        .map(|(e, x)| (similarity.apply(e) - x).norm() / extent * 100.0)
-        .collect();
-    let camera_error = errors[..cameras].iter().copied().fold(0.0, f64::max);
-    let point_error = percentile(&mut errors[cameras..], 0.5);
-    Some((similarity, camera_error, point_error))
-}
-
-fn camera_spread(truth: &SyntheticSet) -> f64 {
-    truth
-        .poses
-        .iter()
-        .flat_map(|a| {
-            truth
-                .poses
-                .iter()
-                .map(move |b| (a.centre() - b.centre()).norm())
-        })
-        .fold(0.0, f64::max)
-}
-
-/// The angle, in degrees, of the rotation taking `b` to `a`.
-fn angle_between(a: &Rotation3<f64>, b: &Rotation3<f64>) -> f64 {
-    // `Rotation3::angle` does not clamp, and a near-perfect estimate lands just above 1.
-    let cos = ((a * b.inverse()).matrix().trace() - 1.0) / 2.0;
-    cos.clamp(-1.0, 1.0).acos().to_degrees()
-}
-
-fn percentile(values: &mut [f64], q: f64) -> f64 {
-    if values.is_empty() {
-        return f64::NAN;
-    }
-    values.sort_by(f64::total_cmp);
-    values[((values.len() - 1) as f64 * q) as usize]
 }
 
 /// Writes the sparse model, depth maps and textured mesh into `dir`.
@@ -578,36 +400,6 @@ fn seed() -> u64 {
         .unwrap_or(DEFAULT_SEED)
 }
 
-fn synthetic_input(args: &Args, name: &str) -> Result<Input, String> {
-    let scene = Scene::named(name).ok_or_else(|| {
-        format!(
-            "unknown scene {name:?}; choose one of {}",
-            Scene::NAMES.join(", ")
-        )
-    })?;
-    let width = if args.long_edge > 0 {
-        args.long_edge as usize
-    } else {
-        800
-    };
-    let height = width * 3 / 4;
-    let set = SyntheticSet::orbit(scene, args.views, args.spread, width, height);
-    eprintln!(
-        "rendering {} views of the {name} scene across {}°",
-        args.views, args.spread
-    );
-    let photos = (0..set.views())
-        .map(|v| Arc::new(set.render(ViewId(v as u32))))
-        .collect();
-    // The renderer's own camera, said in the terms the library takes.
-    let focal = Focal::Pixels(set.intrinsics.fx);
-    Ok(Input {
-        photos,
-        focal,
-        truth: Some(set),
-    })
-}
-
 fn photo_input(args: &Args) -> Result<Input, String> {
     let loaded = args
         .photos
@@ -662,11 +454,7 @@ fn photo_input(args: &Args) -> Result<Input, String> {
         })
         .collect::<Result<_, _>>()?;
 
-    Ok(Input {
-        photos,
-        focal,
-        truth: None,
-    })
+    Ok(Input { photos, focal })
 }
 
 /// A decoded photo, already turned upright.

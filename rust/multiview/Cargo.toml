@@ -22,7 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
 # All of the geometry — essential matrices, PnP, triangulation, bundle adjustment — is
 # written here on nalgebra rather than taken from rust-cv, whose crates pin nalgebra 0.21.
-nalgebra = "0.33"
+nalgebra = "0.35.0"
 
 [features]
 default = ["parallel", "threads"]

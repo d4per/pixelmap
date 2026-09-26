@@ -147,7 +147,6 @@ resizing are the caller's job; the `pixelmap-multiview` binary in
 the repository does them for photos on disc:
 
     cargo run --release -p pixelmap_multiview_cli -- a.jpg b.jpg c.jpg d.jpg --dump-dir out
-    cargo run --release -p pixelmap_multiview_cli -- --synthetic sphere --views 4
 
 With `--dump-dir`, the sparse model is written to `out/sparse.ply`, with coloured points and a
 red pyramid per camera; the textured surface to `out/mesh.obj`, with `mesh.mtl` and

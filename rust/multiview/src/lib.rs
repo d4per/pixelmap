@@ -118,8 +118,8 @@ pub mod pnp;
 pub mod rng;
 #[doc(hidden)]
 pub mod sfm;
-// Scenes with known geometry, rendered and matched exactly. For this crate's tests and the
-// command-line tool's `--synthetic` mode, not for building on.
+// Scenes with known geometry, rendered and matched exactly. For this crate's tests, not
+// for building on.
 #[doc(hidden)]
 pub mod synthetic;
 #[doc(hidden)]
