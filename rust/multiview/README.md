@@ -28,9 +28,12 @@ use pixelmap::Quality;
 use pixelmap_multiview::{Flow, Focal, Options};
 
 // `photos: Vec<Arc<pixelmap::Photo>>`, decoded by the caller, all the same size.
+// `exif_focal_35mm: f64`, the photos' FocalLengthIn35mmFilm from EXIF. Leave `.focal` out
+// when it is not known: the focal length is then estimated from the photos and refined.
 let options = Options::new()
     .quality(Quality::Medium)
-    .focal(Focal::Equivalent35mm(28.0));
+    .focal(Focal::Equivalent35mm(exif_focal_35mm))
+    .refine_focal(true);
 
 let model = pixelmap_multiview::run(&photos, &options, &mut |event| {
     println!("{}: {}", event.stage(), event.message());

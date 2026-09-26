@@ -57,9 +57,11 @@ impl Focal {
 /// use pixelmap::Quality;
 /// use pixelmap_multiview::{Focal, Options};
 ///
+/// let exif_focal_35mm = 28.0; // The photos' FocalLengthIn35mmFilm, from EXIF.
 /// let options = Options::new()
 ///     .quality(Quality::Medium)
-///     .focal(Focal::Equivalent35mm(28.0));
+///     .focal(Focal::Equivalent35mm(exif_focal_35mm))
+///     .refine_focal(true);
 /// ```
 ///
 /// The fields are readable so that a caller can show what a run was given; they are set
@@ -78,7 +80,8 @@ pub struct Options {
     /// [`DEFAULT_SEED`]. Two runs agreeing on photos, quality and seed give the same model.
     pub seed: Option<u64>,
     /// Refine the focal length during bundle adjustment. Always done when [`Self::focal`]
-    /// is [`Focal::Unknown`], whatever this says.
+    /// is [`Focal::Unknown`], whatever this says. Worth turning on for a focal length from
+    /// EXIF too, which is rounded to whole millimetres and does not account for any crop.
     pub refine_focal: bool,
     /// The largest texture atlas to produce, in pixels on a side. The default suits a file
     /// on disc; a caller embedding the atlas in a page wants less.

@@ -4,6 +4,14 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- The README and `Options` examples now take the focal length from EXIF and turn on
+  `refine_focal`, where they used to hardcode 28 mm, a value a copied example would
+  keep for any camera.
+
 ## 0.1.0 - 2026-09-26
 
 First release: 3D reconstruction from three or more photos of one scene, on top of
