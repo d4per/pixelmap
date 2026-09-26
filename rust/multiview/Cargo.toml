@@ -9,7 +9,7 @@ homepage = "https://pixelmap.dogduck.com"
 documentation = "https://docs.rs/pixelmap_multiview"
 readme = "README.md"
 license = "MIT"
-keywords = ["computer-vision", "3d-reconstruction", "photogrammetry", "structure-from-motion", "mesh"]
+keywords = ["computer-vision", "reconstruction", "photogrammetry", "sfm", "mesh"]
 categories = ["computer-vision", "graphics", "multimedia::images"]
 
 [package.metadata.docs.rs]
