@@ -8,7 +8,7 @@ use pixelmap_multiview::pairs::{self, MIN_PAIR_COVERAGE};
 use pixelmap_multiview::rng::Rng;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::twoview::{self, Params};
-use pixelmap_multiview::{Error, Event, Flow, PairLookup, Stage, ViewId};
+ use pixelmap_multiview::{Error, Event, Flow, PairLookup, PhotoPx, Stage, ViewId};
 
 fn rendered(set: &SyntheticSet) -> Vec<Arc<pixelmap::Photo>> {
     (0..set.views())
@@ -102,7 +102,7 @@ fn hands_back_the_dense_map_of_every_pair() {
     assert_eq!(maps.iter().map(|m| m.pair).collect::<Vec<_>>(), pairs);
 
     for (map, (pair, mapping)) in maps.iter().zip(graph.pairs()) {
-        let (columns, rows) = mapping.forward().grid_dimensions();
+        let (columns, rows) = mapping.grid_dimensions();
         assert_eq!((map.columns, map.rows), (columns, rows));
         assert_eq!(map.cell_size, mapping.native_stride());
         assert_eq!(map.points.len(), columns * rows * 2);
@@ -155,4 +155,45 @@ fn stops_when_asked() {
             stage: Stage::Pairs
         })
     ));
+}
+
+#[test]
+fn a_mapping_looks_up_exactly_what_its_correspondence_did() {
+    // `Mapping` drops the photos a `Correspondence` holds and reimplements its lookup; the
+    // two must agree bit for bit, including where nothing is mapped.
+    let set = SyntheticSet::orbit(Scene::corner(), 2, 20.0, 400, 300);
+    let photos = rendered(&set);
+    let correspondence = pixelmap::Correspondence::builder()
+        .quality(Quality::Low)
+        .seed(DEFAULT_SEED)
+        .run(photos[0].clone(), photos[1].clone())
+        .expect("rendered photos are valid input");
+    let mapping = pairs::Mapping::from(correspondence.clone());
+
+    let as_bits = |p: Option<(f32, f32)>| p.map(|(x, y)| (x.to_bits(), y.to_bits()));
+    let (mut mapped, mut unmapped) = (0, 0);
+    for y in -8..(300 * 4 + 8) {
+        for x in -8..(400 * 4 + 8) {
+            // Quarter pixels, reaching a little outside the photo on every side.
+            let p = PhotoPx::new(x as f32 * 0.25 + 0.1, y as f32 * 0.25);
+            let forward = correspondence.lookup(p.x(), p.y());
+            assert_eq!(
+                as_bits(mapping.a_to_b(p).map(|q| (q.x(), q.y()))),
+                as_bits(forward),
+                "a_to_b at {p:?}"
+            );
+            assert_eq!(
+                as_bits(mapping.b_to_a(p).map(|q| (q.x(), q.y()))),
+                as_bits(correspondence.lookup_back(p.x(), p.y())),
+                "b_to_a at {p:?}"
+            );
+            if forward.is_some() {
+                mapped += 1;
+            } else {
+                unmapped += 1;
+            }
+        }
+    }
+    assert!(mapped > 0 && unmapped > 0, "{mapped} mapped, {unmapped} not");
+    assert_eq!(mapping.coverage(), correspondence.coverage());
 }

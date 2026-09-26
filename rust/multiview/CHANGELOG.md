@@ -29,3 +29,10 @@ pixelmap 0.3.
 - `Error`, which names the stage that failed and what to change about the photos.
 - `DropReason`, why a photo was left out, carried by `Event::ViewDropped`,
   `Error::RegistrationFailed` and `RegistrationWarning::Unregistered`.
+
+### Fixed
+
+- Memory during pairwise correspondence. Each pair's mapping kept alive the two photos
+  pixelmap had scaled to its working width, about 30 MB per pair at `Quality::High`.
+  With 23 photos (253 pairs) that exhausted memory partway through. Now only the grids
+  are kept, about 1 MB per pair, and lookups return the same values bit for bit.

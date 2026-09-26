@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use pixelmap::{Correspondence, Photo, Quality};
+use pixelmap::{Correspondence, DensePhotoMap, Photo, Quality};
 
 use crate::error::Error;
 use crate::event::{emit, Event, Flow, PairMap, Stage};
@@ -21,27 +21,153 @@ use crate::types::{PairId, PhotoPx, ViewId};
 /// keeping a copy that drifts. The name is stable; the value may be retuned in any release.
 pub const MIN_PAIR_COVERAGE: f32 = 0.25;
 
-impl PairLookup for Correspondence {
+/// One grid of a pixelmap mapping, without the photos it was computed from.
+#[derive(Clone, Debug)]
+struct Grid {
+    columns: usize,
+    rows: usize,
+    /// `(x, y)` per cell, row by row, in working-resolution pixels. NaN where unmapped.
+    points: Vec<f32>,
+}
+
+impl Grid {
+    fn copy(map: &DensePhotoMap) -> Grid {
+        let (columns, rows) = map.grid_dimensions();
+        let mut points = Vec::with_capacity(columns * rows * 2);
+        for row in 0..rows {
+            for column in 0..columns {
+                let (x, y) = map.grid_coordinates(column, row);
+                points.push(x);
+                points.push(y);
+            }
+        }
+        Grid {
+            columns,
+            rows,
+            points,
+        }
+    }
+
+    fn at(&self, column: usize, row: usize) -> (f32, f32) {
+        if column >= self.columns || row >= self.rows {
+            return (f32::NAN, f32::NAN);
+        }
+        let i = (row * self.columns + column) * 2;
+        (self.points[i], self.points[i + 1])
+    }
+
+    /// The mapping at fractional grid coordinates.
+    ///
+    /// Mirrors `DensePhotoMap::interpolated_point` in pixelmap exactly, so that lookups
+    /// through a [`Mapping`] match `Correspondence::lookup` bit for bit: only corners with
+    /// a non-zero bilinear weight must be mapped, and a quad whose contributing corners
+    /// spread more than three cells from their centroid is too distorted to interpolate.
+    fn interpolate(&self, gx: f32, gy: f32, cell_size: usize) -> Option<(f32, f32)> {
+        if gx.is_nan() || gy.is_nan() || gx < 0.0 || gy < 0.0 {
+            return None;
+        }
+        let (column, row) = (gx as usize, gy as usize);
+        let (xr, yr) = (gx - column as f32, gy - row as f32);
+        let corners = [
+            (self.at(column, row), (1.0 - xr) * (1.0 - yr)),
+            (self.at(column + 1, row), xr * (1.0 - yr)),
+            (self.at(column + 1, row + 1), xr * yr),
+            (self.at(column, row + 1), (1.0 - xr) * yr),
+        ];
+
+        let (mut xt, mut yt, mut sum_x, mut sum_y, mut contributing) = (0.0, 0.0, 0.0, 0.0, 0.0f32);
+        for ((cx, cy), weight) in corners {
+            if weight == 0.0 {
+                continue;
+            }
+            if cx.is_nan() || cy.is_nan() {
+                return None;
+            }
+            xt += cx * weight;
+            yt += cy * weight;
+            sum_x += cx;
+            sum_y += cy;
+            contributing += 1.0;
+        }
+
+        let max_dist_sq = (cell_size as f32 * 3.0).powi(2);
+        let (centre_x, centre_y) = (sum_x / contributing, sum_y / contributing);
+        for ((cx, cy), weight) in corners {
+            if weight != 0.0 && (centre_x - cx).powi(2) + (centre_y - cy).powi(2) > max_dist_sq {
+                return None;
+            }
+        }
+        // `interpolated_point` returns NaN for a missing mapping and `lookup` turns any
+        // NaN component into `None`; do the same.
+        (!xt.is_nan() && !yt.is_nan()).then_some((xt, yt))
+    }
+}
+
+/// A finished pixelmap mapping between two photos, reduced to what reconstruction reads.
+///
+/// A [`Correspondence`] keeps the two photos it was computed from alive, scaled to the
+/// solver's final working width: at [`Quality::High`] that is two 1600 px RGBA images,
+/// some 30 MB a pair. A run keeps every pair until the end, so with many photos those
+/// copies, not the mappings, filled memory. This holds only the grids, about 1 MB a pair.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct Mapping {
+    forward: Grid,
+    backward: Grid,
+    cell_size: usize,
+    /// Working pixels per photo pixel.
+    working_scale: f32,
+    coverage: f32,
+}
+
+impl From<Correspondence> for Mapping {
+    fn from(mapping: Correspondence) -> Mapping {
+        Mapping {
+            forward: Grid::copy(mapping.forward()),
+            backward: Grid::copy(mapping.backward()),
+            cell_size: mapping.forward().grid_cell_size(),
+            working_scale: mapping.working_scale(),
+            coverage: mapping.coverage(),
+        }
+    }
+}
+
+impl Mapping {
+    /// The forward grid's columns and rows.
+    pub fn grid_dimensions(&self) -> (usize, usize) {
+        (self.forward.columns, self.forward.rows)
+    }
+
+    /// `p` through `grid`, converted into and out of the working resolution as
+    /// `Correspondence::lookup` does.
+    fn look(&self, grid: &Grid, p: PhotoPx) -> Option<PhotoPx> {
+        let scale = self.working_scale;
+        let cell = self.cell_size as f32;
+        let (x, y) = grid.interpolate(p.x() * scale / cell, p.y() * scale / cell, self.cell_size)?;
+        Some(PhotoPx::new(x / scale, y / scale))
+    }
+}
+
+impl PairLookup for Mapping {
     fn a_to_b(&self, p: PhotoPx) -> Option<PhotoPx> {
-        self.lookup(p.x(), p.y()).map(|(x, y)| PhotoPx::new(x, y))
+        self.look(&self.forward, p)
     }
 
     fn b_to_a(&self, p: PhotoPx) -> Option<PhotoPx> {
-        self.lookup_back(p.x(), p.y())
-            .map(|(x, y)| PhotoPx::new(x, y))
+        self.look(&self.backward, p)
     }
 
     fn coverage(&self) -> f32 {
-        Correspondence::coverage(self)
+        self.coverage
     }
 
     fn native_stride(&self) -> f32 {
-        Correspondence::forward(self).grid_cell_size() as f32 / self.working_scale()
+        self.cell_size as f32 / self.working_scale
     }
 
     fn precision_px(&self) -> f32 {
         // The solver's mapping is good to about a pixel at the resolution it works at.
-        1.0 / self.working_scale()
+        1.0 / self.working_scale
     }
 }
 
@@ -109,27 +235,18 @@ fn index(views: usize, pair: PairId) -> usize {
 
 /// The finished mapping of `pair` as a [`PairMap`], converted out of the solver's working
 /// resolution into the coordinates of the photos the caller handed in.
-fn pair_map(pair: PairId, mapping: &Correspondence) -> PairMap {
-    let forward = mapping.forward();
-    let (columns, rows) = forward.grid_dimensions();
+fn pair_map(pair: PairId, mapping: &Mapping) -> PairMap {
+    let forward = &mapping.forward;
     // `working_scale` is working pixels per source pixel, so dividing takes a grid entry
     // back to the photo the caller passed in. Unmapped cells hold NaN and stay NaN.
-    let scale = mapping.working_scale();
-    let mut points = Vec::with_capacity(columns * rows * 2);
-    for row in 0..rows {
-        for column in 0..columns {
-            let (x, y) = forward.grid_coordinates(column, row);
-            points.push(x / scale);
-            points.push(y / scale);
-        }
-    }
+    let scale = mapping.working_scale;
     PairMap {
         pair,
-        columns,
-        rows,
+        columns: forward.columns,
+        rows: forward.rows,
         cell_size: mapping.native_stride(),
-        points,
-        coverage: mapping.coverage(),
+        points: forward.points.iter().map(|v| v / scale).collect(),
+        coverage: mapping.coverage,
     }
 }
 
@@ -149,7 +266,7 @@ pub fn compute(
     quality: Quality,
     seed: u64,
     on_event: &mut dyn FnMut(Event) -> Flow,
-) -> Result<PairGraph<Correspondence>, Error> {
+) -> Result<PairGraph<Mapping>, Error> {
     let views = photos.len();
     let total = PairId::count(views);
     let mut maps = Vec::with_capacity(total);
@@ -180,6 +297,8 @@ pub fn compute(
             });
         };
 
+        // Reduced at once, so the working photos the solver scaled are freed with it.
+        let mapping = Mapping::from(mapping);
         let map = pair_map(pair, &mapping);
         maps.push(mapping);
         emit(
