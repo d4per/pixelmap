@@ -8,7 +8,7 @@ use pixelmap_multiview::pairs::{self, MIN_PAIR_COVERAGE};
 use pixelmap_multiview::rng::Rng;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::twoview::{self, Params};
- use pixelmap_multiview::{Error, Event, Flow, PairLookup, PhotoPx, Stage, ViewId};
+use pixelmap_multiview::{Error, Event, Flow, PairLookup, PhotoPx, Stage, ViewId};
 
 fn rendered(set: &SyntheticSet) -> Vec<Arc<pixelmap::Photo>> {
     (0..set.views())
@@ -194,6 +194,9 @@ fn a_mapping_looks_up_exactly_what_its_correspondence_did() {
             }
         }
     }
-    assert!(mapped > 0 && unmapped > 0, "{mapped} mapped, {unmapped} not");
+    assert!(
+        mapped > 0 && unmapped > 0,
+        "{mapped} mapped, {unmapped} not"
+    );
     assert_eq!(mapping.coverage(), correspondence.coverage());
 }

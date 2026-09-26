@@ -89,7 +89,9 @@ fn a_linear_disparity_is_a_flat_surface() {
             assert_eq!(p.z, 0.0, "cell ({x}, {y}) has depth {}", p.z);
         }
     }
-    assert!(!between(&model.to_x3d(), "coordIndex='", "'").trim().is_empty());
+    assert!(!between(&model.to_x3d(), "coordIndex='", "'")
+        .trim()
+        .is_empty());
 }
 
 #[test]

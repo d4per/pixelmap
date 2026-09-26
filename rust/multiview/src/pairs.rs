@@ -143,7 +143,8 @@ impl Mapping {
     fn look(&self, grid: &Grid, p: PhotoPx) -> Option<PhotoPx> {
         let scale = self.working_scale;
         let cell = self.cell_size as f32;
-        let (x, y) = grid.interpolate(p.x() * scale / cell, p.y() * scale / cell, self.cell_size)?;
+        let (x, y) =
+            grid.interpolate(p.x() * scale / cell, p.y() * scale / cell, self.cell_size)?;
         Some(PhotoPx::new(x / scale, y / scale))
     }
 }
