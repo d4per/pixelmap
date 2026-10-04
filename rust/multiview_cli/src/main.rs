@@ -44,8 +44,8 @@ struct Args {
     #[arg(long, default_value = "low")]
     processing_mode: ProcessingMode,
 
-    /// Write the photos as used, the sparse model, the depth maps and the textured mesh (as
-    /// OBJ and X3D) into this directory.
+    /// Write the textured mesh into this directory rather than the current one, along with
+    /// the photos as used, the sparse model and the depth maps.
     #[arg(long)]
     dump_dir: Option<PathBuf>,
 
@@ -144,10 +144,13 @@ fn run(args: Args) -> Result<(), String> {
     println!("reconstructed in {:.1} s", start.elapsed().as_secs_f64());
     print_depth_stats(&model);
 
-    if let Some(dir) = &args.dump_dir {
-        write_outputs(dir, &photos, &model)?;
+    match &args.dump_dir {
+        Some(dir) => {
+            write_diagnostics(dir, &photos, &model)?;
+            write_meshes(dir, &model)
+        }
+        None => write_meshes(Path::new("."), &model),
     }
-    Ok(())
 }
 
 /// Runs on a worker thread and stops it after `seconds`, reporting how long the stop took
@@ -243,9 +246,8 @@ fn print_depth_stats(model: &Model) {
     }
 }
 
-/// Writes the sparse model, depth maps and textured mesh into `dir`.
-fn write_outputs(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+/// Writes the sparse model, depth maps and coverage maps into `dir`.
+fn write_diagnostics(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(), String> {
     let d = model
         .diagnostics()
         .ok_or("the model's diagnostics were dropped")?;
@@ -280,6 +282,16 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(),
         )?;
     }
 
+    eprintln!(
+        "wrote view_N.png, sparse.ply, depth_N.png and coverage_N.png to {}",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Writes the textured mesh into `dir` in every format the crate exports.
+fn write_meshes(dir: &Path, model: &Model) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let mesh = &model.mesh;
     write_file(&dir.join("mesh.obj"), |out| {
         export::write_textured_obj(out, mesh, &model.texture, "mesh.mtl")
@@ -294,9 +306,22 @@ fn write_outputs(dir: &Path, photos: &[Arc<Photo>], model: &Model) -> Result<(),
     write_file(&dir.join("mesh_colours.ply"), |out| {
         export::write_ply_mesh(out, mesh, &model.texture.vertex_colours)
     })?;
+    let atlas_png = encode_png(&model.texture.atlas)?;
+    write_file(&dir.join("mesh.glb"), |out| {
+        export::write_textured_glb(out, mesh, &model.texture, &atlas_png)
+    })?;
+    write_file(&dir.join("mesh.html"), |out| {
+        export::write_textured_html(
+            out,
+            mesh,
+            &model.texture,
+            &atlas_png,
+            "pixelmap_multiview reconstruction",
+        )
+    })?;
 
     eprintln!(
-        "wrote view_N.png, sparse.ply, depth_N.png, coverage_N.png, mesh.obj, mesh.mtl, mesh.x3d, mesh_texture.png and mesh_colours.ply to {}",
+        "wrote mesh.obj, mesh.mtl, mesh.x3d, mesh.glb, mesh.html, mesh_texture.png and mesh_colours.ply to {}",
         dir.display()
     );
     Ok(())
@@ -316,14 +341,27 @@ fn write_file(
 }
 
 fn save_photo(path: &Path, photo: &Photo) -> Result<(), String> {
+    rgba_image(photo)
+        .save(path)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// `photo` as PNG file bytes, for embedding in a GLB.
+fn encode_png(photo: &Photo) -> Result<Vec<u8>, String> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    rgba_image(photo)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| format!("could not encode the texture as PNG: {e}"))?;
+    Ok(png.into_inner())
+}
+
+fn rgba_image(photo: &Photo) -> image::RgbaImage {
     image::RgbaImage::from_raw(
         photo.width() as u32,
         photo.height() as u32,
         photo.as_rgba().to_vec(),
     )
     .expect("buffer came from a Photo of exactly these dimensions")
-    .save(path)
-    .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// A photo tinted by what became of its depth samples: red where no other photo was matched
