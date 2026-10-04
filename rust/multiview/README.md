@@ -151,10 +151,18 @@ the repository does them for photos on disc:
 
     cargo run --release -p pixelmap_multiview_cli -- a.jpg b.jpg c.jpg d.jpg --dump-dir out
 
-With `--dump-dir`, the sparse model is written to `out/sparse.ply`, with coloured points and a
-red pyramid per camera; the textured surface to `out/mesh.obj`, with `mesh.mtl` and
-`mesh_texture.png`, and as X3D to `out/mesh.x3d`; the surface with a colour per vertex to `out/mesh_colours.ply`; and each
-depth map to `out/depth_N.png`. They open in MeshLab, Blender or CloudCompare.
+The textured surface is written to the current directory: as `mesh.obj`, with `mesh.mtl`
+and `mesh_texture.png`; as X3D to `mesh.x3d`; as a single binary glTF file with the texture
+embedded to `mesh.glb`; inside a web page to `mesh.html`, which shows it in 3D in any
+browser (it fetches the `<model-viewer>` library from a CDN, so it needs a network
+connection); and with a colour per vertex to `mesh_colours.ply`. They open in MeshLab,
+Blender or CloudCompare; `mesh.glb` also opens in the Windows 3D Viewer, three.js and
+`<model-viewer>`, and most game engines.
+
+With `--dump-dir out`, the meshes go to `out` instead, along with the photos as used
+(`out/view_N.png`), the sparse model (`out/sparse.ply`, with coloured points and a red
+pyramid per camera), each depth map (`out/depth_N.png`) and a coverage map per photo
+(`out/coverage_N.png`).
 
 The CLI also prints, per photo, how much of it was matched to no other photo and where the
 remaining depth samples were dropped.

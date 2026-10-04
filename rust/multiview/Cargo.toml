@@ -24,6 +24,10 @@ pixelmap = { path = "../pixelmap", version = "0.3.0", default-features = false }
 # written here on nalgebra rather than taken from rust-cv, whose crates pin nalgebra 0.21.
 nalgebra = "0.33"
 
+[dev-dependencies]
+# Only to check that the GLB writer's hand-written JSON chunk parses.
+serde_json = "1"
+
 [features]
 default = ["parallel", "threads"]
 parallel = ["pixelmap/parallel"]

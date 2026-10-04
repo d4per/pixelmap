@@ -6,8 +6,20 @@ All notable changes to this crate are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `export::write_textured_glb`, which writes the textured mesh as binary glTF 2.0 (GLB):
+  one file with the atlas embedded, for viewers and engines that read glTF but not X3D.
+  The CLI writes it to `mesh.glb`.
+- `export::write_textured_html`, which writes one self-contained HTML page that shows the
+  textured mesh in 3D: the GLB is embedded as a `data:` URI and displayed with Google's
+  `<model-viewer>`, loaded from a pinned CDN URL. The CLI writes it to `mesh.html`.
+
 ### Changed
 
+- The CLI always writes the textured mesh, to the current directory when no `--dump-dir`
+  is given; before, it wrote nothing without one. `--dump-dir` still adds the photos,
+  sparse model, depth and coverage maps.
 - The README and `Options` examples now take the focal length from EXIF and turn on
   `refine_focal`, where they used to hardcode 28 mm, a value a copied example would
   keep for any camera.
