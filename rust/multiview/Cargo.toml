@@ -1,6 +1,6 @@
 [package]
 name = "pixelmap_multiview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "3D reconstruction from three or more photos: dense pixelmap correspondence, camera registration, bundle adjustment, depth fusion and texturing"
