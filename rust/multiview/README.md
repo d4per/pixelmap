@@ -21,26 +21,53 @@ this mesh, shown here untextured in MeshLab from three sides:
 
 ## Using it
 
-Hand over the photos, say how much effort to spend, and follow along:
+Hand over the photos, say how much effort to spend, follow along, and save the result.
+Decoding and PNG encoding are the caller's job; this example uses the `image` crate:
 
 ```rust,ignore
-use pixelmap::Quality;
-use pixelmap_multiview::{Flow, Focal, Options};
+use std::{fs::File, io::BufWriter, sync::Arc};
 
-// `photos: Vec<Arc<pixelmap::Photo>>`, decoded by the caller, all the same size.
-// `exif_focal_35mm: f64`, the photos' FocalLengthIn35mmFilm from EXIF. Leave `.focal` out
-// when it is not known: the focal length is then estimated from the photos and refined.
-let options = Options::new()
-    .quality(Quality::Medium)
-    .focal(Focal::Equivalent35mm(exif_focal_35mm))
-    .refine_focal(true);
+use pixelmap::{Photo, Quality};
+use pixelmap_multiview::{export, Flow, Options};
 
-let model = pixelmap_multiview::run(&photos, &options, &mut |event| {
-    println!("{}: {}", event.stage(), event.message());
-    Flow::Continue(())
-})?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The photos must all be the same size.
+    let photos = ["a.jpg", "b.jpg", "c.jpg"]
+        .iter()
+        .map(|path| {
+            let rgba = image::open(path)?.into_rgba8();
+            let (width, height) = rgba.dimensions();
+            Ok(Arc::new(Photo::from_rgba(width as usize, height as usize, rgba.into_raw())?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
-println!("{} triangles", model.mesh.triangles.len());
+    // No `.focal(...)`: the focal length is estimated from the photos and refined.
+    let options = Options::new().quality(Quality::Medium);
+
+    let model = pixelmap_multiview::run(&photos, &options, &mut |event| {
+        println!("{}: {}", event.stage(), event.message());
+        Flow::Continue(())
+    })?;
+    println!("{} triangles", model.mesh.triangles.len());
+
+    // The GLB and the web page both embed the texture atlas as PNG.
+    let atlas = &model.texture.atlas;
+    let mut atlas_png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_raw(atlas.width() as u32, atlas.height() as u32, atlas.as_rgba().to_vec())
+        .expect("the atlas buffer matches its dimensions")
+        .write_to(&mut atlas_png, image::ImageFormat::Png)?;
+    let atlas_png = atlas_png.into_inner();
+
+    // A single binary glTF file with the texture embedded. It imports straight into
+    // Blender (File → Import → glTF 2.0), as well as three.js and most game engines.
+    let mut glb = BufWriter::new(File::create("mesh.glb")?);
+    export::write_textured_glb(&mut glb, &model.mesh, &model.texture, &atlas_png)?;
+
+    // A web page that shows the model in 3D in any browser.
+    let mut html = BufWriter::new(File::create("mesh.html")?);
+    export::write_textured_html(&mut html, &model.mesh, &model.texture, &atlas_png, "My model")?;
+    Ok(())
+}
 ```
 
 `Options` is the whole of what a caller chooses: the quality, what is known about the
@@ -173,7 +200,7 @@ overlap generously avoid it; so does anything seen by a third photo away from it
 
 The command-line tool is not published to crates.io; build it from the repository.
 
-## Cost
+## Time complexity
 
 Pairwise correspondence dominates: N photos need N(N − 1)/2 pixelmap runs. One run on
 a 4:3 photo pair, native build, measured with `pixelmap-multiview --time-pair`:
