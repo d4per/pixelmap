@@ -4,6 +4,19 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2 - 2026-11-17
+
+### Changed
+
+- Requires pixelmap 0.3.1. Its solver is faster: each pair is mapped with about 40% fewer
+  region comparisons, which on 4128x3096 photos takes `High` from 5.9 s to 4.3 s per pair.
+  It also no longer leaves straight unmapped bands, one grid cell wide, through the
+  correspondence of some pairs; those bands showed up here as gaps in the depth maps and
+  the mesh. For the same photos and seed the reconstruction therefore differs from
+  0.1.1's. See pixelmap's CHANGELOG for details.
+- The README's example is now a complete program: it decodes the photos, runs the
+  reconstruction, and writes the textured mesh as GLB and as a web page.
+
 ## 0.1.1 - 2026-10-04
 
 ### Added
