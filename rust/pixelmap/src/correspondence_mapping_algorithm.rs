@@ -1,10 +1,54 @@
 use crate::ac_grid::ACGrid;
 use crate::affine_transform::AffineTransform;
-use crate::correspondence_scoring::{CorrespondenceScoring, PackedPhoto};
+use crate::correspondence_scoring::{CorrespondenceScoring, FixedTransform, PackedPhoto};
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use crate::rng::Rng;
 use std::sync::Arc;
+
+/// How far a cell's score has to drop over one pass before the cell passes its transform
+/// on to its neighbours, as a fraction of the score it began the pass with.
+///
+/// A cell that was empty when the pass began always passes its transform on; this only
+/// governs cells that already held one. Replacing a transform by one that scores a
+/// fraction of a percent lower is still worth doing for the cell itself, but handing that
+/// near-identical transform to four neighbours to score again is where the relaxation's
+/// long tail came from.
+///
+/// Measured on two sets of three real photos (3 to 8 seeds each, judged by how well the
+/// three pairwise mappings close the loop A -> B -> C -> A) and on rendered scenes with
+/// an exact ground truth: at 0.05 the result stays inside the spread the solver shows
+/// from one seed to the next, for about ten percentage points fewer evaluations. At 0.10
+/// the loop error on the harder set is visibly worse. On the hardest pairs at
+/// `Quality::Low` 0.05 already sits at the weak end of that spread, so this is not a
+/// number to raise casually.
+const REPRODUCE_GAIN: f32 = 0.05;
+
+/// Whether a cell that began a pass at `score_at_start` and ended it at `score_now`
+/// passes its transform on. Only called for cells whose transform changed in the pass.
+fn reproduces(score_at_start: f32, score_now: f32) -> bool {
+    // `f32::MAX` is the score of an empty cell: whatever filled it is news to the
+    // neighbours however well or badly it fits.
+    score_at_start == f32::MAX || score_now < score_at_start * (1.0 - REPRODUCE_GAIN)
+}
+
+/// The candidates a cell has already evaluated that are worth remembering.
+///
+/// Scoring is a pure function of a candidate's [`FixedTransform`], a cell's best score
+/// only ever falls, and a candidate has to score strictly lower to be accepted. A
+/// candidate equal to one the cell has evaluated before would therefore score what that
+/// one scored and be rejected, so it can be dropped unscored without changing anything.
+///
+/// Two are enough to catch the common case. When a cell improves and hands its transform
+/// to a neighbour that adopts it unshifted, the neighbour hands the very same transform
+/// straight back.
+#[derive(Clone, Copy, Default)]
+struct Seen {
+    /// The candidate whose evaluation produced the cell's current transform.
+    accepted: Option<FixedTransform>,
+    /// The candidate the cell rejected most recently.
+    rejected: Option<FixedTransform>,
+}
 
 /// Edge length, in pixels, of the region the queue is grouped by between passes.
 ///
@@ -25,8 +69,9 @@ const QUEUE_TILE: usize = 10;
 /// 1. **Initialization**: The images are scaled, a grid is created, and initial transforms
 ///    are pushed into a queue.
 /// 2. **Scoring**: Each transform is evaluated (lower score is better).
-/// 3. **Refinement**: Transforms are slightly adjusted, and any improvements are propagated
-///    to neighboring cells, allowing the algorithm to converge over multiple iterations.
+/// 3. **Refinement**: Transforms are slightly adjusted, and a cell that ends a pass with a
+///    clearly better transform than it began with propagates it to its neighbours,
+///    allowing the algorithm to converge over multiple passes.
 /// 4. **Final Mapping**: Once no more improvements occur, you can retrieve a [DensePhotoMap]
 ///    describing the best transforms found for each cell.
 pub struct CorrespondenceMappingAlgorithm {
@@ -44,14 +89,27 @@ pub struct CorrespondenceMappingAlgorithm {
     ac_grid: ACGrid,
     /// Shuffles the queue between passes.
     ///
-    /// The order in which the queue is drained decides which local optimum the
-    /// relaxation settles into, so the stream has to be reproducible from the caller's
-    /// seed for two runs of the same input to agree.
+    /// Within a pass a cell ends up with the best-scoring candidate it was offered
+    /// whatever the order, so the order only decides between candidates that score
+    /// exactly the same. That happens often — many candidates resolve to the very same
+    /// pixels — and which of them a cell keeps decides what its neighbours are handed
+    /// next, so the stream has to be reproducible from the caller's seed for two runs of
+    /// the same input to agree.
     rng: Rng,
     /// Reused buffer for the tile-ordering counting sort.
     sort_scratch: Vec<AffineTransform>,
     /// Reused bucket boundaries for the tile-ordering counting sort.
     tile_offsets: Vec<u32>,
+    /// Per cell, the candidates it has already evaluated; see [`Seen`].
+    seen: Vec<Seen>,
+    /// The cells whose transform changed during the pass in progress, in the order they
+    /// first did, each with the score it held when the pass began.
+    improved: Vec<(u32, f32)>,
+    /// Whether a cell is already in `improved`.
+    is_improved: Vec<bool>,
+    /// Whether candidates a cell has already evaluated are dropped unscored. Always on;
+    /// the tests turn it off to check that it changes the work and nothing else.
+    skip_seen: bool,
 }
 
 impl CorrespondenceMappingAlgorithm {
@@ -116,6 +174,10 @@ impl CorrespondenceMappingAlgorithm {
             rng: Rng::seed_from_u64(seed),
             sort_scratch: Vec::new(),
             tile_offsets: Vec::new(),
+            seen: vec![Seen::default(); grid_width * grid_height],
+            improved: Vec::new(),
+            is_improved: vec![false; grid_width * grid_height],
+            skip_seen: true,
         }
     }
 
@@ -304,88 +366,144 @@ impl CorrespondenceMappingAlgorithm {
         }
     }
 
-    /// Processes the current queue of transforms. For each transform:
+    /// Runs one pass: scores every queued transform against its grid cell, then lets the
+    /// cells that came out of the pass clearly better hand their transform to their
+    /// neighbours, which is the queue of the next pass.
+    ///
+    /// For each transform:
     /// 1. Validates its scale and position (no out-of-bounds).
-    /// 2. Uses `optimize_position` to adjust it.
-    /// 3. Checks whether it improves upon the transform stored in the grid cell.
-    /// 4. If improved, updates that cell and extrapolates to neighboring cells,
-    ///    pushing new transforms back into a temporary queue.
+    /// 2. Drops it unscored if its cell has evaluated the same transform before.
+    /// 3. Uses `optimize_position` to adjust it.
+    /// 4. Stores it in its grid cell if it scores lower than what the cell holds.
+    ///
+    /// # Who reproduces
+    ///
+    /// A cell hands on a transform **once per pass, after the pass, from whatever it
+    /// holds then** — not at every improvement along the way. It used to queue four
+    /// children the moment a transform was accepted, so a transform displaced a moment
+    /// later by a better candidate for the same cell had already reproduced, and its
+    /// children went on to be scored, sometimes accepted, and to reproduce in turn.
+    /// Measured on a 4128x3096 pair at `high`, about half of all evaluations were
+    /// children of a transform that left no descendant in the final grid, and a quarter
+    /// of all accepted transforms were replaced within the pass that accepted them.
+    ///
+    /// On top of that, a cell that already held a transform when the pass began hands
+    /// its new one on only if the score dropped by more than [`REPRODUCE_GAIN`].
+    ///
+    /// Together with dropping transforms a cell has already evaluated (see [`Seen`]),
+    /// this takes about 40% of the evaluations away. Both the numbers and the checks
+    /// that the result did not suffer are described at [`REPRODUCE_GAIN`].
+    ///
+    /// What was deliberately *not* cut is the spreading of poorly fitting transforms
+    /// into cells that have nothing better. That looks like the larger waste — on a
+    /// hard pair two thirds of all evaluations land in cells the round-trip check then
+    /// discards — but it is how the solver finds the regions it does keep. Limiting how
+    /// far a transform may spread through unmapped cells, letting a transform spread
+    /// only into worse-fitting cells, and refusing to reproduce from a poorly fitting
+    /// entry into an empty cell were all tried, and each cost coverage or accuracy on
+    /// the harder of the two photo sets.
     ///
     /// Returns `true` if the queue is empty afterward (no improvements), or
-    /// `false` if there are still transforms to process in the next iteration.
+    /// `false` if there are still transforms to process in the next pass.
     fn run_queue(&mut self) -> bool {
-        let ac_grid = &self.ac_grid;
-        let mut out_queue: Vec<AffineTransform> = Vec::with_capacity(self.queue.len());
+        let grid_width = self.ac_grid.get_grid_width();
+        let grid_height = self.ac_grid.get_grid_height();
 
-        loop {
-            let cm_opt = self.queue.pop();
-            if cm_opt.is_none() {
-                break;
-            }
-            let cm = cm_opt.unwrap();
-
+        while let Some(cm) = self.queue.pop() {
             // Skip if the transform is out of scale or invalid in terms of translation.
             if !cm.is_scale_valid(4.0) || !self.is_valid(&cm) {
+                continue;
+            }
+
+            // Determine which grid cell the transform belongs to. Optimizing it moves
+            // where it lands in `photo2`, never its origin, so this can be decided up
+            // front.
+            //
+            // A transform can sit one cell past the grid: `init_from_photomapping`
+            // rounds to the nearest grid node, and when a step works at a lower width
+            // than the map it starts from, the map's last column or row rounds up to a
+            // node at the photo's far edge. There is no cell there to compete for.
+            let grid_x = cm.origin_x as usize / self.grid_cell_size;
+            let grid_y = cm.origin_y as usize / self.grid_cell_size;
+            if grid_x >= grid_width || grid_y >= grid_height {
+                continue;
+            }
+            let cell = grid_x + grid_y * grid_width;
+
+            // A transform this cell has already evaluated would score the same again and
+            // lose; see `Seen`.
+            let key = FixedTransform::new(&cm);
+            let seen = self.seen[cell];
+            if self.skip_seen && (seen.accepted == Some(key) || seen.rejected == Some(key)) {
                 continue;
             }
 
             // Attempt a small local optimization on (cm).
             let (score, cm_out) = self.optimize_position(&cm);
 
-            // Determine which grid cell (cm_out) belongs to.
-            let grid_x = cm_out.origin_x as usize / self.grid_cell_size;
-            let grid_y = cm_out.origin_y as usize / self.grid_cell_size;
-
-            // Check bounds in the ACGrid.
-            if grid_x >= ac_grid.get_grid_width() || grid_y >= ac_grid.get_grid_height() {
-                debug_assert!(false, "grid coordinate {grid_x},{grid_y} out of range");
-                continue;
-            }
-
-            // Retrieve the current best cell transform/score.
-            let grid_square = ac_grid.get_grid_square(grid_x, grid_y);
-            if grid_square.get_score() > score {
-                // If we've found an improvement, update and extrapolate to neighbors.
+            // Compare with the current best cell transform/score.
+            let grid_square = self.ac_grid.get_grid_square(grid_x, grid_y);
+            let score_before = grid_square.get_score();
+            if score_before > score {
                 grid_square.set(cm_out, score);
-
-                // Generate child transforms for neighboring cells and push them to
-                // out_queue.
-                //
-                // These extrapolate `cm_out`, the transform that actually won the cell,
-                // not the `cm` that was popped: propagating the pre-optimization
-                // transform threw away the +-1 pixel correction `optimize_position` had
-                // just found, so every neighbour had to rediscover it. Measured over
-                // seven seeds on a 1170x893 pair at `medium`, propagating the optimized
-                // transform raises the matched area from 0.384 to 0.408 for about 14%
-                // more time, the extra time being spent converging to the larger result.
-                if grid_x > 0 {
-                    out_queue.push(cm_out.extrapolate_mapping(
-                        ((grid_x - 1) * self.grid_cell_size) as u16,
-                        (grid_y * self.grid_cell_size) as u16,
-                    ));
+                self.seen[cell].accepted = Some(key);
+                // Remember that the cell changed, and what it had to beat when the pass
+                // began. It reproduces after the pass, from whatever it holds by then.
+                if !self.is_improved[cell] {
+                    self.is_improved[cell] = true;
+                    self.improved.push((cell as u32, score_before));
                 }
-                if grid_x < ac_grid.get_grid_width() - 1 {
-                    out_queue.push(cm_out.extrapolate_mapping(
-                        ((grid_x + 1) * self.grid_cell_size) as u16,
-                        (grid_y * self.grid_cell_size) as u16,
-                    ));
-                }
-                if grid_y > 0 {
-                    out_queue.push(cm_out.extrapolate_mapping(
-                        (grid_x * self.grid_cell_size) as u16,
-                        ((grid_y - 1) * self.grid_cell_size) as u16,
-                    ));
-                }
-                if grid_y < ac_grid.get_grid_height() - 1 {
-                    out_queue.push(cm_out.extrapolate_mapping(
-                        (grid_x * self.grid_cell_size) as u16,
-                        ((grid_y + 1) * self.grid_cell_size) as u16,
-                    ));
-                }
+            } else {
+                self.seen[cell].rejected = Some(key);
             }
         }
 
-        // Replace the main queue with out_queue for the next iteration.
+        // Generate child transforms for the neighbours of every cell that came out of
+        // the pass clearly better than it went in.
+        //
+        // These extrapolate the transform the cell holds, which is the *optimized* one,
+        // not the candidate that was popped: propagating the pre-optimization transform
+        // threw away the +-1 pixel correction `optimize_position` had just found, so
+        // every neighbour had to rediscover it. Measured over seven seeds on a 1170x893
+        // pair at `medium`, propagating the optimized transform raises the matched area
+        // from 0.384 to 0.408 for about 14% more time, the extra time being spent
+        // converging to the larger result.
+        let mut improved = std::mem::take(&mut self.improved);
+        let mut out_queue: Vec<AffineTransform> = Vec::with_capacity(4 * improved.len());
+        let cell_size = self.grid_cell_size;
+        for &(cell, score_at_start) in &improved {
+            let cell = cell as usize;
+            self.is_improved[cell] = false;
+            let (grid_x, grid_y) = (cell % grid_width, cell / grid_width);
+            let grid_square = self.ac_grid.get_grid_square(grid_x, grid_y);
+            if !reproduces(score_at_start, grid_square.get_score()) {
+                continue;
+            }
+            let Some(cm_out) = grid_square.get_affine_transform() else {
+                continue;
+            };
+            let mut child = |x: usize, y: usize| {
+                out_queue.push(
+                    cm_out.extrapolate_mapping((x * cell_size) as u16, (y * cell_size) as u16),
+                );
+            };
+            if grid_x > 0 {
+                child(grid_x - 1, grid_y);
+            }
+            if grid_x < grid_width - 1 {
+                child(grid_x + 1, grid_y);
+            }
+            if grid_y > 0 {
+                child(grid_x, grid_y - 1);
+            }
+            if grid_y < grid_height - 1 {
+                child(grid_x, grid_y + 1);
+            }
+        }
+        improved.clear();
+        self.improved = improved;
+
+        // Replace the main queue with out_queue for the next pass.
         self.queue = out_queue;
         // If it's empty, the algorithm is done (no further improvements).
         self.queue.is_empty()
@@ -447,5 +565,225 @@ impl CorrespondenceMappingAlgorithm {
             }
         }
         pm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WIDTH: usize = 120;
+    const HEIGHT: usize = 90;
+    const SHIFT: usize = 4;
+
+    /// Two windows onto one noisy texture, the second `SHIFT` pixels further along both
+    /// axes, so what the first shows at `(x, y)` sits at `(x - SHIFT, y - SHIFT)` in the
+    /// second.
+    ///
+    /// The second window gets a little noise of its own, as two real photos would have,
+    /// so that even the true mapping does not score a perfect zero.
+    fn shifted_pair() -> (Photo, Photo) {
+        let (bw, bh) = (WIDTH + SHIFT, HEIGHT + SHIFT);
+        let mut rng = Rng::seed_from_u64(0x7E57_0FF5_9121);
+        let mut base = Vec::with_capacity(bw * bh * 4);
+        for y in 0..bh {
+            for x in 0..bw {
+                let noise = (rng.next_u64() % 70) as f32 - 35.0;
+                let wave = 127.0 + 100.0 * (x as f32 / 9.0).sin() * (y as f32 / 11.0).cos() + noise;
+                let v = wave.clamp(0.0, 255.0) as u8;
+                base.extend_from_slice(&[v, (v / 2).wrapping_add(40), 255 - v, 255]);
+            }
+        }
+        let window = |ox: usize, oy: usize| {
+            let mut img_data = Vec::with_capacity(WIDTH * HEIGHT * 4);
+            for y in 0..HEIGHT {
+                let row = (y + oy) * bw + ox;
+                img_data.extend_from_slice(&base[row * 4..(row + WIDTH) * 4]);
+            }
+            Photo {
+                img_data,
+                width: WIDTH,
+                height: HEIGHT,
+            }
+        };
+        let (first, mut second) = (window(0, 0), window(SHIFT, SHIFT));
+        for pixel in second.img_data.chunks_exact_mut(4) {
+            for channel in &mut pixel[..3] {
+                let jitter = (rng.next_u64() % 7) as i32 - 3;
+                *channel = (*channel as i32 + jitter).clamp(0, 255) as u8;
+            }
+        }
+        (first, second)
+    }
+
+    fn solver(seed: u64) -> CorrespondenceMappingAlgorithm {
+        let (a, b) = shifted_pair();
+        CorrespondenceMappingAlgorithm::new(WIDTH, &a, &b, 5, 5, seed)
+    }
+
+    /// A solver seeded on a coarse lattice with the true shift and, next to each, a
+    /// wrong guess: something to spread, something to compete with it, and something
+    /// to lose.
+    fn seeded_solver(seed: u64) -> CorrespondenceMappingAlgorithm {
+        let mut solver = solver(seed);
+        let shift = SHIFT as f32;
+        for y in (10..HEIGHT - 10).step_by(15) {
+            for x in (10..WIDTH - 10).step_by(15) {
+                let (x, y) = (x as f32, y as f32);
+                solver.add_init_point(x, y, x - shift, y - shift, 0.0);
+                solver.add_init_point(x, y, x + 7.0, y - 9.0, 0.3);
+            }
+        }
+        solver
+    }
+
+    /// Every cell's transform and score, for comparing two solvers exactly.
+    fn grid_state(solver: &CorrespondenceMappingAlgorithm) -> Vec<(Option<AffineTransform>, u32)> {
+        let grid = &solver.ac_grid;
+        (0..grid.get_grid_height())
+            .flat_map(|y| (0..grid.get_grid_width()).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let square = grid.get_grid_square(x, y);
+                (square.get_affine_transform(), square.get_score().to_bits())
+            })
+            .collect()
+    }
+
+    /// Dropping a candidate a cell has already evaluated is justified by an argument, not
+    /// by a measurement: it would have been rejected. So switching the drop off has to
+    /// leave every cell with exactly the same transform and score, and only cost more.
+    #[test]
+    fn dropping_seen_candidates_changes_the_work_and_nothing_else() {
+        let mut dropping = seeded_solver(11);
+        let mut scoring_everything = seeded_solver(11);
+        scoring_everything.skip_seen = false;
+
+        dropping.run_until_done();
+        scoring_everything.run_until_done();
+
+        assert!(
+            grid_state(&dropping) == grid_state(&scoring_everything),
+            "dropping seen candidates changed the grid"
+        );
+        assert!(
+            dropping.total_comparisons() < scoring_everything.total_comparisons(),
+            "nothing was dropped: {} comparisons either way",
+            dropping.total_comparisons()
+        );
+        let coverage = dropping.get_photo_mapping().calculate_used_area();
+        assert!(
+            coverage > 0.9,
+            "the solve only filled {coverage:.2} of the grid"
+        );
+    }
+
+    /// Three candidates for one cell, popped worst first, so the cell is improved more
+    /// than once within the pass. Each improvement used to queue four children of its
+    /// own; now the cell reproduces once, from the transform it ends the pass with.
+    #[test]
+    fn a_cell_reproduces_once_per_pass_from_what_it_ends_up_holding() {
+        let mut solver = solver(3);
+        let (at, landing) = (40.0, 40.0 - SHIFT as f32);
+        // The queue is popped from the back, so the true shift goes in first.
+        for (dx, dy) in [(0.0, 0.0), (3.0, 0.0), (5.0, -6.0)] {
+            solver.add_init_point(at, at, landing + dx, landing + dy, 0.0);
+        }
+
+        let done = solver.run_queue();
+
+        assert!(!done, "an improved cell has neighbours to tell");
+        assert_eq!(solver.total_comparisons(), 3 * 5, "all three were scored");
+        let best = solver
+            .ac_grid
+            .get_grid_square(8, 8)
+            .get_affine_transform()
+            .expect("the cell was filled");
+        assert_eq!(
+            (best.translate_x, best.translate_y),
+            (landing, landing),
+            "the true shift, scored last, should have displaced the other two"
+        );
+        assert_eq!(
+            solver.queue.len(),
+            4,
+            "one cell changed, so exactly its four neighbours are queued"
+        );
+        for child in &solver.queue {
+            assert_eq!(
+                *child,
+                best.extrapolate_mapping(child.origin_x, child.origin_y),
+                "a child that does not descend from the cell's final transform"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_clear_improvement_is_passed_on() {
+        assert!(
+            reproduces(f32::MAX, 5000.0),
+            "whatever fills an empty cell is news to its neighbours"
+        );
+        assert!(reproduces(100.0, 94.0));
+        assert!(!reproduces(100.0, 96.0));
+        assert!(!reproduces(100.0, 100.0));
+    }
+
+    /// The cause of the straight unmapped bands. A transform that points a cell at the very
+    /// edge of the other photo with a compressed matrix keeps a single sample of its disc.
+    /// The variance of one sample is zero, the best score there is, so it used to beat the
+    /// genuine transform of any cell it was offered to — and since moving along the edge
+    /// changes nothing about it, it took the cell above and below as well, and so on down
+    /// the whole column. The round-trip check then deleted that column.
+    ///
+    /// The numbers are the ones found in a real run: every cell of one column of an
+    /// 800 px map held `a11 = 0.328, a21 = 0.569`, a target 0.2 px short of the right
+    /// edge, a score of exactly 0.0, and 1 sample of 81.
+    #[test]
+    fn a_transform_that_barely_touches_the_other_photo_cannot_take_over_a_column() {
+        let mut solver = seeded_solver(21);
+        solver.run_until_done();
+        let before = grid_state(&solver);
+        let coverage = solver.get_photo_mapping().calculate_used_area();
+        assert!(
+            coverage > 0.9,
+            "the solve only filled {coverage:.2} of the grid"
+        );
+
+        let (grid_x, grid_y) = (12usize, 9usize);
+        let genuine = solver.ac_grid.get_grid_square(grid_x, grid_y).get_score();
+        assert!(
+            genuine > 0.0,
+            "the true mapping should not score a perfect zero"
+        );
+        solver.queue.push(AffineTransform {
+            origin_x: (grid_x * 5) as u16,
+            origin_y: (grid_y * 5) as u16,
+            translate_x: WIDTH as f32 - 0.15,
+            translate_y: (grid_y * 5) as f32,
+            a11: 0.328,
+            a12: 0.0,
+            a21: 0.569,
+            a22: 1.0,
+        });
+        solver.run_until_done();
+
+        let after = grid_state(&solver);
+        let overwritten = before.iter().zip(&after).filter(|(b, a)| b != a).count();
+        assert_eq!(
+            overwritten, 0,
+            "a transform comparing almost nothing overwrote {overwritten} cells"
+        );
+    }
+
+    /// The same candidate offered to a cell twice is scored once.
+    #[test]
+    fn a_repeated_candidate_is_not_scored_again() {
+        let mut solver = solver(5);
+        let (at, landing) = (40.0, 40.0 - SHIFT as f32);
+        for _ in 0..3 {
+            solver.add_init_point(at, at, landing + 3.0, landing, 0.0);
+        }
+        solver.run_queue();
+        assert_eq!(solver.total_comparisons(), 5);
     }
 }

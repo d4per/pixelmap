@@ -23,6 +23,80 @@ struct Samples {
     p2_idx: Vec<i32>,
     /// How many entries of `p1`/`p2_idx` the current disc filled.
     len: usize,
+    /// How many pixels of the disc lie inside `photo1`: what there was to compare before
+    /// any of it was lost to the bounds of `photo2`. `len` is the part of this that
+    /// landed inside `photo2`.
+    offered: usize,
+}
+
+/// The least share of a disc that has to land inside `photo2` for a comparison to count,
+/// as a fraction `(numerator, denominator)` of the pixels `photo1` offered.
+///
+/// A score is the variance of the colour differences over the samples that survive, and
+/// says nothing about how many did. Left unchecked, that makes a transform better the
+/// less of it can be checked: with a single sample the variance is exactly zero, the best
+/// score there is, and with a handful it is usually far below any genuine match.
+///
+/// Such transforms arise where the mapping runs off the edge of `photo2`. The cells there
+/// pile up against the edge, the matrices derived from them come out compressed, and a
+/// compressed transform aimed at the edge keeps only the tip of its disc. It then beats
+/// the genuine transform of every cell it is handed to, and because moving along the edge
+/// changes nothing about it, it runs the length of a grid column or row. The round-trip
+/// check deletes those cells afterwards, which leaves a straight unmapped band one cell
+/// wide through an otherwise well mapped area.
+///
+/// One half amounts to requiring that the centre of the disc lands inside `photo2`. It is
+/// measured against what `photo1` offered rather than against the full disc, because a
+/// cell on the border of `photo1` has a smaller disc to begin with and must stay
+/// mappable.
+const MIN_COMPARED: (usize, usize) = (1, 2);
+
+impl Samples {
+    /// Whether enough of the disc was resolved for its score to mean anything; see
+    /// [`MIN_COMPARED`].
+    fn is_comparable(&self) -> bool {
+        self.len > 0 && self.len * MIN_COMPARED.1 >= self.offered * MIN_COMPARED.0
+    }
+}
+
+/// Everything the scorer reads from an [`AffineTransform`], in the form it works in: the
+/// disc centre, and the Q16.16 steps and base of the walk through `photo2`.
+///
+/// [`CorrespondenceScoring::resolve_disc_inner`] takes its inputs from here and from
+/// nowhere else. Two transforms with equal `FixedTransform`s therefore resolve exactly
+/// the same samples and score exactly the same, however their floats differ below the
+/// fixed-point resolution. The solver relies on that to recognize a candidate a cell has
+/// already evaluated without scoring it again; see
+/// `CorrespondenceMappingAlgorithm::run_queue`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FixedTransform {
+    origin_x: u16,
+    origin_y: u16,
+    /// The mapped position advances by this for one pixel along a disc row.
+    step_x: i32,
+    step_y: i32,
+    /// ...and by this for one disc row.
+    col_x: i32,
+    col_y: i32,
+    /// The mapped disc centre, with `HALF` folded in so a shift rounds.
+    base_x: i32,
+    base_y: i32,
+}
+
+impl FixedTransform {
+    /// The only floating point the scorer touches: six conversions per transform.
+    pub(crate) fn new(cm: &AffineTransform) -> Self {
+        FixedTransform {
+            origin_x: cm.origin_x,
+            origin_y: cm.origin_y,
+            step_x: (cm.a11 * 65536.0) as i32,
+            step_y: (cm.a21 * 65536.0) as i32,
+            col_x: (cm.a12 * 65536.0) as i32,
+            col_y: (cm.a22 * 65536.0) as i32,
+            base_x: ((cm.translate_x * 65536.0) as i32).wrapping_add(HALF),
+            base_y: ((cm.translate_y * 65536.0) as i32).wrapping_add(HALF),
+        }
+    }
 }
 
 /// A working-resolution photo together with its pixels packed one `0x00BBGGRR` word each,
@@ -189,6 +263,7 @@ impl CorrespondenceScoring {
                 p1: vec![0u32; capacity],
                 p2_idx: vec![0i32; capacity],
                 len: 0,
+                offered: 0,
             }),
         }
     }
@@ -229,6 +304,7 @@ impl CorrespondenceScoring {
         allow_fast: bool,
     ) {
         s.len = 0;
+        s.offered = 0;
 
         let w2 = self.photo2.width;
         let h2 = self.photo2.height;
@@ -238,20 +314,25 @@ impl CorrespondenceScoring {
         }
 
         let radius = self.neighborhood_radius;
-        let x1 = circle_mapping.origin_x as i32;
-        let y1 = circle_mapping.origin_y as i32;
+
+        // The only floating point left in the function: six conversions per call, none
+        // of them inside a loop. Nothing below reads `circle_mapping` again, which is
+        // what makes a `FixedTransform` a complete key for the result.
+        let FixedTransform {
+            origin_x,
+            origin_y,
+            step_x,
+            step_y,
+            col_x,
+            col_y,
+            base_x,
+            base_y,
+        } = FixedTransform::new(circle_mapping);
+        let x1 = origin_x as i32;
+        let y1 = origin_y as i32;
 
         let w1 = self.photo1.width as i32;
         let h1 = self.photo1.height as i32;
-
-        // The only floating point left in the function: six conversions per call, none
-        // of them inside a loop.
-        let step_x = (circle_mapping.a11 * 65536.0) as i32;
-        let step_y = (circle_mapping.a21 * 65536.0) as i32;
-        let col_x = (circle_mapping.a12 * 65536.0) as i32;
-        let col_y = (circle_mapping.a22 * 65536.0) as i32;
-        let base_x = (circle_mapping.translate_x * 65536.0) as i32 + HALF;
-        let base_y = (circle_mapping.translate_y * 65536.0) as i32 + HALF;
 
         let x2_hi = w2 as i32 - 2;
         let y2_hi = h2 as i32 - 2;
@@ -287,6 +368,9 @@ impl CorrespondenceScoring {
         let mut row_fx = base_x.wrapping_add(y_lo.wrapping_mul(col_x));
         let mut row_fy = base_y.wrapping_add(y_lo.wrapping_mul(col_y));
         let mut out = 0usize;
+        // Disc pixels inside `photo1`, counted by the general path as it clamps each row.
+        // The fast path keeps every pixel of a full disc, so there it is simply `out`.
+        let mut offered = 0usize;
 
         if fully_inside {
             for y in y_lo..=y_hi {
@@ -334,6 +418,7 @@ impl CorrespondenceScoring {
                 let x_hi = xx.min(w1 - 1 - x1);
                 if x_lo <= x_hi {
                     let span = x_hi - x_lo;
+                    offered += span as usize + 1;
                     let mut fx = row_fx.wrapping_add(x_lo.wrapping_mul(step_x));
                     let mut fy = row_fy.wrapping_add(x_lo.wrapping_mul(step_y));
 
@@ -373,6 +458,7 @@ impl CorrespondenceScoring {
             }
         }
         s.len = out;
+        s.offered = if fully_inside { out } else { offered };
     }
 
     /// Resolves the disc of `circle_mapping`; see [`Self::resolve_disc_inner`].
@@ -430,9 +516,15 @@ impl CorrespondenceScoring {
     /// entails — five times over.
     ///
     /// The search order matches the original: x first, then y relative to the x winner.
+    ///
+    /// A transform that puts too little of its disc inside `photo2` is not scored at all
+    /// and comes back with `f32::MAX`, which no cell accepts; see [`MIN_COMPARED`].
     pub fn optimize_translation(&self, cm: &AffineTransform) -> (f32, AffineTransform) {
         let mut s = self.scratch.borrow_mut();
         self.resolve_disc(cm, &mut s);
+        if !s.is_comparable() {
+            return (f32::MAX, *cm);
+        }
         self.total_invocations.set(self.total_invocations.get() + 5);
 
         let [score_x1, score_0, score_x2] = self.score_taps(&s, 0, [-1, 0, 1]);
@@ -523,6 +615,7 @@ mod tests {
             p1: vec![0u32; capacity],
             p2_idx: vec![0i32; capacity],
             len: 0,
+            offered: 0,
         }
     }
 
@@ -579,6 +672,10 @@ mod tests {
             scoring.resolve_disc_inner(&cm, &mut general, false);
 
             assert_eq!(fast.len, general.len, "sample count differs for {cm:?}");
+            assert_eq!(
+                fast.offered, general.offered,
+                "the two paths disagree on what photo1 offered for {cm:?}"
+            );
             assert_eq!(
                 fast.p1[..fast.len],
                 general.p1[..general.len],
@@ -673,6 +770,148 @@ mod tests {
                 "finish drifted by {ulps} ulps: {reference} vs {got}"
             );
         }
+    }
+
+    fn identity_at(origin: (u16, u16), target: (f32, f32)) -> AffineTransform {
+        AffineTransform {
+            origin_x: origin.0,
+            origin_y: origin.1,
+            translate_x: target.0,
+            translate_y: target.1,
+            a11: 1.0,
+            a12: 0.0,
+            a21: 0.0,
+            a22: 1.0,
+        }
+    }
+
+    /// The transform behind the straight unmapped bands, as found in a real run: aimed
+    /// 0.15 px short of the right edge of `photo2` and compressed, so that only the tip of
+    /// its disc lands inside. One sample has a variance of zero, which used to make this
+    /// the best-scoring transform a cell could be offered.
+    #[test]
+    fn a_disc_that_all_but_leaves_photo2_is_not_scored() {
+        let (w, h, radius) = (64usize, 48usize, 5usize);
+        let scoring = CorrespondenceScoring::new(
+            noise_photo(w, h, 0x1357_9bdf_0246_8ace),
+            noise_photo(w, h, 0xeca8_6420_fdb9_7531),
+            radius as isize,
+        );
+        let sliver = AffineTransform {
+            a11: 0.328,
+            a21: 0.569,
+            ..identity_at((30, 24), (w as f32 - 0.15, 24.0))
+        };
+
+        let mut s = empty_samples(radius);
+        scoring.resolve_disc_inner(&sliver, &mut s, true);
+        assert_eq!(
+            (s.len, s.offered),
+            (1, 81),
+            "this is meant to be the one-sample case"
+        );
+
+        let (score, returned) = scoring.optimize_translation(&sliver);
+        assert_eq!(score, f32::MAX, "a single sample was given a score");
+        assert_eq!(returned, sliver);
+        assert_eq!(
+            scoring.get_num_comparisons(),
+            0,
+            "nothing was compared, so nothing should be counted"
+        );
+    }
+
+    /// The limit is on the share of the disc that is lost to `photo2`, so it must not
+    /// touch a transform that is merely close to the edge...
+    #[test]
+    fn a_disc_centred_inside_photo2_is_still_scored() {
+        let (w, h, radius) = (64usize, 48usize, 5usize);
+        let scoring = CorrespondenceScoring::new(
+            noise_photo(w, h, 0x1357_9bdf_0246_8ace),
+            noise_photo(w, h, 0xeca8_6420_fdb9_7531),
+            radius as isize,
+        );
+        // Centre three pixels in from the right edge: the disc is cut, but not in half.
+        let near_edge = identity_at((30, 24), (w as f32 - 3.0, 24.0));
+
+        let mut s = empty_samples(radius);
+        scoring.resolve_disc_inner(&near_edge, &mut s, true);
+        assert!(s.len < s.offered, "the edge should cut this disc");
+        assert!(scoring.optimize_translation(&near_edge).0 < f32::MAX);
+    }
+
+    /// ...nor a cell in the corner of `photo1`, whose disc is a quarter of the usual size
+    /// before `photo2` is even considered.
+    #[test]
+    fn a_cell_on_the_border_of_photo1_is_still_scored() {
+        let (w, h, radius) = (64usize, 48usize, 5usize);
+        let scoring = CorrespondenceScoring::new(
+            noise_photo(w, h, 0x1357_9bdf_0246_8ace),
+            noise_photo(w, h, 0xeca8_6420_fdb9_7531),
+            radius as isize,
+        );
+        let corner = identity_at((0, 0), (20.0, 20.0));
+
+        let mut s = empty_samples(radius);
+        scoring.resolve_disc_inner(&corner, &mut s, true);
+        assert!(s.offered < 81 / 2, "a corner cell has a small disc");
+        assert_eq!(s.len, s.offered, "all of it lands inside photo2");
+        assert!(scoring.optimize_translation(&corner).0 < f32::MAX);
+    }
+
+    /// The solver skips a candidate whose [`FixedTransform`] equals one a cell has already
+    /// evaluated, on the grounds that it would score the same. This pins that: transforms
+    /// that differ only below the fixed-point resolution resolve the same samples and
+    /// come back with the same score and the same shift.
+    #[test]
+    fn equal_fixed_transforms_score_the_same() {
+        let (w, h, radius) = (64usize, 48usize, 5usize);
+        let scoring = CorrespondenceScoring::new(
+            noise_photo(w, h, 0x2468_ace0_1357_9bdf),
+            noise_photo(w, h, 0xfdb9_7531_0eca_8642),
+            radius as isize,
+        );
+        let (mut a, mut b) = (empty_samples(radius), empty_samples(radius));
+        let mut twins = 0usize;
+
+        for cm in random_transforms(w, h, 4000, 0x0bad_cafe_dead_beef) {
+            // The next float up: far below one Q16.16 unit for coordinates this small, so
+            // most of these land on the same fixed-point value. Those that do not are
+            // simply not twins and are skipped.
+            let nudged = AffineTransform {
+                translate_x: f32::from_bits(cm.translate_x.to_bits() + 1),
+                a12: f32::from_bits(cm.a12.to_bits() + 1),
+                ..cm
+            };
+            if FixedTransform::new(&cm) != FixedTransform::new(&nudged) {
+                continue;
+            }
+            assert_ne!(cm, nudged, "the nudge has to change the floats");
+            twins += 1;
+
+            scoring.resolve_disc_inner(&cm, &mut a, true);
+            scoring.resolve_disc_inner(&nudged, &mut b, true);
+            assert_eq!(a.len, b.len, "sample count differs for {cm:?}");
+            assert_eq!(a.p1[..a.len], b.p1[..b.len]);
+            assert_eq!(a.p2_idx[..a.len], b.p2_idx[..b.len]);
+
+            let (score, out) = scoring.optimize_translation(&cm);
+            let (score_twin, out_twin) = scoring.optimize_translation(&nudged);
+            assert_eq!(score.to_bits(), score_twin.to_bits());
+            // Rounded, because `(t + 1.0) - t` is not always exactly 1.0 in `f32`.
+            let shift = |from: &AffineTransform, to: &AffineTransform| {
+                (
+                    (to.translate_x - from.translate_x).round(),
+                    (to.translate_y - from.translate_y).round(),
+                )
+            };
+            assert_eq!(
+                shift(&cm, &out),
+                shift(&nudged, &out_twin),
+                "the two picked different shifts"
+            );
+        }
+        assert!(twins > 1000, "only {twins} of 4000 pairs shared a key");
     }
 
     /// The fixed-point row bases accumulate individually truncated `col_*`/`step_*`

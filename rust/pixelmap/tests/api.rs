@@ -666,6 +666,25 @@ fn small_photos_do_not_panic_when_the_schedule_upscales_them() {
     );
 }
 
+/// `Medium` and `High` match features at 800 and 1600 px and then run their first steps
+/// at 400 px. Carried down to the coarser grid, the last column and row of the finer one
+/// round up to a node at the photo's far edge, one cell past the grid. The solver has
+/// always skipped those, but it also had a `debug_assert!` saying it could not happen, so
+/// any build with debug assertions panicked on a photo 800 px wide or more.
+#[test]
+fn a_step_coarser_than_the_map_it_starts_from_does_not_panic() {
+    let (photo1, photo2) = shifted_pair(800, 600, 6, 4);
+    let mapping = Correspondence::builder()
+        .quality(Quality::Medium)
+        .run(photo1, photo2)
+        .expect("synthetic photos are valid input");
+    assert!(
+        mapping.coverage() > 0.5,
+        "coverage was only {:.2}",
+        mapping.coverage()
+    );
+}
+
 /// A callback that asks to stop abandons the run, and says so with `None` rather than an
 /// error: nothing about the input was wrong.
 #[test]
