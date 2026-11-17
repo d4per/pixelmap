@@ -4,6 +4,54 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- **The mapping for a given seed is no longer the one 0.3.0 produced.** It is still fully
+  determined by the photos, the schedule and the seed; it is a different, equally good
+  mapping, reached with about 40% fewer region comparisons. On a 4128x3096 pair `High`
+  went from 5.9 s to 4.3 s and `Medium` from 1.7 s to 1.3 s.
+
+  The solver used to let a grid cell hand its transform to its four neighbours every time
+  the cell improved. Measured on real photos, about half of all comparisons were spent on
+  the offspring of transforms that left no trace in the result: a quarter of all accepted
+  transforms were replaced within the very pass that accepted them, after they had already
+  reproduced. Three things changed:
+
+  - A cell now reproduces once per pass, after the pass, from the transform it ends up
+    holding.
+  - A cell that already held a transform reproduces only if its score dropped by more than
+    5% over the pass. Smaller gains are still kept by the cell itself.
+  - A transform a cell has already evaluated is not scored a second time. This one changes
+    the work and nothing else: such a transform could only have been rejected.
+
+  The result was checked against an exact ground truth on rendered scenes, where the median
+  error is unchanged or slightly lower, and on two sets of three real photos by how well
+  the three pairwise mappings close the loop from the first photo to the second, the third
+  and back. On both it stays inside the spread the solver shows from one seed to the next.
+  On the hardest pairs at `Low` it sits at the weak end of that spread.
+- `Correspondence::comparisons()` reports correspondingly fewer comparisons.
+
+### Fixed
+
+- Straight unmapped bands, one grid cell wide, could run down a column or along a row of
+  the mapping, usually near where it leaves the edge of the second photo. A cell's score
+  is the variance of the colour differences over the part of its disc that lands inside
+  the second photo, and nothing required that part to be large. A transform aimed at the
+  very edge kept a single sample, whose variance is exactly zero, the best possible
+  score. It then won every cell it was offered along that column or row, and the
+  round-trip check deleted them all afterwards. A transform is now scored only if at
+  least half of the disc pixels the first photo offers land inside the second photo.
+  Cells on the border of the first photo, whose discs are smaller to begin with, are
+  unaffected. On the pair that showed it, the bands appeared with 2 of 6 seeds at
+  `Medium` and `High` and are now gone at every quality and seed tried; cycle
+  consistency on two sets of three photos stays within the seed-to-seed spread.
+- `Medium` and `High` panicked in any build with debug assertions on photos 800 px wide or
+  more. Their first steps work at a lower width than the map they start from, which can
+  place a candidate one cell past the grid; the solver has always skipped those, but also
+  carried a `debug_assert!` claiming it could not happen. Release builds were unaffected.
+
 ## 0.3.0 - 2026-09-24
 
 ### Added
