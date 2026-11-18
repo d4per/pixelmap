@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use pixelmap::{Correspondence, DensePhotoMap, Photo, Quality};
+use pixelmap::{Correspondence, DensePhotoMap, FillMode, Photo, Quality};
 
 use crate::error::Error;
 use crate::event::{emit, Event, Flow, PairMap, Stage};
@@ -107,7 +107,7 @@ impl Grid {
 ///
 /// A [`Correspondence`] keeps the two photos it was computed from alive, scaled to the
 /// solver's final working width: at [`Quality::High`] that is two 1600 px RGBA images,
-/// some 30 MB a pair. A run keeps every pair until the end, so with many photos those
+/// some 30 MB a pair, and up to four times that at [`Quality::Ultra`]. A run keeps every pair until the end, so with many photos those
 /// copies, not the mappings, filled memory. This holds only the grids, about 1 MB a pair.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -255,7 +255,7 @@ fn pair_map(pair: PairId, mapping: &Mapping) -> PairMap {
 ///
 /// Reports progress through `on_event`. A `Break` stops the run at the next pixelmap
 /// schedule step, so the longest it waits is one step of the pair being mapped — the last
-/// steps of [`Quality::High`] work at 1600 px and are the slowest.
+/// steps of [`Quality::Ultra`] work at up to 3200 px and are the slowest.
 ///
 /// The event that finishes each pair carries that pair's [`PairMap`], so a caller can show
 /// the correspondence as it is found.
@@ -273,9 +273,13 @@ pub fn compute(
     let mut maps = Vec::with_capacity(total);
 
     for (index, pair) in PairId::all(views as u32).enumerate() {
+        // Every mapped cell becomes a 3D point, so only the ones that passed the final
+        // round-trip check: cells filled from coarser steps raise coverage at the cost of
+        // precision, which suits flow but not triangulation.
         let mapping = Correspondence::builder()
             .quality(quality)
             .seed(seed)
+            .fill_mode(FillMode::Off)
             .run_with_control(
                 photos[pair.a().index()].clone(),
                 photos[pair.b().index()].clone(),

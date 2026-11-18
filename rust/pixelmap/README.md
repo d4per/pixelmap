@@ -60,11 +60,23 @@ reduced resolution internally; `forward()` and `backward()` expose those raw gri
 
 `Quality` picks the iteration schedule, trading time for accuracy:
 
-| Mode | Working widths | Iterations |
-|---|---|---|
-| `Low` | 400 | 4 |
-| `Medium` | 400, 800 | 10 |
-| `High` | 400, 800, 1600 | 13 |
+| Mode | Working widths | Iterations | Fills holes |
+|---|---|---|---|
+| `Low` | 400 | 4 | no |
+| `Medium` | 400, 800 | 10 | yes |
+| `High` | 400, 800, 1600 | 13 | yes |
+| `Ultra` | 400, 800, 1600, 3200 | 15 | yes |
+
+Above `Low`, no step works wider than the photos themselves: on a 1024 px photo `High`'s
+last steps run at 1024 px, not 1600. Scaling a photo up gives the solver nothing new to
+match and measurably lowered accuracy. `Ultra`'s two 3200 px steps run only for photos
+wider than 1600 px, so on smaller ones it is the same as `High`. `Quality::steps_for`
+gives the schedule that runs for a given photo width.
+
+Filling holes takes cells the final step left unmapped from the last map of each earlier,
+coarser working width. That raises coverage and the share of pixels mapped within a few
+pixels of the truth, but the filled cells are less precise than the rest. Use
+`Builder::fill_mode(FillMode::Off)` when a wrong answer costs more than no answer.
 
 `Builder::schedule` takes an explicit list of `IterationParams` for callers tuning the
 algorithm itself.
@@ -84,7 +96,7 @@ let mapping = Correspondence::builder()
 
 A stopped run is not an error — nothing about the input was wrong — so it is an `Option`
 rather than an `Error` variant. A run is abandoned only between steps, so a `Break` waits at
-most one schedule step; the final steps of `High` work at 1600 px and are the slowest.
+most one schedule step; the final steps of `Ultra` work at up to 3200 px and are the slowest.
 Cancelling discards the work done so far: there is no partial mapping.
 
 ## Reproducibility

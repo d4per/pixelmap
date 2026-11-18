@@ -4,6 +4,14 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Accepts pixelmap's new `Quality::Ultra`. Pairs are mapped with `FillMode::Off`, so the
+  mappings it triangulates are unchanged by pixelmap's hole filling; the change to
+  `Medium` and `High`'s working widths (never wider than the photos) does apply.
+
 ## 0.1.2 - 2026-11-17
 
 ### Changed

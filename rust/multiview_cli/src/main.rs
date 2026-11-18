@@ -40,7 +40,7 @@ struct Args {
     #[arg(long)]
     focal_px: Option<f64>,
 
-    /// Processing mode for pairwise correspondence: low, medium, or high.
+    /// Processing mode for pairwise correspondence: low, medium, high, or ultra.
     #[arg(long, default_value = "low")]
     processing_mode: ProcessingMode,
 

@@ -2,3 +2,6 @@
 rust/target
 python/.idea
 
+benchmarks/.venv/
+benchmarks/results/
+__pycache__/

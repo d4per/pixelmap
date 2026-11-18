@@ -4,6 +4,42 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `Quality::Ultra`: `High`, then two more steps at the photos' own width, up to 3200 px,
+  for photos wider than 1600 px. On photos that have the detail it maps more of them, and
+  more precisely: on real 3200 px photos under known homographies, the share of pixels
+  within 1 px of the truth rose from 94.7% to 96.8%, at about 1.6x `High`'s time. On
+  photos up to 1600 px wide it is the same as `High`.
+- `FillMode` and `Builder::fill_mode`, `PixelMapProcessor::set_fill_mode`: how the cells
+  the final step left unmapped are treated. `Plain` takes them from the last map of each
+  earlier, coarser working width.
+- `Quality::steps_for(source_width)`, the schedule that actually runs for photos of a given
+  width, and `Quality::fill_mode`. `PixelMapProcessor::source_width`.
+
+### Changed
+
+- **`Medium` and `High` produce different mappings.** `Low` is unchanged.
+  - No step works wider than the photos any more. `High`'s 1600 px steps used to scale
+    photos narrower than that up, which gives the solver nothing new to match: it
+    lowered accuracy and doubled the time. On a 1024 px photo they now run at 1024 px.
+  - They fill holes (`FillMode::Plain`). A cell that loses the round-trip check at the
+    final width used to be gone even when a coarser step had mapped it consistently.
+
+  On the optical flow and homography benchmarks in `benchmarks/` (photos 700 to 1540 px
+  wide), `High`'s share of pixels within 3 px of the truth, counting unmapped pixels as
+  misses, rose from 66.8% to 77.0% on ETH3D, 55.5% to 65.2% on HPatches, 65.0% to 70.2% on
+  KITTI 2015 and 85.7% to 86.6% / 78.9% to 81.0% on Sintel clean / final, and it ran in
+  about half the time. The average error over the mapped pixels grew (ETH3D 1.4 to 2.0
+  px), because the filled cells are less precise. `Builder::fill_mode(FillMode::Off)`
+  restores the strict behaviour.
+- `ProcessingMode::run` runs `steps_for` the processor's photos rather than `steps`.
+- The documentation of `Builder::max_round_trip_error` and
+  `DensePhotoMap::remove_outliers` now says what the threshold is measured in: grid cells
+  at the working width, not pixels.
+
 ## 0.3.1 - 2026-11-17
 
 ### Changed

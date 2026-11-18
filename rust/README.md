@@ -80,7 +80,7 @@ Or it replays images the command line tool has already written to disc:
 
 | Option              | Default | Meaning                                                         |
 |---------------------|---------|-----------------------------------------------------------------|
-| `--processing-mode` | `low`   | `low`, `medium` or `high`, as in the command line tool           |
+| `--processing-mode` | `low`   | `low`, `medium`, `high` or `ultra`, as in the command line tool  |
 | `--num-frames`      | `12`    | frames to render, including both end photos                      |
 | `--detail-level`    | `4`     | supersampling per frame; higher is slower but leaves fewer holes |
 | `--fps`             | `12`    | animation speed                                                  |

@@ -65,6 +65,42 @@ pub struct PixelMapProcessor {
     /// Each entry carries its packed words as well (see [`PackedPhoto`]), so both solvers
     /// of every step at that width share one copy instead of packing their own.
     scaled: HashMap<(usize, usize), PackedPhoto>,
+
+    /// How [`Self::finish`] fills the cells the final map left empty; see
+    /// [`FillMode`].
+    fill_mode: FillMode,
+
+    /// The raw forward and backward maps of the last step at each earlier working width,
+    /// most recent last. Only collected when `fill_mode` is not [`FillMode::Off`].
+    history: Vec<(DensePhotoMap, DensePhotoMap)>,
+
+    /// Whether [`Self::iterate`] has run, so that the init solve's map, which is far
+    /// rougher than anything after it, is not kept in `history`.
+    iterated: bool,
+}
+
+/// How [`PixelMapProcessor::finish`] treats the cells the final map left empty.
+///
+/// Every schedule step starts a fresh solver from the previous step's cleaned map, so a
+/// region that loses the round-trip check at a fine working width is gone even if a
+/// coarser step had mapped it consistently. Filling takes such cells from the last map
+/// of each earlier width instead, finest first.
+///
+/// The filled cells were mapped consistently at a coarser width but not confirmed at the
+/// final one, so they are less precise than the rest: filling trades end-point accuracy
+/// for coverage. [`crate::Quality::Low`] leaves it off; the higher presets use
+/// [`FillMode::Plain`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FillMode {
+    /// Leave empty cells empty.
+    #[default]
+    Off,
+    /// Take an empty cell from the most recent earlier map that answers there.
+    Plain,
+    /// As `Plain`, then run the round trip again on the filled cells against the filled
+    /// maps of the other direction, with the threshold the earlier map was cleaned with.
+    Checked,
 }
 
 impl PixelMapProcessor {
@@ -127,7 +163,25 @@ impl PixelMapProcessor {
             seed,
             algorithms_built: 0,
             scaled: HashMap::new(),
+            fill_mode: FillMode::Off,
+            history: Vec::new(),
+            iterated: false,
         }
+    }
+
+    /// Sets how [`Self::finish`] fills empty cells. Defaults to [`FillMode::Off`]; the
+    /// presets' choice is [`crate::Quality::fill_mode`].
+    ///
+    /// Call it before the first [`Self::iterate`]: the maps it fills from are collected
+    /// as the iterations run.
+    pub fn set_fill_mode(&mut self, mode: FillMode) {
+        self.fill_mode = mode;
+    }
+
+    /// The width of the full-resolution photos, which [`crate::Quality::steps_for`]
+    /// takes to fit a schedule to them.
+    pub fn source_width(&self) -> usize {
+        self.source_width
     }
 
     /// Hands out the next solver seed for this processor.
@@ -264,6 +318,12 @@ impl PixelMapProcessor {
         let mut pm1 = self.ocm_manager1.get_photo_mapping();
         let mut pm2 = self.ocm_manager2.get_photo_mapping();
 
+        // Keep the last map of each earlier width for `finish` to fill holes from.
+        if self.fill_mode != FillMode::Off && self.iterated && pm1.dimensions().0 != photo_width {
+            self.history.push((pm1.clone(), pm2.clone()));
+        }
+        self.iterated = true;
+
         // Remove outliers by forward-backward consistency check.
 
         pm1.remove_outliers(&pm2, clean_max_dist);
@@ -326,6 +386,16 @@ impl PixelMapProcessor {
         pm1.remove_outliers(&pm2, clean_max_dist);
         pm2.remove_outliers(&pm1, clean_max_dist);
 
+        if self.fill_mode != FillMode::Off && !self.history.is_empty() {
+            fill_from_history(
+                &mut pm1,
+                &mut pm2,
+                std::mem::take(&mut self.history),
+                clean_max_dist,
+                self.fill_mode == FillMode::Checked,
+            );
+        }
+
         (pm1, pm2)
     }
 
@@ -343,6 +413,93 @@ impl PixelMapProcessor {
         pm2.remove_outliers(&pm1, 2.0);
 
         pm1.calculate_used_area()
+    }
+}
+
+/// Fills the empty cells of the final maps `fwd`/`bwd` from `history`, the raw maps of
+/// earlier working widths (oldest first); see [`FillMode`].
+///
+/// Each earlier pair is cleaned with `max_dist` in *its own* grid first, the check it
+/// would have had to pass had the schedule ended there. An empty cell then takes its
+/// value from the most recent pair that answers at its position. With `checked`, the
+/// filled cells must also survive a round trip through the filled map of the other
+/// direction, with `max_dist` scaled to the grid of the map the fill came from.
+fn fill_from_history(
+    fwd: &mut DensePhotoMap,
+    bwd: &mut DensePhotoMap,
+    history: Vec<(DensePhotoMap, DensePhotoMap)>,
+    max_dist: f32,
+    checked: bool,
+) {
+    let width = fwd.dimensions().0 as f32;
+    let earlier: Vec<(DensePhotoMap, DensePhotoMap, f32)> = history
+        .into_iter()
+        .rev()
+        .map(|(mut a, mut b)| {
+            a.remove_outliers(&b, max_dist);
+            b.remove_outliers(&a, max_dist);
+            let scale = a.dimensions().0 as f32 / width;
+            (a, b, scale)
+        })
+        .collect();
+
+    // For each cell, the index into `earlier` its value was filled from.
+    let fill = |map: &mut DensePhotoMap,
+                pick: fn(&(DensePhotoMap, DensePhotoMap, f32)) -> &DensePhotoMap| {
+        let (gw, gh) = map.grid_dimensions();
+        let cs = map.grid_cell_size() as f32;
+        let mut source = vec![None; gw * gh];
+        for y in 0..gh {
+            for x in 0..gw {
+                if !map.grid_coordinates(x, y).0.is_nan() {
+                    continue;
+                }
+                let (px, py) = (x as f32 * cs, y as f32 * cs);
+                for (i, entry) in earlier.iter().enumerate() {
+                    let scale = entry.2;
+                    if let Some((qx, qy)) = pick(entry).lookup(px * scale, py * scale) {
+                        map.set_grid_coordinates(x, y, qx / scale, qy / scale);
+                        source[x + y * gw] = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        source
+    };
+    let fwd_source = fill(fwd, |e| &e.0);
+    let bwd_source = fill(bwd, |e| &e.1);
+
+    if checked {
+        recheck(fwd, bwd, &fwd_source, &earlier, max_dist);
+        recheck(bwd, fwd, &bwd_source, &earlier, max_dist);
+    }
+}
+
+/// The round trip of [`DensePhotoMap::remove_outliers`], on the filled cells of `map`
+/// only, each with `max_dist` scaled from the grid it was filled from to this one.
+fn recheck(
+    map: &mut DensePhotoMap,
+    other: &DensePhotoMap,
+    source: &[Option<usize>],
+    earlier: &[(DensePhotoMap, DensePhotoMap, f32)],
+    max_dist: f32,
+) {
+    let (gw, gh) = map.grid_dimensions();
+    let cs = map.grid_cell_size() as f32;
+    for y in 0..gh {
+        for x in 0..gw {
+            let Some(i) = source[x + y * gw] else {
+                continue;
+            };
+            let limit = max_dist / earlier[i].2;
+            let (mx, my) = map.grid_coordinates(x, y);
+            let (bx, by) = other.map_photo_pixel(mx, my);
+            let (dx, dy) = (x as f32 - bx / cs, y as f32 - by / cs);
+            if dx.is_nan() || dy.is_nan() || dx * dx + dy * dy > limit * limit {
+                map.set_grid_coordinates(x, y, f32::NAN, f32::NAN);
+            }
+        }
     }
 }
 
@@ -376,4 +533,74 @@ where
     B: FnOnce() -> RB,
 {
     (a(), b())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blank(width: usize, height: usize) -> Arc<Photo> {
+        Arc::new(Photo {
+            img_data: vec![0; width * height * 4],
+            width,
+            height,
+        })
+    }
+
+    /// A map over a `width`-wide photo that sends `(x, y)` to `(x + shift, y)`.
+    fn shifted_map(width: usize, height: usize, shift: f32) -> DensePhotoMap {
+        let (gw, gh) = (width / 5, height / 5);
+        let mut map =
+            DensePhotoMap::with_cell_size(blank(width, height), blank(width, height), gw, gh, 5);
+        for y in 0..gh {
+            for x in 0..gw {
+                map.set_grid_coordinates(x, y, (x * 5) as f32 + shift, (y * 5) as f32);
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn filling_only_touches_empty_cells_and_scales_the_earlier_map() {
+        let mut fwd = shifted_map(100, 60, 0.0);
+        let mut bwd = shifted_map(100, 60, 0.0);
+        fwd.set_grid_coordinates(3, 3, 99.0, 99.0); // a value filling must not overwrite
+        fwd.set_grid_coordinates(10, 6, f32::NAN, f32::NAN);
+        let history = vec![(shifted_map(50, 30, 0.0), shifted_map(50, 30, 0.0))];
+
+        fill_from_history(&mut fwd, &mut bwd, history, 2.0, false);
+
+        assert_eq!(fwd.grid_coordinates(3, 3), (99.0, 99.0));
+        assert_eq!(fwd.grid_coordinates(10, 6), (50.0, 30.0));
+    }
+
+    #[test]
+    fn a_checked_fill_must_survive_the_other_directions_final_map() {
+        let hole = |map: &mut DensePhotoMap| map.set_grid_coordinates(10, 6, f32::NAN, f32::NAN);
+        // The earlier pair agrees with itself on a 15 px (at width 50) shift; the final
+        // backward map says the photo does not move at all.
+        let history = || vec![(shifted_map(50, 30, 15.0), shifted_map(50, 30, -15.0))];
+
+        let (mut fwd, mut bwd) = (shifted_map(100, 60, 0.0), shifted_map(100, 60, 0.0));
+        hole(&mut fwd);
+        fill_from_history(&mut fwd, &mut bwd, history(), 2.0, false);
+        assert_eq!(
+            fwd.grid_coordinates(10, 6),
+            (80.0, 30.0),
+            "a plain fill keeps it"
+        );
+
+        let (mut fwd, mut bwd) = (shifted_map(100, 60, 0.0), shifted_map(100, 60, 0.0));
+        hole(&mut fwd);
+        fill_from_history(&mut fwd, &mut bwd, history(), 2.0, true);
+        assert!(
+            fwd.grid_coordinates(10, 6).0.is_nan(),
+            "the round trip is 6 cells off"
+        );
+        assert_eq!(
+            fwd.grid_coordinates(9, 6),
+            (45.0, 30.0),
+            "unfilled cells stay"
+        );
+    }
 }

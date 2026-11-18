@@ -112,5 +112,5 @@ pub use correspondence::{correspond, Builder, Correspondence, Progress};
 pub use dense_photo_map::DensePhotoMap;
 pub use error::{DecodeError, Error};
 pub use photo::{Photo, MIN_DIMENSION};
-pub use pixelmap_processor::{PixelMapProcessor, DEFAULT_SEED};
+pub use pixelmap_processor::{FillMode, PixelMapProcessor, DEFAULT_SEED};
 pub use processing_mode::{IterationParams, ParseProcessingModeError, ProcessingMode, Quality};

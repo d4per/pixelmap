@@ -16,7 +16,7 @@ fn main() {
     let (a, b) = (&args[1], &args[2]);
     let quality: Quality = args
         .get(3)
-        .map(|s| s.parse().expect("low, medium or high"))
+        .map(|s| s.parse().expect("low, medium, high or ultra"))
         .unwrap_or(Quality::Low);
     let out_dir = args.get(4).cloned().unwrap_or_else(|| ".".to_string());
     let max_width: usize = args
@@ -35,7 +35,7 @@ fn main() {
     };
     let (photo1, photo2) = (Arc::new(load(a)), Arc::new(load(b)));
 
-    let steps = quality.steps();
+    let steps = quality.steps_for(photo1.width());
     for prefix in 1..=steps.len() {
         let mapping = Correspondence::builder()
             .quality(quality)

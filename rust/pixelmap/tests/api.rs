@@ -774,3 +774,111 @@ fn progress_is_reported_for_every_step() {
         "steps must increase"
     );
 }
+
+/// Filling final holes from earlier widths can only add cells, and keeps the known
+/// translation.
+#[test]
+fn hole_filling_keeps_the_translation() {
+    use pixelmap::{FillMode, IterationParams};
+    let step = |photo_width, clean_max_dist| IterationParams {
+        photo_width,
+        grid_cell_size: 5,
+        neighborhood_radius: 5,
+        smooth_iterations: 2,
+        clean_max_dist,
+    };
+    let schedule = vec![
+        step(200, 3.0),
+        step(200, 2.0),
+        step(400, 1.0),
+        step(400, 2.0),
+    ];
+    let mapping = |fill| {
+        let (a, b) = shifted_pair(400, 240, 8, 4);
+        Correspondence::builder()
+            .quality(Quality::Medium)
+            .schedule(schedule.clone())
+            .fill_mode(fill)
+            .run(a, b)
+            .expect("synthetic photos are valid input")
+    };
+    let off = mapping(FillMode::Off);
+    let filled = mapping(FillMode::Plain);
+    assert!(filled.coverage() >= off.coverage());
+    let (x, y) = filled.lookup(200.0, 120.0).expect("the centre is mapped");
+    assert!(
+        (x - 192.0).abs() < 1.5 && (y - 116.0).abs() < 1.5,
+        "({x}, {y})"
+    );
+}
+
+/// Above `Low`, no step works wider than the photos, and `Ultra` adds its 3200 px steps
+/// only for photos wider than `High`'s 1600 px.
+#[test]
+fn schedules_fit_the_photo_width() {
+    let widths = |q: Quality, w: usize| -> Vec<usize> {
+        q.steps_for(w).iter().map(|s| s.photo_width).collect()
+    };
+    for q in Quality::ALL {
+        assert_eq!(
+            widths(q, 10_000),
+            widths_of(q.steps()),
+            "{q} on a wide photo"
+        );
+    }
+    assert_eq!(
+        widths(Quality::Low, 300),
+        vec![400; 4],
+        "Low is left as it was"
+    );
+    assert!(widths(Quality::Medium, 600).iter().all(|&w| w <= 600));
+    assert_eq!(widths(Quality::High, 1000).last(), Some(&1000));
+    for w in [700, 1600] {
+        assert_eq!(Quality::Ultra.steps_for(w), Quality::High.steps_for(w));
+    }
+    let ultra = widths(Quality::Ultra, 2400);
+    assert_eq!(ultra.len(), Quality::High.steps().len() + 2);
+    assert_eq!(&ultra[ultra.len() - 3..], &[1600, 2400, 2400]);
+    assert_eq!(widths(Quality::Ultra, 5000).last(), Some(&3200));
+}
+
+fn widths_of(steps: &[pixelmap::IterationParams]) -> Vec<usize> {
+    steps.iter().map(|s| s.photo_width).collect()
+}
+
+#[test]
+fn ultra_parses_and_the_higher_presets_fill_by_default() {
+    use pixelmap::FillMode;
+    assert_eq!("ultra".parse::<Quality>(), Ok(Quality::Ultra));
+    assert_eq!(Quality::Ultra.to_string(), "ultra");
+    assert_eq!(Quality::Low.fill_mode(), FillMode::Off);
+    for q in [Quality::Medium, Quality::High, Quality::Ultra] {
+        assert_eq!(q.fill_mode(), FillMode::Plain, "{q}");
+    }
+}
+
+/// The preset's fill mode applies unless the caller overrides it.
+#[test]
+fn the_fill_mode_defaults_to_the_presets() {
+    use pixelmap::FillMode;
+    let run = |fill: Option<FillMode>| {
+        let (a, b) = shifted_pair(320, 200, 6, 3);
+        let builder = Correspondence::builder().quality(Quality::Medium);
+        let builder = match fill {
+            Some(f) => builder.fill_mode(f),
+            None => builder,
+        };
+        let m = builder.run(a, b).expect("synthetic photos are valid input");
+        let (gw, gh) = m.forward().dimensions();
+        let mut bits = Vec::new();
+        for y in 0..gh {
+            for x in 0..gw {
+                let (u, v) = m.forward().grid_coordinates(x, y);
+                bits.extend([u.to_bits(), v.to_bits()]);
+            }
+        }
+        bits
+    };
+    let default = run(None);
+    assert_eq!(default, run(Some(FillMode::Plain)));
+}
