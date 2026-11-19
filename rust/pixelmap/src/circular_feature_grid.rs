@@ -105,15 +105,19 @@ impl<'a> DescriptorRows<'a> {
 
     /// Writes the descriptors of row `y` into `out`, which must be `width` long.
     ///
-    /// Along the interior of a row the disc is *slid* rather than re-walked: consecutive
-    /// centres overlap in all but one column per disc row, so [`AbsSums`] can update the
-    /// sums by subtracting the pixel leaving each of the `2r+1` rows and adding the one
-    /// entering it. That is 2*(2r+1) pixel loads per descriptor instead of the whole
-    /// disc — 42 instead of 317 at radius 10 — and, being integer arithmetic, gives
-    /// bit-identical sums.
+    /// The disc is *slid* along the row rather than re-walked: consecutive centres
+    /// overlap in all but one column per disc row, so [`AbsSums`] can update the sums by
+    /// subtracting the pixel leaving each of the `2r+1` rows and adding the one entering
+    /// it. That is 2*(2r+1) pixel loads per descriptor instead of the whole disc — 42
+    /// instead of 317 at radius 10 — and, being integer arithmetic, gives bit-identical
+    /// sums.
     ///
-    /// Only the border ring, where the disc wraps toroidally and the overlap argument
-    /// does not hold, still walks the full disc.
+    /// Near the edges the disc wraps toroidally, and it slides there too. Each pixel is
+    /// *read* at its wrapped position but *weighted* by its unwrapped one, `x + dx` and
+    /// `y + dy`, so the moments still come out as `sum(dx * v)` and `sum(dy * v)`:
+    /// exactly what walking the wrapped disc gives. The border used to walk the full disc
+    /// for every centre, with two `%` per pixel, and at 1600 px that was 3% of the
+    /// descriptors and 30% of the time.
     pub(crate) fn fill_row(&self, y: usize, out: &mut [CircularFeatureDescriptor]) {
         let (data, radius, row_half_width) = (self.data, self.radius, &self.row_half_width[..]);
         let (w, h) = (self.width as isize, self.height as isize);
@@ -123,48 +127,53 @@ impl<'a> DescriptorRows<'a> {
             self.width,
             "a row buffer must be one image row long"
         );
-        let interior_x = radius < w - radius;
-        let interior_row = y >= radius && y < h - radius && interior_x;
-        let wrapping = |x: isize| {
-            let sums = Self::disc_sums_wrapping(data, w, h, x, y, radius, row_half_width);
-            Self::finish_descriptor(x, y, sums)
-        };
-        if !interior_row {
-            for x in 0..w {
-                out[x as usize] = wrapping(x);
-            }
+        if w == 0 {
             return;
         }
-        for x in 0..radius {
-            out[x as usize] = wrapping(x);
-        }
-        // Seed the running sums at the first interior centre of this row.
+        // Every disc row's wrapped image row, as the index of its first pixel.
+        let rows: Vec<isize> = (-radius..=radius)
+            .map(|dy| (y + dy).rem_euclid(h) * w)
+            .collect();
+        let at = |px: isize, i: usize| (px.rem_euclid(w) + rows[i]) as usize;
+
+        // Seed the running sums at the row's first centre.
         let mut acc = AbsSums::default();
         for (i, &half) in row_half_width.iter().enumerate() {
             let py = y + i as isize - radius;
-            for px in (radius - half)..=(radius + half) {
-                acc.add(px, py, data, w);
+            for px in -half..=half {
+                acc.add_at(px, py, at(px, i), data);
             }
         }
-        for x in radius..(w - radius) {
-            if x > radius {
-                // Slide one column right: one pixel out and one in per disc row.
+        out[0] = Self::finish_descriptor(0, y, acc.to_disc_sums(0, y));
+
+        // Where neither the disc rows nor the pixels entering and leaving them wrap, the
+        // slide can skip the wrapping and the bounds checks.
+        let interior_row = y >= radius && y < h - radius;
+        let interior = (radius + 1)..(w - radius);
+        for x in 1..w {
+            if interior_row && interior.contains(&x) {
                 for (i, &half) in row_half_width.iter().enumerate() {
                     let py = y + i as isize - radius;
                     acc.sub(x - 1 - half, py, data, w);
                     acc.add(x + half, py, data, w);
                 }
+            } else {
+                for (i, &half) in row_half_width.iter().enumerate() {
+                    let py = y + i as isize - radius;
+                    let (gone, new) = (x - 1 - half, x + half);
+                    acc.sub_at(gone, py, at(gone, i), data);
+                    acc.add_at(new, py, at(new, i), data);
+                }
             }
             out[x as usize] = Self::finish_descriptor(x, y, acc.to_disc_sums(x, y));
-        }
-        for x in (w - radius)..w {
-            out[x as usize] = wrapping(x);
         }
     }
 }
 
 impl DescriptorRows<'_> {
-    /// Accumulates the disc sums for a centre near an edge, wrapping toroidally.
+    /// The disc sums of one centre, walking the whole disc and wrapping toroidally: what
+    /// [`Self::fill_row`] has to reproduce, and what the tests hold it to.
+    #[cfg(test)]
     fn disc_sums_wrapping(
         data: &[u8],
         w: isize,
@@ -261,6 +270,7 @@ struct DiscSums {
 }
 
 impl DiscSums {
+    #[cfg(test)]
     #[inline(always)]
     fn add(&mut self, dx: isize, dy: isize, r: isize, g: isize, b: isize) {
         self.sum_red += r;
@@ -293,14 +303,42 @@ impl AbsSums {
     #[inline(always)]
     fn rgb(data: &[u8], px: isize, py: isize, w: isize) -> (i64, i64, i64) {
         let p = ((py * w + px) * 4) as usize;
-        // SAFETY: only reached for centres at least `radius` from every edge, and
-        // `half <= radius`, so `px` is in `0..w` and `py` in `0..h`.
+        // SAFETY: only reached from the interior of `fill_row`: rows at least `radius`
+        // from the top and bottom, and pixels `x - 1 - half >= 0` and `x + half < w`
+        // with `half <= radius`, so `px` is in `0..w` and `py` in `0..h`.
         unsafe {
             (
                 *data.get_unchecked(p) as i64,
                 *data.get_unchecked(p + 1) as i64,
                 *data.get_unchecked(p + 2) as i64,
             )
+        }
+    }
+
+    /// Adds the pixel at index `at` of `data`, weighted as if it sat at `(px, py)`. The
+    /// two differ where the disc wraps; see [`DescriptorRows::fill_row`].
+    #[inline(always)]
+    fn add_at(&mut self, px: isize, py: isize, at: usize, data: &[u8]) {
+        let p = &data[4 * at..4 * at + 3];
+        let (pxi, pyi) = (px as i64, py as i64);
+        for (c, &v) in p.iter().enumerate() {
+            let v = v as i64;
+            self.s[c] += v;
+            self.ax[c] += pxi * v;
+            self.ay[c] += pyi * v;
+        }
+    }
+
+    /// The inverse of [`Self::add_at`].
+    #[inline(always)]
+    fn sub_at(&mut self, px: isize, py: isize, at: usize, data: &[u8]) {
+        let p = &data[4 * at..4 * at + 3];
+        let (pxi, pyi) = (px as i64, py as i64);
+        for (c, &v) in p.iter().enumerate() {
+            let v = v as i64;
+            self.s[c] -= v;
+            self.ax[c] -= pxi * v;
+            self.ay[c] -= pyi * v;
         }
     }
 
@@ -348,6 +386,66 @@ impl AbsSums {
             wy_green,
             wx_blue,
             wy_blue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    fn noise_photo(width: usize, height: usize, seed: u64) -> Photo {
+        let mut rng = Rng::seed_from_u64(seed);
+        let img_data = (0..width * height * 4)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        Photo {
+            img_data,
+            width,
+            height,
+        }
+    }
+
+    /// Sliding, through the interior and through the wrapped border alike, has to give
+    /// every centre exactly the descriptor that walking its whole wrapped disc gives.
+    /// The sizes include photos barely wider or taller than the disc, where every centre
+    /// is on the border and the disc can reach around to meet itself.
+    #[test]
+    fn sliding_gives_the_full_walk_everywhere() {
+        for &(w, h, radius) in &[
+            (64usize, 48usize, 10usize),
+            (33, 50, 10),
+            (21, 23, 10),
+            (25, 21, 10),
+            (40, 30, 4),
+            (11, 9, 4),
+        ] {
+            let photo = noise_photo(w, h, (w * 1000 + h * 10 + radius) as u64);
+            let rows = DescriptorRows::new(&photo, radius);
+            let mut out = vec![CircularFeatureDescriptor::default(); w];
+            for y in 0..h {
+                rows.fill_row(y, &mut out);
+                for (x, got) in out.iter().enumerate() {
+                    let (xi, yi) = (x as isize, y as isize);
+                    let sums = DescriptorRows::disc_sums_wrapping(
+                        &photo.img_data,
+                        w as isize,
+                        h as isize,
+                        xi,
+                        yi,
+                        radius as isize,
+                        &rows.row_half_width,
+                    );
+                    let expected = DescriptorRows::finish_descriptor(xi, yi, sums);
+                    assert_eq!(
+                        (got.feature_vector, got.total_angle.to_bits()),
+                        (expected.feature_vector, expected.total_angle.to_bits()),
+                        "{w}x{h} at radius {radius}, centre ({x}, {y})"
+                    );
+                    assert_eq!((got.center_x, got.center_y), (x as u16, y as u16));
+                }
+            }
         }
     }
 }

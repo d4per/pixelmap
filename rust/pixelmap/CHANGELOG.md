@@ -14,11 +14,22 @@ gives the same mapping as 0.4.0, bit for bit, whatever the number of threads. On
 
 | preset | 0.4.0 | now | peak memory, 0.4.0 → now |
 |---|---|---|---|
-| `Ultra` | 5.2 s | 3.1 s | 484 MB → 239 MB |
-| `High` | 3.04 s | 2.04 s | 168 MB → 138 MB |
-| `Medium` | 0.88 s | 0.65 s | unchanged |
-| `Low` | 0.37 s | 0.32 s | unchanged |
+| `Ultra` | 5.2 s | 2.55 s | 484 MB → 239 MB |
+| `High` | 3.04 s | 1.56 s | 168 MB → 138 MB |
+| `Medium` | 0.88 s | 0.57 s | unchanged |
+| `Low` | 0.37 s | 0.31 s | unchanged |
 
+- The initial feature match is about twice as fast (875 ms → about 400 ms at 1600 px),
+  and still exact: every query finds the same nearest descriptor, ties included.
+  - The kd-tree prunes a subtree by the distance to its whole box, accumulated over every
+    axis, instead of along the last split alone.
+  - It splits along the axis of widest spread, in a basis fitted to the descriptor: the
+    red, green and blue components of a key move together, so it splits along their
+    common direction and across it rather than along each in turn. Together with the
+    box bound, a query visits 77 nodes and 355 leaf points instead of 142 and 1042.
+  - Descriptors near the image border are slid along the row like the rest instead of
+    each walking its whole wrapped disc. The border was 3% of the descriptors and 30% of
+    the time spent computing them.
 - The solver uses every core instead of two. Each pass is split into bands of whole grid
   rows that are scored side by side. Within a pass a candidate reads and writes only its
   own cell, so the bands are independent and the result is the serial one. Passes of
