@@ -111,14 +111,15 @@ jobs:
         run: cargo doc -p pixelmap --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
-      - name: Verify the crate is publishable
-        run: cargo publish --dry-run -p pixelmap
       - name: Document pixelmap_multiview with warnings denied
         run: cargo doc -p pixelmap_multiview --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
-      - name: Verify pixelmap_multiview is publishable
-        run: cargo publish --dry-run -p pixelmap_multiview
+      # One multi-package dry run, so pixelmap_multiview is verified against the local
+      # pixelmap. On its own it would look its pixelmap requirement up on crates.io, and
+      # fail whenever pixelmap's version has been bumped but not yet published.
+      - name: Verify both crates are publishable
+        run: cargo publish --dry-run -p pixelmap -p pixelmap_multiview
 
   docsrs:
     name: docs.rs build
