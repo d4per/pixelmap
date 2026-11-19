@@ -59,3 +59,83 @@ Each metric is computed per pair and then averaged over the dataset.
 - **PCK@k**: the share of *all* ground-truth pixels whose error is below k px, with unanswered pixels counted as misses. This is the fairest single number, because declining to answer cannot raise it.
 - **noc**: the same metrics restricted to non-occluded pixels, where the dataset provides them.
 - **s/pair**: wall time per pair, measured after a warm-up call. Both libraries use `--threads` threads.
+
+## Results: HPatches
+
+HPatches has no submission server, so these numbers are published here. The protocol is the
+one dense-matching papers use for HPatches at original resolution: the 59 viewpoint
+sequences (`v_*`), image 1 matched against images 2–6, ground truth from the provided
+homographies. Each number is a mean over the 295 pairs. pixelmap ran at its defaults
+(pixelmap 0.3.1 plus the Unreleased changes: `High` capped at the photo width and filling its
+holes); the OpenCV methods ran at theirs, with 12 threads on an i7-9750H.
+
+| method | pairs | coverage | AEPE | PCK-1 | PCK-3 | PCK-5 | s/pair |
+|---|---|---|---|---|---|---|---|
+| `pixelmap_high` | 295 | 77.1% | 7.14 | 37.7% | 65.1% | 70.9% | 3.21 |
+| `pixelmap_medium` | 295 | 76.3% | 16.83 | 34.7% | 64.0% | 69.8% | 1.46 |
+| `pixelmap_low` | 295 | 70.8% | 12.96 | 26.7% | 58.6% | 64.6% | 0.43 |
+| `pixelmap_high_filled` | 295 | 90.8% | 14.97 | 38.1% | 67.0% | 74.0% | 3.24 |
+| `pixelmap_medium_filled` | 295 | 92.2% | 27.15 | 35.1% | 66.0% | 73.0% | 1.49 |
+| `dis_medium` | 295 | 100.0% | 154.62 | 14.1% | 25.1% | 28.1% | 0.05 |
+| `dis_fast` | 295 | 100.0% | 166.73 | 7.9% | 16.6% | 19.5% | 0.02 |
+| `deepflow` | 295 | 100.0% | 178.42 | 9.6% | 13.3% | 14.2% | 2.25 |
+| `farneback` | 295 | 100.0% | 190.40 | 2.5% | 4.1% | 4.7% | 0.26 |
+| `pcaflow` | 295 | 100.0% | 190.50 | 0.7% | 2.1% | 3.0% | 0.07 |
+| `rlof` | 169 (126 failed) | 100.0% | 157.22 | 4.2% | 9.4% | 10.6% | 0.46 |
+
+How to read it:
+
+- **PCK-k** is the share of all ground-truth pixels within k px, with unanswered pixels
+  counted as misses. It is the column to compare across methods.
+- **AEPE** is over the pixels each method answered. A method that declines hard pixels gets a
+  lower AEPE than one that answers everything, so compare it only between methods with the
+  same coverage.
+- **pixelmap gives no answer at all on 27 of the 295 pairs** (High), mostly the
+  strongest viewpoint changes (images 4–6). Those pairs count as zero in PCK, are left out of
+  AEPE, and are why the `_filled` rows reach 90.8% coverage rather than 100%: with nothing
+  answered there is nothing to fill from.
+- The OpenCV methods are optical flow methods built for small motion, so HPatches' large
+  viewpoint changes are far outside what they were designed for. Learned dense matchers
+  report on this same protocol in their papers. Those numbers come from the papers, not from
+  runs here, and their image sizes and averaging may differ, so check before comparing.
+
+Regenerate the numbers with `python run.py --datasets hpatches` and `python report.py`.
+
+## Submitting to the leaderboards
+
+MPI Sintel, KITTI 2015 and ETH3D rank results on hidden test sets through their own
+websites. `submit.py` writes pixelmap's output in each one's official format and packs it;
+`python submit.py --help` lists the layouts, and `test_submit.py` checks the writers.
+Download the test splits with `./download.sh test`.
+
+The configuration was chosen on the **training** splits with each leaderboard's own metric,
+`quality="high"` throughout:
+
+| fill / densify | Sintel EPE clean / final (1041 pairs each) | KITTI Fl-all | ETH3D bad-2 (nocc) |
+|---|---|---|---|
+| **off / nearest** | **3.00 / 4.74** | **26.4%** | 14.68% |
+| plain / nearest | 3.08 / 4.80 | 27.2% | **14.64%** |
+| off / none | — (must be dense) | 28.9% | 22.7% |
+| plain / none | — (must be dense) | 28.5% | 18.5% |
+
+- **Submit `--fill off --densify nearest` to all three.** It wins on Sintel and KITTI and ties
+  on ETH3D, where the 0.04-point gap is noise over 27 pairs. One configuration also keeps
+  the method description the same on every leaderboard. pixelmap's own hole filling (`plain`,
+  the High default) adds answers that are less accurate than the nearest pixel it would
+  otherwise be filled from, so it helps PCK and hurts EPE and Fl.
+- Filling ourselves beats leaving holes to the server: KITTI's own background interpolation
+  scores 28.9% against 26.4%, and ETH3D counts missing pixels as wrong.
+- KITTI Fl-all is computed by `submit.py`'s port of the devkit's interpolation and scoring,
+  because the devkit's evaluator only runs in the server's directory layout.
+- About 1 s per pair at these sizes, 12 threads on an i7-9750H.
+
+Run the test split **once** with that configuration, then upload:
+
+```bash
+.venv/bin/python submit.py sintel  --split test --fill off --densify nearest --pack
+.venv/bin/python submit.py kitti15 --split test --fill off --densify nearest --pack
+.venv/bin/python submit.py eth3d   --split test --fill off --densify nearest --pack
+```
+
+Every benchmark forbids tuning on the test set, and KITTI and ETH3D accept a single upload
+per method, so do not change the configuration after seeing a test score.

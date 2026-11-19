@@ -4,6 +4,7 @@
 #
 #   ./download.sh hpatches eth3d      # the wide-baseline sets (~1.3 GB)
 #   ./download.sh all                 # adds KITTI 2015 (1.7 GB) and Sintel (5.6 GB)
+#   ./download.sh test                # the test splits and official tools, for submit.py
 #
 # Archives are deleted after extraction unless KEEP_ARCHIVES=1. Already extracted
 # datasets are skipped. Each dataset has its own licence: read it before publishing
@@ -75,11 +76,51 @@ sintel() {
     done_archive "$a"
 }
 
-[[ $# -eq 0 ]] && { echo "usage: $0 {hpatches|eth3d|kitti15|sintel|all}..." >&2; exit 2; }
+# Test splits (no ground truth) and the official tools, for submit.py. KITTI and Sintel
+# come out of the same archives as their training data, which are fetched again if they
+# were deleted after extraction.
+
+eth3d_test() {
+    [[ -d "$DATA/eth3d/two_view_test" ]] && { echo "eth3d_test: present"; return; }
+    local a="$DATA/eth3d/two_view_test.7z"
+    mkdir -p "$DATA/eth3d"
+    fetch "https://www.eth3d.net/data/two_view_test.7z" "$a"
+    extract_7z "$a" "$DATA/eth3d/two_view_test"
+    done_archive "$a"
+}
+
+kitti15_test() {
+    [[ -d "$DATA/kitti15/testing" ]] && { echo "kitti15_test: present"; return; }
+    local a="$DATA/data_scene_flow.zip"
+    fetch https://s3.eu-central-1.amazonaws.com/avg-kitti/data_scene_flow.zip "$a"
+    mkdir -p "$DATA/kitti15"
+    unzip -q "$a" 'testing/image_2/*' -d "$DATA/kitti15"
+    done_archive "$a"
+}
+
+kitti15_devkit() {
+    [[ -d "$DATA/kitti15/devkit" ]] && { echo "kitti15_devkit: present"; return; }
+    local a="$DATA/devkit_scene_flow.zip"
+    fetch https://s3.eu-central-1.amazonaws.com/avg-kitti/devkit_scene_flow.zip "$a"
+    unzip -q "$a" -d "$DATA/kitti15"
+    done_archive "$a"
+}
+
+sintel_test() {
+    [[ -d "$DATA/sintel/test/final" ]] && { echo "sintel_test: present"; return; }
+    local a="$DATA/MPI-Sintel-complete.zip"
+    fetch http://files.is.tue.mpg.de/sintel/MPI-Sintel-complete.zip "$a"
+    mkdir -p "$DATA/sintel"
+    unzip -q "$a" 'test/clean/*' 'test/final/*' 'bundler/*' -d "$DATA/sintel"
+    done_archive "$a"
+}
+
+[[ $# -eq 0 ]] && { echo "usage: $0 {hpatches|eth3d|kitti15|sintel|all|test}..." >&2; exit 2; }
 for d in "$@"; do
     case "$d" in
         all) hpatches; eth3d; kitti15; sintel ;;
-        hpatches|eth3d|kitti15|sintel) "$d" ;;
+        test) eth3d_test; kitti15_test; kitti15_devkit; sintel_test ;;
+        hpatches|eth3d|kitti15|sintel|eth3d_test|kitti15_test|kitti15_devkit|sintel_test) "$d" ;;
         *) echo "unknown dataset $d" >&2; exit 2 ;;
     esac
 done

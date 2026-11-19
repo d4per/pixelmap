@@ -4,4 +4,5 @@ python/.idea
 
 benchmarks/.venv/
 benchmarks/results/
+benchmarks/submissions/
 __pycache__/
