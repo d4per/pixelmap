@@ -1,6 +1,7 @@
 use crate::ac_grid::ACGrid;
 use crate::affine_transform::AffineTransform;
-use crate::correspondence_scoring::{CorrespondenceScoring, FixedTransform, PackedPhoto};
+use crate::affine_transform_cell::AffineTransformCell;
+use crate::correspondence_scoring::{CorrespondenceScoring, FixedTransform, Samples};
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use crate::rng::Rng;
@@ -60,6 +61,47 @@ struct Seen {
 /// 4 is worse, and no grouping at all costs about 15%.
 const QUEUE_TILE: usize = 10;
 
+/// [`CorrespondenceMappingAlgorithm::order_queue_by_tile`] sorts the queue by key
+/// rather than counting it into every tile when there are more than this many tiles per
+/// queued transform. Both give the same order; this only picks the faster one.
+const SORT_BELOW_TILES_PER_ENTRY: usize = 16;
+
+/// A pass over fewer queued transforms than this runs as one band on the calling
+/// thread; see [`CorrespondenceMappingAlgorithm::run_bands`]. Below it, handing the work
+/// to other threads costs more than it saves. Measured on a 4128x3096 pair: 1024 beat
+/// 4096 by 3–4% at `Medium` through `Ultra`.
+const MIN_BANDED_QUEUE: usize = 1024;
+
+/// One queued candidate: the transform `parents[parent]` of
+/// [`CorrespondenceMappingAlgorithm`], moved to the grid node `origin`.
+///
+/// Every candidate after the first pass is a child: a cell's transform at the end of a
+/// pass, extrapolated to a neighbour's node. Queuing the four children of a cell as whole
+/// transforms stored the same matrix four times, at 28 bytes a child. They now share one
+/// copy of it and are 8 bytes each, which at 3200 px, where a pass can queue over a
+/// million of them per solver, is most of the queue's memory.
+///
+/// A seed (a transform queued from outside, not a child) sits at its own origin, which
+/// no child ever does; that is how [`resolve`] tells it to use the transform as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueEntry {
+    parent: u32,
+    origin_x: u16,
+    origin_y: u16,
+}
+
+/// The transform `entry` stands for: its parent extrapolated to its node, exactly the
+/// value that used to be computed and queued when the parent reproduced.
+#[inline(always)]
+fn resolve(parents: &[AffineTransform], entry: QueueEntry) -> AffineTransform {
+    let p = &parents[entry.parent as usize];
+    if (entry.origin_x, entry.origin_y) == (p.origin_x, p.origin_y) {
+        *p
+    } else {
+        p.extrapolate_mapping(entry.origin_x, entry.origin_y)
+    }
+}
+
 /// Manages an iterative process for matching two images (`photo1` and `photo2`) by
 /// assigning an [AffineTransform] to each cell in a grid. The algorithm refines these
 /// transforms based on a scoring function (see [CorrespondenceScoring]) until no
@@ -81,8 +123,10 @@ pub struct CorrespondenceMappingAlgorithm {
     photo2: Arc<Photo>,
     /// Size of each grid cell in pixels.
     grid_cell_size: usize,
-    /// A queue of candidate [AffineTransform] objects to evaluate and refine.
-    queue: Vec<AffineTransform>,
+    /// The candidates of the next pass; see [`QueueEntry`].
+    queue: Vec<QueueEntry>,
+    /// The transforms `queue` refers to.
+    parents: Vec<AffineTransform>,
     /// Scores transforms by comparing corresponding regions of `photo1` and `photo2`.
     scorer: CorrespondenceScoring,
     /// A 2D grid that stores the best-known transform for each cell (and its score).
@@ -97,9 +141,11 @@ pub struct CorrespondenceMappingAlgorithm {
     /// the same input to agree.
     rng: Rng,
     /// Reused buffer for the tile-ordering counting sort.
-    sort_scratch: Vec<AffineTransform>,
+    sort_scratch: Vec<QueueEntry>,
     /// Reused bucket boundaries for the tile-ordering counting sort.
     tile_offsets: Vec<u32>,
+    /// Reused `(tile, queue position)` keys for the tile ordering of a small queue.
+    sort_keys: Vec<u64>,
     /// Per cell, the candidates it has already evaluated; see [`Seen`].
     seen: Vec<Seen>,
     /// The cells whose transform changed during the pass in progress, in the order they
@@ -110,6 +156,109 @@ pub struct CorrespondenceMappingAlgorithm {
     /// Whether candidates a cell has already evaluated are dropped unscored. Always on;
     /// the tests turn it off to check that it changes the work and nothing else.
     skip_seen: bool,
+    /// One disc scratch per band of a pass, reused across passes.
+    scratch: Vec<Samples>,
+    /// The disc radius the scratch is sized for.
+    neighborhood_radius: usize,
+    /// Comparisons made so far, collected from `scratch` after every pass.
+    comparisons: usize,
+    /// [`MIN_BANDED_QUEUE`]; the tests lower it to band the small passes they can afford.
+    /// Without the `parallel` feature every pass is one band.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    min_banded_queue: usize,
+}
+
+/// One band of a pass: a run of the tile-ordered queue, and the grid rows its
+/// transforms land in.
+struct Band<'a> {
+    entries: &'a [QueueEntry],
+    first_row: usize,
+    cells: &'a mut [AffineTransformCell],
+    seen: &'a mut [Seen],
+    is_improved: &'a mut [bool],
+    scratch: &'a mut Samples,
+}
+
+/// What every band of a pass reads.
+struct PassContext<'a> {
+    scorer: &'a CorrespondenceScoring,
+    parents: &'a [AffineTransform],
+    grid_width: usize,
+    grid_height: usize,
+    cell_size: usize,
+    photo_width: f32,
+    photo_height: f32,
+    skip_seen: bool,
+}
+
+/// Scores one band's transforms against its cells, last first as the serial pass popped
+/// them. Returns the cells that changed, in the order they first did, each with the
+/// score it held before; see [`CorrespondenceMappingAlgorithm::run_queue`].
+fn run_band(ctx: &PassContext, band: Band) -> Vec<(u32, f32)> {
+    let Band {
+        entries,
+        first_row,
+        cells,
+        seen,
+        is_improved,
+        scratch: s,
+    } = band;
+    let base = first_row * ctx.grid_width;
+    let mut improved = Vec::new();
+    for &entry in entries.iter().rev() {
+        let cm = &resolve(ctx.parents, entry);
+        // Skip if the transform is out of scale or its target lies outside photo2.
+        let valid = cm.translate_x >= 0.0
+            && cm.translate_y >= 0.0
+            && cm.translate_x <= ctx.photo_width
+            && cm.translate_y <= ctx.photo_height;
+        if !cm.is_scale_valid(4.0) || !valid {
+            continue;
+        }
+        // Determine which grid cell the transform belongs to. Optimizing it moves
+        // where it lands in `photo2`, never its origin, so this can be decided up
+        // front.
+        //
+        // A transform can sit one cell past the grid: `init_from_photomapping`
+        // rounds to the nearest grid node, and when a step works at a lower width
+        // than the map it starts from, the map's last column or row rounds up to a
+        // node at the photo's far edge. There is no cell there to compete for.
+        let grid_x = cm.origin_x as usize / ctx.cell_size;
+        let grid_y = cm.origin_y as usize / ctx.cell_size;
+        if grid_x >= ctx.grid_width || grid_y >= ctx.grid_height {
+            continue;
+        }
+        let cell = grid_x + grid_y * ctx.grid_width;
+        // In range: `run_bands` gave this band every row its tile rows contain.
+        let local = cell - base;
+
+        // A transform this cell has already evaluated would score the same again and
+        // lose; see `Seen`.
+        let key = FixedTransform::new(cm);
+        let seen_here = seen[local];
+        if ctx.skip_seen && (seen_here.accepted == Some(key) || seen_here.rejected == Some(key)) {
+            continue;
+        }
+        // Try it and its +-1 pixel shifts.
+        let (score, cm_out) = ctx.scorer.optimize_translation(cm, &key, s);
+
+        // Compare with the current best cell transform/score.
+        let square = &cells[local];
+        let score_before = square.get_score();
+        if score_before > score {
+            square.set(cm_out, score);
+            seen[local].accepted = Some(key);
+            if !is_improved[local] {
+                // Remember that the cell changed, and what it had to beat when the pass
+                // began. It reproduces after the pass, from whatever it holds by then.
+                is_improved[local] = true;
+                improved.push((cell as u32, score_before));
+            }
+        } else {
+            seen[local].rejected = Some(key);
+        }
+    }
+    improved
 }
 
 impl CorrespondenceMappingAlgorithm {
@@ -126,6 +275,7 @@ impl CorrespondenceMappingAlgorithm {
     /// # Returns
     /// A new `CorrespondenceMappingAlgorithm` with scaled images, an empty queue, and
     /// an initialized scoring mechanism and grid.
+    #[cfg(test)]
     pub fn new(
         photo_width: usize,
         photo1: &Photo,
@@ -135,17 +285,17 @@ impl CorrespondenceMappingAlgorithm {
         seed: u64,
     ) -> Self {
         // Scale the original photos to the specified width.
-        let photo1a = PackedPhoto::new(Arc::new(photo1.scaled_to_width(photo_width)));
-        let photo2a = PackedPhoto::new(Arc::new(photo2.scaled_to_width(photo_width)));
+        let photo1a = Arc::new(photo1.scaled_to_width(photo_width));
+        let photo2a = Arc::new(photo2.scaled_to_width(photo_width));
         Self::with_scaled(photo1a, photo2a, grid_cell_size, neighborhood_radius, seed)
     }
 
     /// Same as [`Self::new`], but takes photos that have already been scaled to the
     /// working width. Callers that build several algorithms over the same pair of
-    /// images can then scale and pack once instead of once per algorithm.
+    /// images can then scale once instead of once per algorithm.
     pub(crate) fn with_scaled(
-        packed1: PackedPhoto,
-        packed2: PackedPhoto,
+        photo1: Arc<Photo>,
+        photo2: Arc<Photo>,
         grid_cell_size: usize,
         neighborhood_radius: usize,
         seed: u64,
@@ -156,35 +306,36 @@ impl CorrespondenceMappingAlgorithm {
         // column past the image, where `resolve_disc` finds no pixels to score and the
         // cell can never be filled. That dead column and row then took their neighbours
         // with them through `remove_outliers`, and counted against `coverage()` besides.
-        let (photo1a, photo2a) = (packed1.photo.clone(), packed2.photo.clone());
-        let grid_width = photo1a.width.saturating_sub(1) / grid_cell_size + 1;
-        let grid_height = photo1a.height.saturating_sub(1) / grid_cell_size + 1;
+        let grid_width = photo1.width.saturating_sub(1) / grid_cell_size + 1;
+        let grid_height = photo1.height.saturating_sub(1) / grid_cell_size + 1;
 
         CorrespondenceMappingAlgorithm {
-            photo1: photo1a,
-            photo2: photo2a,
+            photo1: photo1.clone(),
+            photo2: photo2.clone(),
             grid_cell_size,
             queue: vec![],
-            scorer: CorrespondenceScoring::with_packed(
-                packed1,
-                packed2,
-                neighborhood_radius as isize,
-            ),
+            parents: Vec::new(),
+            scorer: CorrespondenceScoring::new(photo1, photo2, neighborhood_radius as isize),
             ac_grid: ACGrid::new(grid_width, grid_height),
             rng: Rng::seed_from_u64(seed),
             sort_scratch: Vec::new(),
             tile_offsets: Vec::new(),
+            sort_keys: Vec::new(),
             seen: vec![Seen::default(); grid_width * grid_height],
             improved: Vec::new(),
             is_improved: vec![false; grid_width * grid_height],
             skip_seen: true,
+            scratch: Vec::new(),
+            neighborhood_radius,
+            comparisons: 0,
+            min_banded_queue: MIN_BANDED_QUEUE,
         }
     }
 
     /// Returns the total number of scoring function invocations
-    /// performed so far (for diagnostic or debugging purposes).
+    /// performed so far (for diagnostic or debugging purposes): five per scored candidate.
     pub fn total_comparisons(&self) -> usize {
-        self.scorer.get_num_comparisons()
+        self.comparisons
     }
 
     /// Repeatedly processes (and shuffles) the queue of transforms until no more
@@ -212,52 +363,76 @@ impl CorrespondenceMappingAlgorithm {
     /// local. Tiles are visited in serpentine order so that stepping from one tile to
     /// the next is always a step to an adjacent region.
     ///
-    /// This is a counting sort: two linear passes plus a scatter, reusing its buffers
-    /// across passes. That is cheaper than the full-width Fisher-Yates it replaces.
+    /// A large queue is ordered by a counting sort, two linear passes plus a scatter
+    /// with buffers reused across passes, which is cheaper than the full-width
+    /// Fisher-Yates it replaces. A counting sort costs time in proportion to the number
+    /// of tiles as well, though, and that is 77,000 at 3200 px. The relaxation ends in a
+    /// long tail of small passes, which spent most of their time on empty tiles. A queue that is small next to the tile count is therefore
+    /// sorted by key instead; see [`Self::order_by_sorting`]. Both orders are the same,
+    /// and so are the shuffles, so which path runs changes nothing but the time.
     fn order_queue_by_tile(&mut self) {
         let n = self.queue.len();
         if n < 2 {
             return;
         }
-        let tile = QUEUE_TILE;
-        let tw = self.photo1.width / tile + 1;
-        let th = self.photo1.height / tile + 1;
-        let n_tiles = tw * th;
+        if n * SORT_BELOW_TILES_PER_ENTRY < self.tile_layout().2 {
+            self.order_by_sorting();
+        } else {
+            self.order_by_counting();
+        }
+    }
+
+    /// The tile grid of [`Self::order_queue_by_tile`]: `(tiles across, tiles down, tiles)`.
+    fn tile_layout(&self) -> (usize, usize, usize) {
+        let tw = self.photo1.width / QUEUE_TILE + 1;
+        let th = self.photo1.height / QUEUE_TILE + 1;
+        (tw, th, tw * th)
+    }
+
+    /// The position of the tile `cm` starts in, in the serpentine order of
+    /// [`Self::order_queue_by_tile`].
+    #[inline(always)]
+    fn tile_of(cm: &QueueEntry, tw: usize, th: usize) -> usize {
+        let tx = (cm.origin_x as usize / QUEUE_TILE).min(tw - 1);
+        let ty = (cm.origin_y as usize / QUEUE_TILE).min(th - 1);
+        // Serpentine: reverse the x order on odd rows so the last tile of one row
+        // is adjacent to the first tile of the next.
+        let tx = if ty & 1 == 1 { tw - 1 - tx } else { tx };
+        ty * tw + tx
+    }
+
+    /// [`Self::order_queue_by_tile`] as a counting sort over every tile.
+    fn order_by_counting(&mut self) {
+        let n = self.queue.len();
+        let (tw, th, n_tiles) = self.tile_layout();
 
         let queue = std::mem::take(&mut self.queue);
         let mut sorted = std::mem::take(&mut self.sort_scratch);
         let mut offsets = std::mem::take(&mut self.tile_offsets);
 
-        let tile_of = |cm: &AffineTransform| -> usize {
-            let tx = (cm.origin_x as usize / tile).min(tw - 1);
-            let ty = (cm.origin_y as usize / tile).min(th - 1);
-            // Serpentine: reverse the x order on odd rows so the last tile of one row
-            // is adjacent to the first tile of the next.
-            let tx = if ty & 1 == 1 { tw - 1 - tx } else { tx };
-            ty * tw + tx
-        };
-
+        // Tile `t`'s count goes in `offsets[t + 2]`, so that after the prefix sum
+        // `offsets[t + 1]` is where tile `t` starts. The scatter then advances it as a
+        // cursor, leaving it where tile `t` ends, which is where `t + 1` starts: the
+        // finished `offsets[t]..offsets[t + 1]` is tile `t`, with no copy of the
+        // boundaries needed to scatter by.
         offsets.clear();
-        offsets.resize(n_tiles + 1, 0u32);
+        offsets.resize(n_tiles + 2, 0u32);
         for cm in &queue {
-            offsets[tile_of(cm) + 1] += 1;
+            offsets[Self::tile_of(cm, tw, th) + 2] += 1;
         }
-        for i in 1..=n_tiles {
+        for i in 2..offsets.len() {
             offsets[i] += offsets[i - 1];
         }
 
         sorted.clear();
         sorted.resize(n, queue[0]);
-        {
-            let mut cursor = offsets.clone();
-            for cm in &queue {
-                let t = tile_of(cm);
-                sorted[cursor[t] as usize] = *cm;
-                cursor[t] += 1;
-            }
+        for cm in &queue {
+            let cursor = &mut offsets[Self::tile_of(cm, tw, th) + 1];
+            sorted[*cursor as usize] = *cm;
+            *cursor += 1;
         }
 
-        for w in offsets.windows(2) {
+        for w in offsets[..=n_tiles].windows(2) {
             let (a, b) = (w[0] as usize, w[1] as usize);
             if b - a > 1 {
                 self.rng.shuffle(&mut sorted[a..b]);
@@ -267,6 +442,48 @@ impl CorrespondenceMappingAlgorithm {
         self.queue = sorted;
         self.sort_scratch = queue;
         self.tile_offsets = offsets;
+    }
+
+    /// [`Self::order_queue_by_tile`] by sorting the queue on its tiles, which costs
+    /// nothing for the tiles that are empty.
+    ///
+    /// The key is the tile above the entry's queue position, so equal tiles keep their
+    /// queue order, exactly as the counting sort's scatter leaves them. The tiles that
+    /// hold more than one entry are then shuffled in increasing order, which is the order
+    /// the counting sort shuffles them in, so both draw the same numbers from `rng` for
+    /// the same entries.
+    fn order_by_sorting(&mut self) {
+        let (tw, th, _) = self.tile_layout();
+
+        let queue = std::mem::take(&mut self.queue);
+        let mut sorted = std::mem::take(&mut self.sort_scratch);
+        let mut keys = std::mem::take(&mut self.sort_keys);
+
+        keys.clear();
+        keys.extend(
+            queue
+                .iter()
+                .enumerate()
+                .map(|(i, cm)| (Self::tile_of(cm, tw, th) as u64) << 32 | i as u64),
+        );
+        keys.sort_unstable();
+
+        sorted.clear();
+        sorted.extend(keys.iter().map(|&k| queue[k as u32 as usize]));
+
+        let mut a = 0;
+        while a < keys.len() {
+            let tile = keys[a] >> 32;
+            let b = a + keys[a..].iter().take_while(|&&k| k >> 32 == tile).count();
+            if b - a > 1 {
+                self.rng.shuffle(&mut sorted[a..b]);
+            }
+            a = b;
+        }
+
+        self.queue = sorted;
+        self.sort_scratch = queue;
+        self.sort_keys = keys;
     }
 
     /// Adds a new transform to the queue, deriving rotation from the given `angle`.
@@ -296,7 +513,18 @@ impl CorrespondenceMappingAlgorithm {
             (x1 as usize / self.grid_cell_size * self.grid_cell_size) as u16,
             (y1 as usize / self.grid_cell_size * self.grid_cell_size) as u16,
         );
-        self.queue.push(snap_to_grid_cm);
+        self.push_seed(snap_to_grid_cm);
+    }
+
+    /// Queues `cm` as it is, for the next pass to score.
+    fn push_seed(&mut self, cm: AffineTransform) {
+        let parent = u32::try_from(self.parents.len()).expect("fewer than 2^32 transforms");
+        self.parents.push(cm);
+        self.queue.push(QueueEntry {
+            parent,
+            origin_x: cm.origin_x,
+            origin_y: cm.origin_y,
+        });
     }
 
     /// Initializes the queue with transforms derived from an existing [DensePhotoMap].
@@ -361,7 +589,7 @@ impl CorrespondenceMappingAlgorithm {
                     * self.grid_cell_size;
                 let snap_to_grid_cm =
                     cm.extrapolate_mapping(snap_to_grid_x as u16, snap_to_grid_y as u16);
-                self.queue.push(snap_to_grid_cm);
+                self.push_seed(snap_to_grid_cm);
             }
         }
     }
@@ -373,7 +601,7 @@ impl CorrespondenceMappingAlgorithm {
     /// For each transform:
     /// 1. Validates its scale and position (no out-of-bounds).
     /// 2. Drops it unscored if its cell has evaluated the same transform before.
-    /// 3. Uses `optimize_position` to adjust it.
+    /// 3. Scores it and its four ±1 pixel shifts.
     /// 4. Stores it in its grid cell if it scores lower than what the cell holds.
     ///
     /// # Who reproduces
@@ -409,54 +637,7 @@ impl CorrespondenceMappingAlgorithm {
         let grid_width = self.ac_grid.get_grid_width();
         let grid_height = self.ac_grid.get_grid_height();
 
-        while let Some(cm) = self.queue.pop() {
-            // Skip if the transform is out of scale or invalid in terms of translation.
-            if !cm.is_scale_valid(4.0) || !self.is_valid(&cm) {
-                continue;
-            }
-
-            // Determine which grid cell the transform belongs to. Optimizing it moves
-            // where it lands in `photo2`, never its origin, so this can be decided up
-            // front.
-            //
-            // A transform can sit one cell past the grid: `init_from_photomapping`
-            // rounds to the nearest grid node, and when a step works at a lower width
-            // than the map it starts from, the map's last column or row rounds up to a
-            // node at the photo's far edge. There is no cell there to compete for.
-            let grid_x = cm.origin_x as usize / self.grid_cell_size;
-            let grid_y = cm.origin_y as usize / self.grid_cell_size;
-            if grid_x >= grid_width || grid_y >= grid_height {
-                continue;
-            }
-            let cell = grid_x + grid_y * grid_width;
-
-            // A transform this cell has already evaluated would score the same again and
-            // lose; see `Seen`.
-            let key = FixedTransform::new(&cm);
-            let seen = self.seen[cell];
-            if self.skip_seen && (seen.accepted == Some(key) || seen.rejected == Some(key)) {
-                continue;
-            }
-
-            // Attempt a small local optimization on (cm).
-            let (score, cm_out) = self.optimize_position(&cm);
-
-            // Compare with the current best cell transform/score.
-            let grid_square = self.ac_grid.get_grid_square(grid_x, grid_y);
-            let score_before = grid_square.get_score();
-            if score_before > score {
-                grid_square.set(cm_out, score);
-                self.seen[cell].accepted = Some(key);
-                // Remember that the cell changed, and what it had to beat when the pass
-                // began. It reproduces after the pass, from whatever it holds by then.
-                if !self.is_improved[cell] {
-                    self.is_improved[cell] = true;
-                    self.improved.push((cell as u32, score_before));
-                }
-            } else {
-                self.seen[cell].rejected = Some(key);
-            }
-        }
+        self.run_bands();
 
         // Generate child transforms for the neighbours of every cell that came out of
         // the pass clearly better than it went in.
@@ -468,8 +649,14 @@ impl CorrespondenceMappingAlgorithm {
         // pair at `medium`, propagating the optimized transform raises the matched area
         // from 0.384 to 0.408 for about 14% more time, the extra time being spent
         // converging to the larger result.
+        //
+        // The pass is over, so nothing reads the transforms its queue referred to any
+        // more: the pool is refilled with the transforms of the cells that reproduce,
+        // one each, and their children refer to them.
         let mut improved = std::mem::take(&mut self.improved);
-        let mut out_queue: Vec<AffineTransform> = Vec::with_capacity(4 * improved.len());
+        let mut out_queue: Vec<QueueEntry> = Vec::with_capacity(4 * improved.len());
+        let mut parents = std::mem::take(&mut self.parents);
+        parents.clear();
         let cell_size = self.grid_cell_size;
         for &(cell, score_at_start) in &improved {
             let cell = cell as usize;
@@ -482,10 +669,14 @@ impl CorrespondenceMappingAlgorithm {
             let Some(cm_out) = grid_square.get_affine_transform() else {
                 continue;
             };
+            let parent = parents.len() as u32;
+            parents.push(cm_out);
             let mut child = |x: usize, y: usize| {
-                out_queue.push(
-                    cm_out.extrapolate_mapping((x * cell_size) as u16, (y * cell_size) as u16),
-                );
+                out_queue.push(QueueEntry {
+                    parent,
+                    origin_x: (x * cell_size) as u16,
+                    origin_y: (y * cell_size) as u16,
+                });
             };
             if grid_x > 0 {
                 child(grid_x - 1, grid_y);
@@ -502,6 +693,7 @@ impl CorrespondenceMappingAlgorithm {
         }
         improved.clear();
         self.improved = improved;
+        self.parents = parents;
 
         // Replace the main queue with out_queue for the next pass.
         self.queue = out_queue;
@@ -509,27 +701,111 @@ impl CorrespondenceMappingAlgorithm {
         self.queue.is_empty()
     }
 
-    /// Performs a simple local search by checking a few neighboring translations
-    /// (±1 pixel in x or y) to see if they improve the score.
-    ///
-    /// # Returns
-    /// A tuple `(best_score, best_cm)`, where `best_cm` is the transform
-    /// (among the few tested) with the lowest score.
-    ///
-    /// All five candidates share one circular neighbourhood and differ only by a
-    /// constant offset into `photo2`, so the scorer resolves that neighbourhood once
-    /// and evaluates the five offsets over it — see
-    /// [`CorrespondenceScoring::optimize_translation`].
-    pub fn optimize_position(&self, cm: &AffineTransform) -> (f32, AffineTransform) {
-        self.scorer.optimize_translation(cm)
+    /// The tile row `cm` falls in; see [`Self::order_queue_by_tile`].
+    fn tile_row(&self, cm: &QueueEntry) -> usize {
+        let th = self.photo1.height / QUEUE_TILE + 1;
+        (cm.origin_y as usize / QUEUE_TILE).min(th - 1)
     }
 
-    /// Checks if a given [AffineTransform] has valid translation coordinates (within image bounds).
-    fn is_valid(&self, cm: &AffineTransform) -> bool {
-        cm.translate_x >= 0.0
-            && cm.translate_y >= 0.0
-            && cm.translate_x <= self.photo1.width as f32
-            && cm.translate_y <= self.photo1.height as f32
+    /// Scores the queue, split into bands of whole tile rows that run side by side.
+    ///
+    /// The queue is grouped by tile, so a band of whole tile rows holds every candidate
+    /// for a band of whole grid rows, in the order the serial pass would score them.
+    /// Within a pass a candidate reads and writes only its own cell, so the bands are
+    /// independent and the result is the serial one, bit for bit. Only the order the
+    /// changed cells are recorded in has to be put back: the serial pass popped the
+    /// queue from the back, so the last band's go first.
+    fn run_bands(&mut self) {
+        let queue = std::mem::take(&mut self.queue);
+        let n = queue.len();
+        let grid_width = self.ac_grid.get_grid_width();
+        let grid_height = self.ac_grid.get_grid_height();
+
+        // Cut points in the queue, at tile-row changes. Up to four bands per thread, so
+        // that a band of slow (edge-straddling) discs does not hold the pass up.
+        let mut cuts = vec![0usize];
+        #[cfg(feature = "parallel")]
+        if n >= self.min_banded_queue {
+            let min_band = (self.min_banded_queue / 2).max(1);
+            let bands = (n / min_band).min(4 * rayon::current_num_threads());
+            for i in 1..bands {
+                let mut pos = i * n / bands;
+                while pos < n && self.tile_row(&queue[pos]) == self.tile_row(&queue[pos - 1]) {
+                    pos += 1;
+                }
+                if pos > *cuts.last().unwrap() && pos < n {
+                    cuts.push(pos);
+                }
+            }
+        }
+        cuts.push(n);
+        let bands = cuts.len() - 1;
+
+        // The grid rows each band owns: from the first row whose cells lie in its first
+        // tile row.
+        let cs = self.grid_cell_size;
+        let mut rows = vec![0usize];
+        for &cut in &cuts[1..bands] {
+            let ty = self.tile_row(&queue[cut]);
+            rows.push(((ty * QUEUE_TILE).div_ceil(cs)).min(grid_height));
+        }
+        rows.push(grid_height);
+
+        while self.scratch.len() < bands {
+            self.scratch.push(Samples::new(self.neighborhood_radius));
+        }
+
+        let ctx = PassContext {
+            scorer: &self.scorer,
+            parents: &self.parents,
+            grid_width,
+            grid_height,
+            cell_size: cs,
+            photo_width: self.photo1.width as f32,
+            photo_height: self.photo1.height as f32,
+            skip_seen: self.skip_seen,
+        };
+        let mut cells = self.ac_grid.cells_mut();
+        let mut seen = &mut self.seen[..];
+        let mut is_improved = &mut self.is_improved[..];
+        let mut scratch = self.scratch.iter_mut();
+        let mut tasks: Vec<Band> = Vec::with_capacity(bands);
+        for b in 0..bands {
+            let len = (rows[b + 1] - rows[b]) * grid_width;
+            let (c, rest) = std::mem::take(&mut cells).split_at_mut(len);
+            cells = rest;
+            let (sn, rest) = std::mem::take(&mut seen).split_at_mut(len);
+            seen = rest;
+            let (im, rest) = std::mem::take(&mut is_improved).split_at_mut(len);
+            is_improved = rest;
+            tasks.push(Band {
+                entries: &queue[cuts[b]..cuts[b + 1]],
+                first_row: rows[b],
+                cells: c,
+                seen: sn,
+                is_improved: im,
+                scratch: scratch.next().expect("one scratch per band"),
+            });
+        }
+
+        let run = |band: Band| run_band(&ctx, band);
+        #[cfg(feature = "parallel")]
+        let results: Vec<Vec<(u32, f32)>> = if bands > 1 {
+            use rayon::prelude::*;
+            tasks.into_par_iter().map(run).collect()
+        } else {
+            tasks.into_iter().map(run).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let results: Vec<Vec<(u32, f32)>> = tasks.into_iter().map(run).collect();
+
+        for r in results.into_iter().rev() {
+            self.improved.extend(r);
+        }
+        for s in &mut self.scratch {
+            self.comparisons += s.scored;
+            s.scored = 0;
+        }
     }
 
     /// Builds a [DensePhotoMap] from the best transforms currently stored in the [ACGrid].
@@ -708,9 +984,9 @@ mod tests {
             4,
             "one cell changed, so exactly its four neighbours are queued"
         );
-        for child in &solver.queue {
+        for child in solver.queue.iter().map(|&e| resolve(&solver.parents, e)) {
             assert_eq!(
-                *child,
+                child,
                 best.extrapolate_mapping(child.origin_x, child.origin_y),
                 "a child that does not descend from the cell's final transform"
             );
@@ -755,7 +1031,7 @@ mod tests {
             genuine > 0.0,
             "the true mapping should not score a perfect zero"
         );
-        solver.queue.push(AffineTransform {
+        solver.push_seed(AffineTransform {
             origin_x: (grid_x * 5) as u16,
             origin_y: (grid_y * 5) as u16,
             translate_x: WIDTH as f32 - 0.15,
@@ -773,6 +1049,62 @@ mod tests {
             overwritten, 0,
             "a transform comparing almost nothing overwrote {overwritten} cells"
         );
+    }
+
+    /// Which of the two orderings runs depends on the queue length only for speed, so
+    /// they must agree on the order and leave the shuffle stream in the same place.
+    #[test]
+    fn sorting_and_counting_order_the_queue_the_same() {
+        let mut source = Rng::seed_from_u64(0x5047_7155);
+        for (round, len) in [2usize, 3, 7, 40, 129, 600].into_iter().enumerate() {
+            let queue: Vec<AffineTransform> = (0..len)
+                .map(|i| AffineTransform {
+                    // Origins past the photo exercise the clamp into the last tile.
+                    origin_x: (source.next_u64() % (WIDTH as u64 + 15)) as u16,
+                    origin_y: (source.next_u64() % (HEIGHT as u64 + 15)) as u16,
+                    translate_x: i as f32,
+                    translate_y: round as f32,
+                    a11: 1.0,
+                    a12: 0.0,
+                    a21: 0.0,
+                    a22: 1.0,
+                })
+                .collect();
+            let (mut counting, mut sorting) = (solver(round as u64), solver(round as u64));
+            for &cm in &queue {
+                counting.push_seed(cm);
+                sorting.push_seed(cm);
+            }
+
+            counting.order_by_counting();
+            sorting.order_by_sorting();
+
+            assert!(
+                counting.queue == sorting.queue,
+                "the orders differ for {len} entries"
+            );
+            assert_eq!(
+                counting.rng.next_u64(),
+                sorting.rng.next_u64(),
+                "the shuffles drew differently for {len} entries"
+            );
+        }
+    }
+
+    /// Bands are an argument, not a measurement: within a pass a candidate touches only
+    /// its own cell. So splitting every pass into bands has to leave every cell, the
+    /// count of comparisons and the shuffle stream exactly as one serial band does.
+    #[test]
+    fn bands_give_the_serial_result() {
+        let mut banded = seeded_solver(13);
+        banded.min_banded_queue = 2;
+        let mut serial = seeded_solver(13);
+        serial.min_banded_queue = usize::MAX;
+        banded.run_until_done();
+        serial.run_until_done();
+        assert!(grid_state(&banded) == grid_state(&serial));
+        assert_eq!(banded.total_comparisons(), serial.total_comparisons());
+        assert_eq!(banded.rng.next_u64(), serial.rng.next_u64());
     }
 
     /// The same candidate offered to a cell twice is scored once.

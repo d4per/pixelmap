@@ -4,11 +4,10 @@ use crate::circular_feature_descriptor_matcher::{
     CircularFeatureDescriptorMatcher, DEFAULT_MATCH_STRIDE,
 };
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
-use crate::correspondence_scoring::PackedPhoto;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
 use crate::processing_mode::IterationParams;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// The seed [`PixelMapProcessor::new`] uses when the caller does not pick one.
@@ -33,13 +32,14 @@ pub struct PixelMapProcessor {
     /// Width of the full-resolution images, which outlives them.
     source_width: usize,
 
-    /// An algorithm that manages local transformations and outlier filtering
-    /// from `photo1` to `photo2`.
-    ocm_manager1: CorrespondenceMappingAlgorithm,
-
-    /// An algorithm that manages local transformations and outlier filtering
-    /// from `photo2` to `photo1`.
-    ocm_manager2: CorrespondenceMappingAlgorithm,
+    /// The raw forward (`photo1` → `photo2`) and backward maps the last solve ended
+    /// with, before any outlier removal. `None` until [`Self::init`] has run.
+    ///
+    /// Only the maps are kept, not the solvers that produced them. A solver holds per-cell
+    /// state and queue buffers worth about 60 MB at 3200 px, and keeping the previous
+    /// step's pair alive while the next one ran made two pairs coexist: that was the peak
+    /// of a `Quality::Ultra` run.
+    maps: Option<(DensePhotoMap, DensePhotoMap)>,
 
     /// A running total of all comparisons made by both correspondence managers.
     total_comparisons: usize,
@@ -61,10 +61,12 @@ pub struct PixelMapProcessor {
     /// from full resolution, even though the schedule only ever asks for three distinct
     /// widths and the two managers of one iteration need the very same pair of images
     /// with their roles swapped. At `high` that was 52 resamples of a 4096x2304 source.
-    ///
-    /// Each entry carries its packed words as well (see [`PackedPhoto`]), so both solvers
-    /// of every step at that width share one copy instead of packing their own.
-    scaled: HashMap<(usize, usize), PackedPhoto>,
+    scaled: HashMap<(usize, usize), Arc<Photo>>,
+
+    /// The working widths still to come, in order, the init solve's first: set by
+    /// [`Self::prepare`] from the schedule, and `None` for a caller that runs without
+    /// one. Each step drops the entries of `scaled` that no later step will ask for.
+    widths_ahead: Option<VecDeque<usize>>,
 
     /// How [`Self::finish`] fills the cells the final map left empty; see
     /// [`FillMode`].
@@ -106,10 +108,8 @@ pub enum FillMode {
 impl PixelMapProcessor {
     /// Constructs a new `PixelMapProcessor` with the given `photo1`, `photo2`, and an `initial_photo_width`.
     ///
-    /// The width is used to scale images down (if needed) before feature extraction. This
-    /// method also sets up two correspondence managers (`ocm_manager1`, `ocm_manager2`),
-    /// initially with dummy images, then re-initializes them with the real images to ensure
-    /// references are valid.
+    /// The width is used to scale images down (if needed) before feature extraction. Until
+    /// [`Self::init`] runs, the processor holds empty maps.
     ///
     /// # Parameters
     /// - `photo1`: The first [Photo].
@@ -136,33 +136,16 @@ impl PixelMapProcessor {
         photo_width: usize,
         seed: u64,
     ) -> Self {
-        // Temporary dummy Photo, used only so that CorrespondenceMappingAlgorithm can be constructed.
-        let dummy_photo = Photo::default();
-
         PixelMapProcessor {
             source_width: photo1.width,
             sources: Some((photo1, photo2)),
-            ocm_manager1: CorrespondenceMappingAlgorithm::new(
-                photo_width,
-                &dummy_photo,
-                &dummy_photo,
-                5,
-                5,
-                seed,
-            ),
-            ocm_manager2: CorrespondenceMappingAlgorithm::new(
-                photo_width,
-                &dummy_photo,
-                &dummy_photo,
-                5,
-                5,
-                seed,
-            ),
+            maps: None,
             total_comparisons: 0,
             initial_photo_width: photo_width,
             seed,
             algorithms_built: 0,
             scaled: HashMap::new(),
+            widths_ahead: None,
             fill_mode: FillMode::Off,
             history: Vec::new(),
             iterated: false,
@@ -201,7 +184,7 @@ impl PixelMapProcessor {
     /// # Panics
     /// If the width was not scaled before [`Self::prepare`] released the sources. Only
     /// [`crate::Builder`] calls `prepare`, with the whole schedule it is about to run.
-    fn scaled(&mut self, which: usize, width: usize) -> PackedPhoto {
+    fn scaled(&mut self, which: usize, width: usize) -> Arc<Photo> {
         if let Some(p) = self.scaled.get(&(which, width)) {
             return p.clone();
         }
@@ -210,7 +193,7 @@ impl PixelMapProcessor {
             .as_ref()
             .expect("every working width is scaled before the sources are released");
         let src = if which == 0 { photo1 } else { photo2 };
-        let p = PackedPhoto::new(Arc::new(src.scaled_to_width(width)));
+        let p = Arc::new(src.scaled_to_width(width));
         self.scaled.insert((which, width), p.clone());
         p
     }
@@ -228,12 +211,31 @@ impl PixelMapProcessor {
     /// whole run only raised the peak. They are freed only if this processor held the
     /// last reference to them.
     pub(crate) fn prepare(&mut self, steps: &[IterationParams]) {
-        let widths = std::iter::once(self.init_width()).chain(steps.iter().map(|s| s.photo_width));
-        for width in widths {
-            self.scaled(0, width);
-            self.scaled(1, width);
+        let widths: VecDeque<usize> = std::iter::once(self.init_width())
+            .chain(steps.iter().map(|s| s.photo_width))
+            .collect();
+        // One photo at a time, each let go as soon as its own widths are made, so the
+        // second source is the only one alive while the second photo's widths are scaled.
+        if let Some((photo1, photo2)) = self.sources.take() {
+            for (which, source) in [(0, photo1), (1, photo2)] {
+                for &width in &widths {
+                    self.scaled
+                        .entry((which, width))
+                        .or_insert_with(|| Arc::new(source.scaled_to_width(width)));
+                }
+            }
         }
-        self.sources = None;
+        self.widths_ahead = Some(widths);
+    }
+
+    /// Called once a step's solvers hold their photos: forgets the scaled photos that no
+    /// later step will ask for. The solvers keep what they hold alive until they finish.
+    fn step_started(&mut self) {
+        let Some(ahead) = self.widths_ahead.as_mut() else {
+            return;
+        };
+        ahead.pop_front();
+        self.scaled.retain(|&(_, width), _| ahead.contains(&width));
     }
 
     /// Performs the initial matching step:
@@ -252,14 +254,14 @@ impl PixelMapProcessor {
 
         // Extract circular feature descriptors and match them across the two images.
         let pairs = CircularFeatureDescriptorMatcher::match_photos(
-            &photo1scaled.photo,
-            &photo2scaled.photo,
+            &photo1scaled,
+            &photo2scaled,
             10,
             DEFAULT_MATCH_STRIDE,
         );
 
         // Create new managers for the scaled images.
-        let w = photo1scaled.photo.width;
+        let w = photo1scaled.width;
         let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
         let (seed1, seed2) = (self.next_seed(), self.next_seed());
         let mut ocm_manager1 =
@@ -277,14 +279,9 @@ impl PixelMapProcessor {
             ocm_manager2.add_init_point(m.x2 as f32, m.y2 as f32, m.x1 as f32, m.y1 as f32, -vv);
         }
 
-        // Run both managers to completion.
-        run_both(&mut ocm_manager1, &mut ocm_manager2);
-
-        // Update total comparisons, store the managers.
-        self.total_comparisons =
-            ocm_manager1.total_comparisons() + ocm_manager2.total_comparisons();
-        self.ocm_manager1 = ocm_manager1;
-        self.ocm_manager2 = ocm_manager2;
+        self.step_started();
+        self.total_comparisons = 0;
+        self.solve(ocm_manager1, ocm_manager2);
     }
 
     /// Returns the total number of comparisons made so far by the two correspondence managers.
@@ -294,11 +291,11 @@ impl PixelMapProcessor {
 
     /// Performs an **iteration** of the mapping refinement process:
     ///
-    /// 1. Extracts the current dense photo maps from each manager.
+    /// 1. Takes the maps the previous solve ended with.
     /// 2. Removes outliers in each map by checking consistency with the other map.
     /// 3. Smooths (averages) each map over several iterations to reduce noise.
-    /// 4. Re-initializes the `ocm_manager1` and `ocm_manager2` with the smoothed maps.
-    /// 5. Runs both managers until done again.
+    /// 4. Builds a new pair of solvers from the smoothed maps.
+    /// 5. Runs both to completion and keeps their maps.
     /// 6. Accumulates the total comparison count.
     ///
     /// # Parameters
@@ -315,8 +312,7 @@ impl PixelMapProcessor {
         smooth_iterations: usize,
         clean_max_dist: f32,
     ) {
-        let mut pm1 = self.ocm_manager1.get_photo_mapping();
-        let mut pm2 = self.ocm_manager2.get_photo_mapping();
+        let (mut pm1, mut pm2) = self.last_maps();
 
         // Keep the last map of each earlier width for `finish` to fill holes from.
         if self.fill_mode != FillMode::Off && self.iterated && pm1.dimensions().0 != photo_width {
@@ -355,16 +351,31 @@ impl PixelMapProcessor {
         ocm_manager1.init_from_photomapping(&pm1_smooth);
         ocm_manager2.init_from_photomapping(&pm2_smooth);
 
-        // Run again with the updated maps.
-        run_both(&mut ocm_manager1, &mut ocm_manager2);
+        drop((pm1, pm2, pm1_smooth, pm2_smooth));
+        self.step_started();
+        self.solve(ocm_manager1, ocm_manager2);
+    }
 
-        // Accumulate total comparisons.
-        self.total_comparisons +=
-            ocm_manager1.total_comparisons() + ocm_manager2.total_comparisons();
+    /// Copies of [`Self::maps`].
+    ///
+    /// # Panics
+    /// If [`Self::init`] has not run yet.
+    fn last_maps(&self) -> (DensePhotoMap, DensePhotoMap) {
+        self.maps
+            .clone()
+            .expect("PixelMapProcessor::init must run before the maps are used")
+    }
 
-        // Store the new managers.
-        self.ocm_manager1 = ocm_manager1;
-        self.ocm_manager2 = ocm_manager2;
+    /// Runs both solvers to completion, counts their comparisons, and keeps their maps.
+    /// The solvers themselves are dropped here; see [`Self::maps`].
+    fn solve(
+        &mut self,
+        mut forward: CorrespondenceMappingAlgorithm,
+        mut backward: CorrespondenceMappingAlgorithm,
+    ) {
+        run_both(&mut forward, &mut backward);
+        self.total_comparisons += forward.total_comparisons() + backward.total_comparisons();
+        self.maps = Some((forward.get_photo_mapping(), backward.get_photo_mapping()));
     }
 
     /// Retrieves the final forward and backward mappings, removing any remaining outliers
@@ -379,8 +390,7 @@ impl PixelMapProcessor {
     /// - First: from `photo1` to `photo2`.
     /// - Second: from `photo2` to `photo1`.
     pub fn finish(&mut self, clean_max_dist: f32) -> (DensePhotoMap, DensePhotoMap) {
-        let mut pm1 = self.ocm_manager1.get_photo_mapping();
-        let mut pm2 = self.ocm_manager2.get_photo_mapping();
+        let (mut pm1, mut pm2) = self.last_maps();
 
         // Remove outliers in both directions.
         pm1.remove_outliers(&pm2, clean_max_dist);
@@ -399,15 +409,14 @@ impl PixelMapProcessor {
         (pm1, pm2)
     }
 
-    /// Computes how much of the mapping is valid (non-outlier) in `ocm_manager1`,
+    /// Computes how much of the forward mapping is valid (non-outlier),
     /// by performing a small outlier check with threshold `2.0`.
     ///
     /// # Returns
     /// The fraction of valid cells in the forward map, a value between 0.0 and 1.0.
     pub fn matched_area(&self) -> f32 {
-        // `get_photo_mapping` builds fresh maps, so cleaning them leaves the managers alone.
-        let mut pm1 = self.ocm_manager1.get_photo_mapping();
-        let mut pm2 = self.ocm_manager2.get_photo_mapping();
+        // Cleaning copies leaves the stored maps alone.
+        let (mut pm1, mut pm2) = self.last_maps();
 
         pm1.remove_outliers(&pm2, 2.0);
         pm2.remove_outliers(&pm1, 2.0);

@@ -4,6 +4,43 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+Faster at every preset and much leaner at `Ultra`, with the same output: every preset
+gives the same mapping as 0.4.0, bit for bit, whatever the number of threads. On a
+4128x3096 pair:
+
+| preset | 0.4.0 | now | peak memory, 0.4.0 → now |
+|---|---|---|---|
+| `Ultra` | 5.2 s | 3.1 s | 484 MB → 239 MB |
+| `High` | 3.04 s | 2.04 s | 168 MB → 138 MB |
+| `Medium` | 0.88 s | 0.65 s | unchanged |
+| `Low` | 0.37 s | 0.32 s | unchanged |
+
+- The solver uses every core instead of two. Each pass is split into bands of whole grid
+  rows that are scored side by side. Within a pass a candidate reads and writes only its
+  own cell, so the bands are independent and the result is the serial one. Passes of
+  fewer than 1024 candidates still run on one thread. Without the `parallel` feature
+  (wasm) every pass runs on one thread, as before.
+- Grouping the solver's queue by image tile cost time for every tile of the photo on
+  every pass. That is 77,000 tiles at 3200 px, and the solve ends in a long run of small
+  passes. A queue that is small next to the tile count is now sorted by key instead.
+- Each candidate's fixed-point transform is computed once instead of twice: the solver
+  already computes it to recognize repeated candidates.
+- The `photo2` indices of a disc that lies wholly inside both photos are computed in one
+  pass over the whole disc instead of one short pass per row, which vectorizes better.
+- Queued candidates are 8 bytes instead of 28: the four children of a cell share one copy
+  of its transform. At 3200 px a pass can queue over a million of them per solver.
+- The scorer reads pixels straight from the photos' RGBA bytes instead of from a second,
+  packed copy of every working-width photo (61 MB for the pair at 3200 px).
+- The processor keeps each step's maps instead of its solvers, so the previous step's
+  pair of solvers (about 120 MB at 3200 px) is gone before the next pair is built.
+- A working width's scaled photos are dropped after the last step that uses them, and
+  `prepare` lets each full-resolution photo go as soon as its own working widths are
+  scaled.
+
 ## 0.4.0 - 2026-11-19
 
 A minor-version bump because `Medium` and `High` now produce different mappings by

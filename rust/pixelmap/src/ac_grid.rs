@@ -74,6 +74,11 @@ impl ACGrid {
     /// let my_grid = ACGrid::new(10, 5);
     /// assert_eq!(my_grid.get_grid_width(), 10);
     /// ```
+    /// Every cell, row by row, for a pass to split into bands of rows.
+    pub fn cells_mut(&mut self) -> &mut [AffineTransformCell] {
+        &mut self.grid
+    }
+
     pub fn get_grid_width(&self) -> usize {
         self.grid_width
     }
