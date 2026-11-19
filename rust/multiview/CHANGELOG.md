@@ -8,6 +8,7 @@ All notable changes to this crate are documented here. The format follows
 
 ### Changed
 
+- Requires pixelmap 0.4.0.
 - Accepts pixelmap's new `Quality::Ultra`. Pairs are mapped with `FillMode::Off`, so the
   mappings it triangulates are unchanged by pixelmap's hole filling; the change to
   `Medium` and `High`'s working widths (never wider than the photos) does apply.

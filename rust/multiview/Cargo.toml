@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # Default features off so that the `parallel` passthrough below is the only way rayon gets
 # in: the wasm build has to be able to leave it out.
-pixelmap = { path = "../pixelmap", version = "0.3.1", default-features = false }
+pixelmap = { path = "../pixelmap", version = "0.4.0", default-features = false }
 # All of the geometry — essential matrices, PnP, triangulation, bundle adjustment — is
 # written here on nalgebra rather than taken from rust-cv, whose crates pin nalgebra 0.21.
 nalgebra = "0.33"

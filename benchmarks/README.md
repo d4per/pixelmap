@@ -66,7 +66,7 @@ HPatches has no submission server, so these numbers are published here. The prot
 one dense-matching papers use for HPatches at original resolution: the 59 viewpoint
 sequences (`v_*`), image 1 matched against images 2–6, ground truth from the provided
 homographies. Each number is a mean over the 295 pairs. pixelmap ran at its defaults
-(pixelmap 0.3.1 plus the Unreleased changes: `High` capped at the photo width and filling its
+(pixelmap 0.4.0: `High` capped at the photo width and filling its
 holes); the OpenCV methods ran at theirs, with 12 threads on an i7-9750H.
 
 | method | pairs | coverage | AEPE | PCK-1 | PCK-3 | PCK-5 | s/pair |
