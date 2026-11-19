@@ -307,9 +307,8 @@ impl DensePhotoMap {
     ///
     /// # Parameters
     /// - `other`: Another `DensePhotoMap` presumably for the reverse transformation.
-    /// - `max_dist`: Threshold for how far the round-trip mapping can deviate. Compared
-    ///   against the *squared* distance in grid cells, so the tolerance it expresses is
-    ///   `sqrt(max_dist)` cells.
+    /// - `max_dist`: Threshold for how far the round-trip mapping can deviate, in grid
+    ///   cells (not pixels).
     pub fn remove_outliers(&mut self, other: &DensePhotoMap, max_dist: f32) {
         let max_dist_sq = max_dist * max_dist;
         for y in 0..self.grid_height {

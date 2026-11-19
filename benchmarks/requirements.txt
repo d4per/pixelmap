@@ -1,0 +1,7 @@
+# Versions the published results were produced with. pixelmap-python 0.3.1 wraps
+# the pixelmap 0.3.1 crate in ../rust/pixelmap.
+pixelmap-python==0.3.1
+opencv-contrib-python==5.1.0.95
+numpy==2.5.5
+# Only for download.sh, to extract ETH3D's .7z archives where no 7z binary is installed.
+py7zr

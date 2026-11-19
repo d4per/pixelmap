@@ -50,10 +50,11 @@ struct Args {
     #[arg(long, num_args = 1.., value_name = "FILE")]
     frames: Vec<PathBuf>,
 
-    /// Processing mode: low, medium, or high.
+    /// Processing mode: low, medium, high, or ultra.
     /// - low: Fast, but may be less accurate.
     /// - medium: Slower, but more accurate.
-    /// - high: Slowest, but likely the best result.
+    /// - high: Slower still, and more accurate again.
+    /// - ultra: As high, plus steps at up to 3200 px for photos wider than 1600 px.
     #[arg(long, default_value = "low")]
     processing_mode: ProcessingMode,
 

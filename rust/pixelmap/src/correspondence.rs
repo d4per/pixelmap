@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::error::Error;
 use crate::photo::Photo;
-use crate::pixelmap_processor::{PixelMapProcessor, DEFAULT_SEED};
+use crate::pixelmap_processor::{FillMode, PixelMapProcessor, DEFAULT_SEED};
 use crate::processing_mode::{IterationParams, Quality};
 
 /// How far along a run is, reported to [`Builder::run_with_progress`] and
@@ -142,6 +142,7 @@ pub struct Builder {
     schedule: Option<Vec<IterationParams>>,
     seed: u64,
     final_max_dist: f32,
+    fill_mode: Option<FillMode>,
 }
 
 impl Default for Builder {
@@ -158,7 +159,19 @@ impl Builder {
             schedule: None,
             seed: DEFAULT_SEED,
             final_max_dist: 2.0,
+            fill_mode: None,
         }
+    }
+
+    /// How the cells the final map left empty are treated. Defaults to the quality
+    /// preset's [`Quality::fill_mode`].
+    ///
+    /// [`FillMode::Off`] keeps only mappings that passed the round-trip check at the
+    /// final working width: fewer of them, but each more precise. Pick it when a wrong
+    /// answer costs more than no answer, as when triangulating points.
+    pub fn fill_mode(mut self, mode: FillMode) -> Self {
+        self.fill_mode = Some(mode);
+        self
     }
 
     /// How much work to put in. Defaults to [`Quality::Low`].
@@ -170,7 +183,9 @@ impl Builder {
     /// Replaces the quality preset's iteration schedule with an explicit one.
     ///
     /// For callers tuning the algorithm itself; [`Self::quality`] covers ordinary use.
-    /// The working width the run starts from still comes from [`Self::quality`].
+    /// The working width the run starts from, and the fill mode, still come from
+    /// [`Self::quality`]. The steps run as given, without the preset's capping at the
+    /// photos' width ([`Quality::steps_for`]).
     pub fn schedule(mut self, steps: impl Into<Vec<IterationParams>>) -> Self {
         self.schedule = Some(steps.into());
         self
@@ -185,7 +200,12 @@ impl Builder {
     }
 
     /// How far a round trip through both mappings may land from where it started, in
-    /// working-resolution pixels, before a cell is discarded. Defaults to `2.0`.
+    /// grid cells at the final working resolution, before a cell is discarded. Defaults
+    /// to `2.0`.
+    ///
+    /// A grid cell is 5 working pixels, so the tolerance relative to the photo shrinks
+    /// as the working width grows: `2.0` at a final width of 1600 px is half the
+    /// tolerance it is at 800 px.
     ///
     /// Lower keeps only the mappings both directions agree on closely, at the cost of
     /// coverage; higher keeps more, including some that are wrong.
@@ -240,7 +260,7 @@ impl Builder {
     /// [`Error`], every one of which describes a problem with the input.
     ///
     /// A run is abandoned only between steps, so the longest a `Break` waits is one
-    /// schedule step — the final steps of [`Quality::High`] work at 1600 px and are the
+    /// schedule step — the final steps of [`Quality::Ultra`] work at up to 3200 px and are the
     /// slowest. Cancelling costs the work done so far; there is no partial mapping.
     ///
     /// # Errors
@@ -264,17 +284,25 @@ impl Builder {
             });
         }
 
-        let steps: &[IterationParams] = self
+        #[cfg(feature = "bench")]
+        let overridden = self.with_env_overrides();
+        #[cfg(feature = "bench")]
+        let this = &overridden;
+        #[cfg(not(feature = "bench"))]
+        let this = self;
+
+        let steps = this
             .schedule
-            .as_deref()
-            .unwrap_or_else(|| self.quality.steps());
+            .clone()
+            .unwrap_or_else(|| this.quality.steps_for(source_size.0));
         // The initial matching pass counts as a step, so the reported total matches the
         // number of callbacks.
         let total = steps.len() + 1;
 
         let mut processor =
-            PixelMapProcessor::with_seed(photo1, photo2, self.quality.photo_width(), self.seed);
-        processor.prepare(steps);
+            PixelMapProcessor::with_seed(photo1, photo2, this.quality.photo_width(), this.seed);
+        processor.set_fill_mode(this.fill_mode.unwrap_or(this.quality.fill_mode()));
+        processor.prepare(&steps);
         processor.init();
         if on_progress(Progress { step: 1, total }).is_break() {
             return Ok(None);
@@ -293,13 +321,55 @@ impl Builder {
         }
 
         let comparisons = processor.total_comparisons();
-        let (forward, backward) = processor.finish(self.final_max_dist);
+        let (forward, backward) = processor.finish(this.final_max_dist);
         Ok(Some(Correspondence {
             forward,
             backward,
             comparisons,
             source_size,
         }))
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Builder {
+    /// This builder with the experiment overrides from the environment applied, so a
+    /// caller that cannot reach these options (the Python binding) can still drive
+    /// them. Unset variables change nothing.
+    ///
+    /// - `PIXELMAP_SCHEDULE`: comma-separated `width:clean_max_dist` steps.
+    /// - `PIXELMAP_FILL`: `off`, `plain` or `checked`.
+    fn with_env_overrides(&self) -> Builder {
+        let mut b = self.clone();
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        if let Some(v) = var("PIXELMAP_SCHEDULE") {
+            let steps = v
+                .split(',')
+                .map(|step| {
+                    let (w, d) = step
+                        .trim()
+                        .split_once(':')
+                        .expect("PIXELMAP_SCHEDULE step is width:dist");
+                    IterationParams {
+                        photo_width: w.parse().expect("PIXELMAP_SCHEDULE width"),
+                        grid_cell_size: 5,
+                        neighborhood_radius: 5,
+                        smooth_iterations: 2,
+                        clean_max_dist: d.parse().expect("PIXELMAP_SCHEDULE dist"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            b.schedule = Some(steps);
+        }
+        if let Some(v) = var("PIXELMAP_FILL") {
+            b.fill_mode = Some(match v.trim() {
+                "off" => FillMode::Off,
+                "plain" => FillMode::Plain,
+                "checked" => FillMode::Checked,
+                other => panic!("PIXELMAP_FILL must be off, plain or checked, not {other}"),
+            });
+        }
+        b
     }
 }
 

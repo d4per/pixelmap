@@ -212,7 +212,8 @@ a 4:3 photo pair, native build, measured with `pixelmap-multiview --time-pair`:
 | high    |        | 5.81 s  |         |
 
 The input size barely matters, because pixelmap scales every photo to a fixed working
-width (400 px for low, 800 px for medium, 1600 px for high) before it starts. What the input
+width (400 px for low, 800 px for medium, 1600 px for high, up to 3200 px for ultra, but never
+wider than the photo itself) before it starts. What the input
 resolution buys is the precision of the geometry that follows, not matching time.
 
 End to end, those three photos of stone steps at 1200 px and low quality reconstruct in 1.9 s into a

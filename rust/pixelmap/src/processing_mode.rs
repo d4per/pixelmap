@@ -1,12 +1,14 @@
 //! Ready-made iteration schedules for [`PixelMapProcessor`].
 //!
 //! Running the correspondence mapping is a sequence of [`PixelMapProcessor::iterate`]
-//! calls with gradually changing parameters. The three presets defined here trade
+//! calls with gradually changing parameters. The four presets defined here trade
 //! processing time for accuracy:
 //!
 //! - [`ProcessingMode::Low`]: fast, but may be less accurate.
 //! - [`ProcessingMode::Medium`]: slower, but more accurate.
-//! - [`ProcessingMode::High`]: slowest, but likely the best result.
+//! - [`ProcessingMode::High`]: slower still, and more accurate again.
+//! - [`ProcessingMode::Ultra`]: as High, plus extra steps at up to 3200 px for photos
+//!   wider than 1600 px. The same as High on smaller photos.
 //!
 #![doc = include_str!("../doc/quality-scales.md")]
 //!
@@ -18,6 +20,7 @@
 //! # let (photo1, photo2) = (Arc::new(Photo::default()), Arc::new(Photo::default()));
 //! let mode = ProcessingMode::Low;
 //! let mut processor = PixelMapProcessor::new(photo1, photo2, mode.photo_width());
+//! processor.set_fill_mode(mode.fill_mode());
 //! processor.init();
 //! mode.run(&mut processor);
 //! let (map1, map2) = processor.finish(2.0);
@@ -26,7 +29,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::pixelmap_processor::PixelMapProcessor;
+use crate::pixelmap_processor::{FillMode, PixelMapProcessor};
 
 /// How much work the correspondence mapping should put into a photo pair.
 ///
@@ -110,11 +113,35 @@ const HIGH_STEPS: [IterationParams; 13] = [
     step(1600, 2.0),
 ];
 
+/// [`HIGH_STEPS`], then two steps at 3200 px that only run for photos wider than 1600 px.
+const ULTRA_STEPS: [IterationParams; 15] = [
+    step(400, 3.0),
+    step(400, 2.0),
+    step(400, 1.0),
+    step(400, 0.5),
+    step(400, 1.0),
+    step(400, 2.0),
+    step(400, 2.0),
+    step(800, 3.0),
+    step(800, 1.0),
+    step(800, 2.0),
+    step(1600, 1.0),
+    step(1600, 2.0),
+    step(1600, 2.0),
+    step(3200, 1.0),
+    step(3200, 2.0),
+];
+
+/// Ultra's extra steps run only above this source width, where High's schedule ends.
+const ULTRA_EXTRA_ABOVE: usize = 1600;
+
 /// How much work the correspondence mapping should put into a photo pair.
 ///
 /// Each preset is a coarse-to-fine schedule of [`IterationParams`]. Higher settings both
 /// run more iterations and finish at a higher working resolution, so cost grows faster
-/// than the step count suggests.
+/// than the step count suggests. Above [`ProcessingMode::Low`], no step works wider than
+/// the photos themselves (see [`ProcessingMode::steps_for`]), so on small photos the
+/// higher presets cost less than their nominal widths suggest.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProcessingMode {
@@ -122,16 +149,21 @@ pub enum ProcessingMode {
     Low,
     /// Slower, but more accurate.
     Medium,
-    /// Slowest, but likely the best result.
+    /// Slower still, and more accurate again.
     High,
+    /// The best result, and the slowest for photos wider than 1600 px: High, then two
+    /// more steps at the photo's own width, up to 3200 px. For photos up to 1600 px wide
+    /// it is the same as [`ProcessingMode::High`].
+    Ultra,
 }
 
 impl ProcessingMode {
     /// All modes, in increasing order of processing time.
-    pub const ALL: [ProcessingMode; 3] = [
+    pub const ALL: [ProcessingMode; 4] = [
         ProcessingMode::Low,
         ProcessingMode::Medium,
         ProcessingMode::High,
+        ProcessingMode::Ultra,
     ];
 
     /// The lowercase name of this mode, as accepted on the command line.
@@ -140,28 +172,68 @@ impl ProcessingMode {
             ProcessingMode::Low => "low",
             ProcessingMode::Medium => "medium",
             ProcessingMode::High => "high",
+            ProcessingMode::Ultra => "ultra",
         }
     }
 
-    /// The working width to pass to [`PixelMapProcessor::new`] for this mode.
+    /// The working width to pass to [`PixelMapProcessor::new`] for this mode: the
+    /// width the initial feature matching runs at (or the photos' own width, if they
+    /// are narrower).
     pub fn photo_width(&self) -> usize {
         match self {
             ProcessingMode::Low => 400,
             ProcessingMode::Medium => 800,
-            ProcessingMode::High => 1600,
+            ProcessingMode::High | ProcessingMode::Ultra => 1600,
         }
     }
 
-    /// The iteration schedule of this mode.
+    /// The nominal iteration schedule of this mode, for photos wider than every step.
+    ///
+    /// What actually runs depends on the photos' width; see [`Self::steps_for`].
     pub fn steps(&self) -> &'static [IterationParams] {
         match self {
             ProcessingMode::Low => &LOW_STEPS,
             ProcessingMode::Medium => &MEDIUM_STEPS,
             ProcessingMode::High => &HIGH_STEPS,
+            ProcessingMode::Ultra => &ULTRA_STEPS,
         }
     }
 
-    /// Runs the whole schedule on an already initialized processor.
+    /// The iteration schedule this mode runs for photos `source_width` pixels wide.
+    ///
+    /// Above [`Self::Low`], every step works at no more than the photos' own width:
+    /// scaling a photo up adds no detail to match, only interpolation the solver then
+    /// fits to, which measurably lowered accuracy and doubled the time. [`Self::Ultra`]
+    /// also drops its 3200 px steps unless the photos are wider than 1600 px, where
+    /// [`Self::High`] stops. [`Self::Low`] runs [`Self::steps`] as it is.
+    pub fn steps_for(&self, source_width: usize) -> Vec<IterationParams> {
+        let steps = self.steps();
+        match self {
+            ProcessingMode::Low => steps.to_vec(),
+            ProcessingMode::Ultra if source_width <= ULTRA_EXTRA_ABOVE => {
+                capped(&steps[..HIGH_STEPS.len()], source_width)
+            }
+            _ => capped(steps, source_width),
+        }
+    }
+
+    /// How the mode fills the cells the final map left empty; see [`FillMode`].
+    ///
+    /// The presets above [`Self::Low`] fill them from earlier, coarser iterations, which
+    /// raises coverage and the share of pixels mapped within a few pixels of the truth,
+    /// at the cost of a larger average error over the mapped pixels. Override it with
+    /// [`crate::Builder::fill_mode`].
+    pub fn fill_mode(&self) -> FillMode {
+        match self {
+            ProcessingMode::Low => FillMode::Off,
+            _ => FillMode::Plain,
+        }
+    }
+
+    /// Runs the whole schedule, [`Self::steps_for`] the processor's photos, on an
+    /// already initialized processor.
+    ///
+    /// The mode's [`Self::fill_mode`] is the processor's to set, before this runs.
     pub fn run(&self, processor: &mut PixelMapProcessor) {
         self.run_with_progress(processor, |_, _| {});
     }
@@ -173,12 +245,23 @@ impl ProcessingMode {
         processor: &mut PixelMapProcessor,
         mut on_step: impl FnMut(usize, usize),
     ) {
-        let steps = self.steps();
+        let steps = self.steps_for(processor.source_width());
         for (index, params) in steps.iter().enumerate() {
             params.apply(processor);
             on_step(index + 1, steps.len());
         }
     }
+}
+
+/// `steps` with every working width capped at `source_width`.
+fn capped(steps: &[IterationParams], source_width: usize) -> Vec<IterationParams> {
+    steps
+        .iter()
+        .map(|s| IterationParams {
+            photo_width: s.photo_width.min(source_width),
+            ..*s
+        })
+        .collect()
 }
 
 /// The string handed to [`ProcessingMode::from_str`] did not name a mode.
@@ -202,7 +285,7 @@ impl fmt::Display for ParseProcessingModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid processing mode: {}. Use 'low', 'medium', or 'high'.",
+            "invalid processing mode: {}. Use 'low', 'medium', 'high', or 'ultra'.",
             self.input
         )
     }
