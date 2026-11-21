@@ -1,6 +1,5 @@
 use crate::affine_transform::AffineTransform;
 use crate::photo::Photo;
-use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// Number of fractional bits used by the fixed-point coordinate walk.
@@ -15,10 +14,15 @@ const HALF: i32 = 1 << (FRAC - 1);
 /// yield — and `len` says how much of them the current disc filled, so resolving a disc
 /// never reallocates and never re-checks capacity. They stay resident in L1 across the
 /// five candidates of one [`CorrespondenceScoring::optimize_translation`] call.
+///
+/// The scorer itself holds nothing that changes, so that the bands of a pass can share
+/// it across threads; each band brings one of these as its scratch, and its count of
+/// comparisons with it.
 #[derive(Default)]
-struct Samples {
-    /// Packed `0x00BBGGRR` from `photo1`, one entry per surviving disc pixel.
-    p1: Vec<u32>,
+pub(crate) struct Samples {
+    /// The RGBA bytes of `photo1`'s surviving disc pixels, four per sample, copied as
+    /// they are so that a disc row is a single `memcpy`.
+    p1: Vec<u8>,
     /// Pixel index into `p2_words` for the *unshifted* transform.
     p2_idx: Vec<i32>,
     /// How many entries of `p1`/`p2_idx` the current disc filled.
@@ -27,6 +31,22 @@ struct Samples {
     /// any of it was lost to the bounds of `photo2`. `len` is the part of this that
     /// landed inside `photo2`.
     offered: usize,
+    /// Comparisons made through this scratch so far, five per scored candidate.
+    pub(crate) scored: usize,
+}
+
+impl Samples {
+    /// Scratch for discs of the given radius.
+    pub(crate) fn new(radius: usize) -> Self {
+        let capacity = (2 * radius + 1) * (2 * radius + 1);
+        Samples {
+            p1: vec![0u8; 4 * capacity],
+            p2_idx: vec![0i32; capacity],
+            len: 0,
+            offered: 0,
+            scored: 0,
+        }
+    }
 }
 
 /// The least share of a disc that has to land inside `photo2` for a comparison to count,
@@ -62,7 +82,7 @@ impl Samples {
 /// Everything the scorer reads from an [`AffineTransform`], in the form it works in: the
 /// disc centre, and the Q16.16 steps and base of the walk through `photo2`.
 ///
-/// [`CorrespondenceScoring::resolve_disc_inner`] takes its inputs from here and from
+/// [`CorrespondenceScoring::resolve_disc`] takes its inputs from here and from
 /// nowhere else. Two transforms with equal `FixedTransform`s therefore resolve exactly
 /// the same samples and score exactly the same, however their floats differ below the
 /// fixed-point resolution. The solver relies on that to recognize a candidate a cell has
@@ -99,56 +119,28 @@ impl FixedTransform {
     }
 }
 
-/// A working-resolution photo together with its pixels packed one `0x00BBGGRR` word each,
-/// which is the form [`CorrespondenceScoring`] reads.
-///
-/// Packing used to happen inside every scorer, and each schedule step builds two solvers
-/// over the same pair of photos with their roles swapped, so every step packed both
-/// photos twice and kept four copies alive. Carrying the words with the photo lets
-/// [`crate::pixelmap_processor::PixelMapProcessor`] pack each photo once per working
-/// width and share it between both solvers and across steps.
-#[derive(Clone)]
-pub(crate) struct PackedPhoto {
-    pub photo: Arc<Photo>,
-    pub words: Arc<[u32]>,
-}
-
-impl PackedPhoto {
-    pub(crate) fn new(photo: Arc<Photo>) -> Self {
-        let words = photo
-            .img_data
-            .chunks_exact(4)
-            .map(|q| u32::from_le_bytes([q[0], q[1], q[2], 0]))
-            .collect();
-        PackedPhoto { photo, words }
-    }
-}
-
 /// The `CorrespondenceScoring` struct is responsible for evaluating the similarity between two photos
 /// using pixel comparisons within a circular neighborhood. This similarity is computed based on color
 /// differences between corresponding regions of the photos.
+///
+/// Pixels are read straight from the photos' RGBA bytes, four at a time as one
+/// little-endian word, `0xAABBGGRR`: a single 32-bit load rather than three byte loads
+/// and two shifts. The alpha byte comes along in the top eight bits, where [`Acc::add`]
+/// never looks. This used to read a second, packed copy of each photo instead, which at
+/// 3200 px cost 61 MB for the pair and bought no speed.
 pub struct CorrespondenceScoring {
     /// A shared reference to the first photo.
     photo1: Arc<Photo>,
     /// A shared reference to the second photo.
     photo2: Arc<Photo>,
-    /// `photo1` and `photo2` with one packed `0x00BBGGRR` word per pixel.
-    ///
-    /// Sampling a pixel is then a single aligned 32-bit load instead of three byte loads
-    /// and two shifts, which matters because the `photo2` side of the inner loop is a
-    /// gather: the three bytes were three separate address computations against the same
-    /// cache line. Costs one extra copy of each image, which the scoring loop pays back
-    /// immediately. Shared with the other solver over the same pair; see [`PackedPhoto`].
-    p1_words: Arc<[u32]>,
-    p2_words: Arc<[u32]>,
     /// Precomputed table of maximum x-offsets for each y-offset in the circular neighborhood.
     sqrt_table: Vec<i32>,
+    /// The offset from the centre of every pixel of a full disc, `x` in `disc_dx` and `y`
+    /// in `disc_dy`, in the order the walk visits them: row by row, left to right.
+    disc_dx: Vec<i32>,
+    disc_dy: Vec<i32>,
     /// Radius of the circular neighborhood used for comparisons.
     neighborhood_radius: i32,
-    /// Tracks the total number of similarity score calculations performed.
-    total_invocations: Cell<usize>,
-    /// Reused scratch for the disc resolved by the most recent call.
-    scratch: RefCell<Samples>,
 }
 
 /// The running colour sums of one candidate offset.
@@ -211,25 +203,9 @@ impl CorrespondenceScoring {
     ///
     /// # Details
     /// This method precomputes a `sqrt_table` to optimize calculations of maximum x-offsets
-    /// for each y-offset in the circular neighborhood, packs both images into one word per
-    /// pixel, and sizes the sample scratch to the largest disc that can occur.
-    #[cfg(test)]
-    pub fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, neighborhood_radius: isize) -> Self {
-        Self::with_packed(
-            PackedPhoto::new(photo1),
-            PackedPhoto::new(photo2),
-            neighborhood_radius,
-        )
-    }
-
-    /// [`Self::new`] over photos whose words are already packed.
-    pub(crate) fn with_packed(
-        packed1: PackedPhoto,
-        packed2: PackedPhoto,
-        neighborhood_radius: isize,
-    ) -> Self {
-        let (photo1, photo2) = (packed1.photo, packed2.photo);
-        let (p1_words, p2_words) = (packed1.words, packed2.words);
+    /// for each y-offset in the circular neighborhood, and lists the pixels of a full disc
+    /// for the fast path.
+    pub(crate) fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, neighborhood_radius: isize) -> Self {
         let neighborhood_radius = neighborhood_radius as i32;
         let diameter = (2 * neighborhood_radius + 1) as usize;
         let mut sqrt_table = vec![0i32; diameter];
@@ -249,26 +225,26 @@ impl CorrespondenceScoring {
             "neighborhood_radius {neighborhood_radius} would overflow the i32 accumulators"
         );
 
-        let capacity = diameter * diameter;
+        // Row by row and left to right, the order both paths of `resolve_disc` emit a
+        // full disc in.
+        let (disc_dx, disc_dy): (Vec<i32>, Vec<i32>) = (-neighborhood_radius..=neighborhood_radius)
+            .flat_map(|dy| {
+                let xx = sqrt_table[(dy + neighborhood_radius) as usize];
+                (-xx..=xx).map(move |dx| (dx, dy))
+            })
+            .unzip();
 
         CorrespondenceScoring {
             photo1,
             photo2,
-            p1_words,
-            p2_words,
             sqrt_table,
+            disc_dx,
+            disc_dy,
             neighborhood_radius,
-            total_invocations: Cell::new(0),
-            scratch: RefCell::new(Samples {
-                p1: vec![0u32; capacity],
-                p2_idx: vec![0i32; capacity],
-                len: 0,
-                offered: 0,
-            }),
         }
     }
 
-    /// Resolves the circular neighbourhood of `circle_mapping` into `self.scratch`.
+    /// Resolves the circular neighbourhood of the transform `fixed` was made from into `s`.
     ///
     /// Walks the disc once, mapping each `photo1` pixel through the affine transform
     /// to a rounded `photo2` pixel, and keeps only the pairs where *both* sides are in
@@ -291,18 +267,14 @@ impl CorrespondenceScoring {
     /// exact on those four, and `>> FRAC` is monotone so the integer coordinates are
     /// bounded by the same four. If they are all inside the inset — and the box is
     /// inside `photo1` — every sample is, and the walk degenerates to a contiguous copy
-    /// plus an index ramp with no test at all. Only a disc that genuinely straddles an
-    /// edge takes the general path, which clamps each row to `photo1` and, for a row
-    /// that also straddles a `photo2` edge, tests every pixel.
+    /// per row plus one index computation over the whole disc table, with no test at
+    /// all. Only a disc that genuinely straddles an edge takes the general path, which
+    /// clamps each row to `photo1` and, for a row that also straddles a `photo2` edge,
+    /// tests every pixel.
     ///
     /// `allow_fast` is there for the tests, which run the general path over inputs the
     /// fast path would claim and assert the two agree; production always passes `true`.
-    fn resolve_disc_inner(
-        &self,
-        circle_mapping: &AffineTransform,
-        s: &mut Samples,
-        allow_fast: bool,
-    ) {
+    fn resolve_disc(&self, fixed: &FixedTransform, s: &mut Samples, allow_fast: bool) {
         s.len = 0;
         s.offered = 0;
 
@@ -315,9 +287,8 @@ impl CorrespondenceScoring {
 
         let radius = self.neighborhood_radius;
 
-        // The only floating point left in the function: six conversions per call, none
-        // of them inside a loop. Nothing below reads `circle_mapping` again, which is
-        // what makes a `FixedTransform` a complete key for the result.
+        // Everything below is integer and comes from `fixed`, which is what makes a
+        // `FixedTransform` a complete key for the result.
         let FixedTransform {
             origin_x,
             origin_y,
@@ -327,7 +298,7 @@ impl CorrespondenceScoring {
             col_y,
             base_x,
             base_y,
-        } = FixedTransform::new(circle_mapping);
+        } = *fixed;
         let x1 = origin_x as i32;
         let y1 = origin_y as i32;
 
@@ -378,32 +349,33 @@ impl CorrespondenceScoring {
                 let xx = unsafe { *self.sqrt_table.get_unchecked((y + radius) as usize) };
                 let n = (2 * xx + 1) as usize;
                 let row1_pix = ((y1 + y) * w1 + x1 - xx) as usize;
-                let fx0 = row_fx.wrapping_sub(xx.wrapping_mul(step_x));
-                let fy0 = row_fy.wrapping_sub(xx.wrapping_mul(step_y));
 
-                // SAFETY: the disc's bounding box is inside `photo1`, so `row1_pix ..
-                // row1_pix + n` is one contiguous run of `p1_words`; and the disc yields
-                // at most `(2r+1)^2` samples, which is what `p1` and `p2_idx` were sized
-                // to, so `out + n` stays within both.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.p1_words.as_ptr().add(row1_pix),
-                        s.p1.as_mut_ptr().add(out),
-                        n,
-                    );
-                    // Written as `fx0 + i * step_x` rather than as a running sum on
-                    // purpose: it states the affine relation the vectorizer needs.
-                    let dst = s.p2_idx.as_mut_ptr().add(out);
-                    for i in 0..n {
-                        let fx = fx0.wrapping_add((i as i32).wrapping_mul(step_x));
-                        let fy = fy0.wrapping_add((i as i32).wrapping_mul(step_y));
-                        *dst.add(i) = (fx >> FRAC) + (fy >> FRAC) * w2i;
-                    }
-                }
+                // The disc's bounding box is inside `photo1`, so this row is one
+                // contiguous run of its pixels; and the disc yields at most `(2r+1)^2`
+                // samples, which is what `p1` was sized to.
+                s.p1[4 * out..4 * (out + n)]
+                    .copy_from_slice(&self.photo1.img_data[4 * row1_pix..4 * (row1_pix + n)]);
                 out += n;
+            }
 
-                row_fx = row_fx.wrapping_add(col_x);
-                row_fy = row_fy.wrapping_add(col_y);
+            // The `photo2` indices in one flat pass over the disc table rather than one
+            // short ramp per row: rows of at most 2r+1 pixels left a scalar remainder on
+            // nearly every one, and a single loop over the whole disc vectorizes almost
+            // without one. Each position is computed from the centre rather than advanced
+            // row by row, but in wrapping arithmetic both reach the same integer,
+            // `base + dy * col + dx * step`.
+            for ((p2, &dx), &dy) in s.p2_idx[..out]
+                .iter_mut()
+                .zip(&self.disc_dx[..out])
+                .zip(&self.disc_dy[..out])
+            {
+                let fx = base_x
+                    .wrapping_add(dy.wrapping_mul(col_x))
+                    .wrapping_add(dx.wrapping_mul(step_x));
+                let fy = base_y
+                    .wrapping_add(dy.wrapping_mul(col_y))
+                    .wrapping_add(dx.wrapping_mul(step_y));
+                *p2 = (fx >> FRAC) + (fy >> FRAC) * w2i;
             }
         } else {
             for y in y_lo..=y_hi {
@@ -441,12 +413,14 @@ impl CorrespondenceScoring {
                             continue;
                         }
 
-                        // SAFETY: `row1_pix + i` is a pixel of `photo1` by the row clamp
-                        // above, and the disc yields at most `(2r+1)^2` samples, which is
-                        // what `p1` and `p2_idx` were sized to.
+                        // `row1_pix + i` is a pixel of `photo1` by the row clamp above,
+                        // and the disc yields at most `(2r+1)^2` samples, which is what
+                        // `p1` and `p2_idx` were sized to.
+                        let from = 4 * (row1_pix + i);
+                        s.p1[4 * out..4 * out + 4]
+                            .copy_from_slice(&self.photo1.img_data[from..from + 4]);
+                        // SAFETY: as above.
                         unsafe {
-                            *s.p1.get_unchecked_mut(out) =
-                                *self.p1_words.get_unchecked(row1_pix + i);
                             *s.p2_idx.get_unchecked_mut(out) = px + py * w2i;
                         }
                         out += 1;
@@ -461,10 +435,10 @@ impl CorrespondenceScoring {
         s.offered = if fully_inside { out } else { offered };
     }
 
-    /// Resolves the disc of `circle_mapping`; see [`Self::resolve_disc_inner`].
-    #[inline(always)]
-    fn resolve_disc(&self, circle_mapping: &AffineTransform, s: &mut Samples) {
-        self.resolve_disc_inner(circle_mapping, s, true);
+    /// [`Self::resolve_disc`] of an [`AffineTransform`], for the tests.
+    #[cfg(test)]
+    fn resolve_disc_inner(&self, cm: &AffineTransform, s: &mut Samples, allow_fast: bool) {
+        self.resolve_disc(&FixedTransform::new(cm), s, allow_fast);
     }
 
     /// Scores the `K` candidates that differ from the resolved disc by the constant
@@ -481,18 +455,24 @@ impl CorrespondenceScoring {
         if n == 0 {
             return [f32::MAX; K];
         }
-        let p2 = &self.p2_words;
+        let p2 = &self.photo2.img_data[..];
         let mut acc = [Acc::default(); K];
 
         for j in 0..n {
-            // SAFETY: `j < n <= s.p1.len()`, and `resolve_disc` insets photo2 by one
+            // SAFETY: `j < n`, and `p1` holds the four bytes of each of the `n` samples;
+            // and `resolve_disc` insets photo2 by one
             // pixel on every side, so every sample shifted by at most one pixel in
-            // either axis is still a valid index into `p2_words`.
+            // either axis is still a pixel of `photo2`: its four bytes are in `p2`.
             unsafe {
-                let w1 = *s.p1.get_unchecked(j);
+                let w1: [u8; 4] = s.p1.get_unchecked(4 * j..4 * j + 4).try_into().unwrap();
+                let w1 = u32::from_le_bytes(w1);
                 let idx = *s.p2_idx.get_unchecked(j) + base;
                 for k in 0..K {
-                    acc[k].add(w1, *p2.get_unchecked((idx + offs[k]) as usize));
+                    let at = 4 * (idx + offs[k]) as usize;
+                    // A slice of exactly four bytes, so the conversion cannot fail and
+                    // compiles to a single load.
+                    let px: [u8; 4] = p2.get_unchecked(at..at + 4).try_into().unwrap();
+                    acc[k].add(w1, u32::from_le_bytes(px));
                 }
             }
         }
@@ -519,15 +499,25 @@ impl CorrespondenceScoring {
     ///
     /// A transform that puts too little of its disc inside `photo2` is not scored at all
     /// and comes back with `f32::MAX`, which no cell accepts; see [`MIN_COMPARED`].
-    pub fn optimize_translation(&self, cm: &AffineTransform) -> (f32, AffineTransform) {
-        let mut s = self.scratch.borrow_mut();
-        self.resolve_disc(cm, &mut s);
+    ///
+    /// `fixed` must be `FixedTransform::new(cm)`. The caller passes it in because the
+    /// solver already holds it, as the key it recognizes repeated candidates by, and
+    /// converting the transform twice per candidate was measurable. `s` is the caller's
+    /// scratch; the comparisons are counted in it.
+    pub(crate) fn optimize_translation(
+        &self,
+        cm: &AffineTransform,
+        fixed: &FixedTransform,
+        s: &mut Samples,
+    ) -> (f32, AffineTransform) {
+        debug_assert!(*fixed == FixedTransform::new(cm));
+        self.resolve_disc(fixed, s, true);
         if !s.is_comparable() {
             return (f32::MAX, *cm);
         }
-        self.total_invocations.set(self.total_invocations.get() + 5);
+        s.scored += 5;
 
-        let [score_x1, score_0, score_x2] = self.score_taps(&s, 0, [-1, 0, 1]);
+        let [score_x1, score_0, score_x2] = self.score_taps(s, 0, [-1, 0, 1]);
 
         let mut best = score_0;
         let mut delta = 0i32;
@@ -545,7 +535,7 @@ impl CorrespondenceScoring {
         }
 
         let w = self.photo2.width as i32;
-        let [score_y1, score_y2] = self.score_taps(&s, delta, [-w, w]);
+        let [score_y1, score_y2] = self.score_taps(s, delta, [-w, w]);
         if score_y1 < best && score_y1 < score_y2 {
             best = score_y1;
             dy = -1.0;
@@ -562,11 +552,6 @@ impl CorrespondenceScoring {
                 ..*cm
             },
         )
-    }
-
-    /// Returns the total number of similarity score calculations performed.
-    pub fn get_num_comparisons(&self) -> usize {
-        self.total_invocations.get()
     }
 }
 
@@ -610,13 +595,7 @@ mod tests {
     }
 
     fn empty_samples(radius: usize) -> Samples {
-        let capacity = (2 * radius + 1) * (2 * radius + 1);
-        Samples {
-            p1: vec![0u32; capacity],
-            p2_idx: vec![0i32; capacity],
-            len: 0,
-            offered: 0,
-        }
+        Samples::new(radius)
     }
 
     /// Random transforms spanning the range the solver actually produces: origins over
@@ -811,12 +790,13 @@ mod tests {
             "this is meant to be the one-sample case"
         );
 
-        let (score, returned) = scoring.optimize_translation(&sliver);
+        let mut probe = empty_samples(radius);
+        let (score, returned) =
+            scoring.optimize_translation(&sliver, &FixedTransform::new(&sliver), &mut probe);
         assert_eq!(score, f32::MAX, "a single sample was given a score");
         assert_eq!(returned, sliver);
         assert_eq!(
-            scoring.get_num_comparisons(),
-            0,
+            probe.scored, 0,
             "nothing was compared, so nothing should be counted"
         );
     }
@@ -837,7 +817,16 @@ mod tests {
         let mut s = empty_samples(radius);
         scoring.resolve_disc_inner(&near_edge, &mut s, true);
         assert!(s.len < s.offered, "the edge should cut this disc");
-        assert!(scoring.optimize_translation(&near_edge).0 < f32::MAX);
+        assert!(
+            scoring
+                .optimize_translation(
+                    &near_edge,
+                    &FixedTransform::new(&near_edge),
+                    &mut empty_samples(5)
+                )
+                .0
+                < f32::MAX
+        );
     }
 
     /// ...nor a cell in the corner of `photo1`, whose disc is a quarter of the usual size
@@ -856,7 +845,16 @@ mod tests {
         scoring.resolve_disc_inner(&corner, &mut s, true);
         assert!(s.offered < 81 / 2, "a corner cell has a small disc");
         assert_eq!(s.len, s.offered, "all of it lands inside photo2");
-        assert!(scoring.optimize_translation(&corner).0 < f32::MAX);
+        assert!(
+            scoring
+                .optimize_translation(
+                    &corner,
+                    &FixedTransform::new(&corner),
+                    &mut empty_samples(5)
+                )
+                .0
+                < f32::MAX
+        );
     }
 
     /// The solver skips a candidate whose [`FixedTransform`] equals one a cell has already
@@ -895,8 +893,13 @@ mod tests {
             assert_eq!(a.p1[..a.len], b.p1[..b.len]);
             assert_eq!(a.p2_idx[..a.len], b.p2_idx[..b.len]);
 
-            let (score, out) = scoring.optimize_translation(&cm);
-            let (score_twin, out_twin) = scoring.optimize_translation(&nudged);
+            let (score, out) =
+                scoring.optimize_translation(&cm, &FixedTransform::new(&cm), &mut empty_samples(5));
+            let (score_twin, out_twin) = scoring.optimize_translation(
+                &nudged,
+                &FixedTransform::new(&nudged),
+                &mut empty_samples(5),
+            );
             assert_eq!(score.to_bits(), score_twin.to_bits());
             // Rounded, because `(t + 1.0) - t` is not always exactly 1.0 in `f32`.
             let shift = |from: &AffineTransform, to: &AffineTransform| {
