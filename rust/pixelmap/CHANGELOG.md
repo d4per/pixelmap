@@ -4,6 +4,17 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.2 - 2026-11-22
+
+### Fixed
+
+- `PixelMapProcessor::finish` used up the maps it fills holes from, so with a `FillMode`
+  other than `Off` only the first call filled anything, and a call between two
+  `iterate`s dropped the earlier widths from every later result. It now leaves the
+  processor as it was, and calling it after every step gives the same final mapping as
+  calling it once at the end. `Correspondence::builder()` calls it once, so its mappings
+  are unchanged.
+
 ## 0.4.1 - 2026-11-22
 
 ### Added

@@ -5,7 +5,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use pixelmap::{
-    correspond, Correspondence, DecodeError, DensePhotoMap, Error, Photo, Quality, DEFAULT_SEED,
+    correspond, Correspondence, DecodeError, DensePhotoMap, Error, FillMode, Photo,
+    PixelMapProcessor, Quality, DEFAULT_SEED,
 };
 
 /// Deterministic xorshift, so a failure is reproducible.
@@ -72,6 +73,61 @@ fn run(photo1: Photo, photo2: Photo, seed: u64) -> Correspondence {
         .seed(seed)
         .run(photo1, photo2)
         .expect("synthetic photos are valid input")
+}
+
+/// A caller stepping the processor by hand looks at the mapping after every step, and
+/// each look must not use up the earlier widths the final mapping fills holes from.
+#[test]
+fn finishing_can_be_repeated_without_losing_the_fill_history() {
+    // Strong pixel noise over a patch of `b`: the fine step loses it in the round-trip
+    // check, while at the coarse width the downscale averages the noise out.
+    let (a, b) = shifted_pair(240, 180, 7, 4);
+    let mut rng = Rng(99);
+    let mut noisy = b.into_rgba();
+    for y in 50..120 {
+        for x in 60..140 {
+            for c in 0..3 {
+                noisy[(y * 240 + x) * 4 + c] = rng.next_u32() as u8;
+            }
+        }
+    }
+    let (a, b) = (
+        Arc::new(a),
+        Arc::new(Photo::from_rgba(240, 180, noisy).unwrap()),
+    );
+
+    let run = |mode, peek: bool| {
+        let mut processor = PixelMapProcessor::new(a.clone(), b.clone(), 120);
+        processor.set_fill_mode(mode);
+        processor.init();
+        processor.iterate(120, 5, 5, 2, 2.0);
+        if peek {
+            processor.finish(1.0);
+        }
+        processor.iterate(240, 5, 5, 2, 1.0);
+        processor
+    };
+
+    let unfilled = run(FillMode::Off, false)
+        .finish(1.0)
+        .0
+        .calculate_used_area();
+    let mut processor = run(FillMode::Plain, false);
+    let first = processor.finish(1.0);
+    let second = processor.finish(1.0);
+    let peeked = run(FillMode::Plain, true).finish(1.0);
+    assert!(
+        first.0.calculate_used_area() > unfilled + 0.05,
+        "the fill must have something to do for this test to mean anything"
+    );
+    assert!(
+        first.0.serialize() == second.0.serialize() && first.1.serialize() == second.1.serialize(),
+        "a second finish gave a different mapping"
+    );
+    assert!(
+        first.0.serialize() == peeked.0.serialize() && first.1.serialize() == peeked.1.serialize(),
+        "a finish between two iterates changed the final mapping"
+    );
 }
 
 /// The headline claim: given a known warp, the pipeline recovers it.

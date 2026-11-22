@@ -403,6 +403,10 @@ impl PixelMapProcessor {
     /// Retrieves the final forward and backward mappings, removing any remaining outliers
     /// with a given distance threshold.
     ///
+    /// It leaves the processor as it was: it can be called after every [`Self::iterate`]
+    /// to look at the mapping so far, and a later call still fills holes from every
+    /// earlier working width.
+    ///
     /// # Parameters
     /// - `clean_max_dist`: The maximum distance for outlier checking.
     ///   Points whose forward-backward mapping is too large are discarded.
@@ -422,7 +426,7 @@ impl PixelMapProcessor {
             fill_from_history(
                 &mut pm1,
                 &mut pm2,
-                std::mem::take(&mut self.history),
+                &self.history,
                 clean_max_dist,
                 self.fill_mode == FillMode::Checked,
             );
@@ -458,15 +462,16 @@ impl PixelMapProcessor {
 fn fill_from_history(
     fwd: &mut DensePhotoMap,
     bwd: &mut DensePhotoMap,
-    history: Vec<(DensePhotoMap, DensePhotoMap)>,
+    history: &[(DensePhotoMap, DensePhotoMap)],
     max_dist: f32,
     checked: bool,
 ) {
     let width = fwd.dimensions().0 as f32;
     let earlier: Vec<(DensePhotoMap, DensePhotoMap, f32)> = history
-        .into_iter()
+        .iter()
         .rev()
-        .map(|(mut a, mut b)| {
+        .map(|(a, b)| {
+            let (mut a, mut b) = (a.clone(), b.clone());
             a.remove_outliers(&b, max_dist);
             b.remove_outliers(&a, max_dist);
             let scale = a.dimensions().0 as f32 / width;
@@ -599,7 +604,7 @@ mod tests {
         fwd.set_grid_coordinates(10, 6, f32::NAN, f32::NAN);
         let history = vec![(shifted_map(50, 30, 0.0), shifted_map(50, 30, 0.0))];
 
-        fill_from_history(&mut fwd, &mut bwd, history, 2.0, false);
+        fill_from_history(&mut fwd, &mut bwd, &history, 2.0, false);
 
         assert_eq!(fwd.grid_coordinates(3, 3), (99.0, 99.0));
         assert_eq!(fwd.grid_coordinates(10, 6), (50.0, 30.0));
@@ -614,7 +619,7 @@ mod tests {
 
         let (mut fwd, mut bwd) = (shifted_map(100, 60, 0.0), shifted_map(100, 60, 0.0));
         hole(&mut fwd);
-        fill_from_history(&mut fwd, &mut bwd, history(), 2.0, false);
+        fill_from_history(&mut fwd, &mut bwd, &history(), 2.0, false);
         assert_eq!(
             fwd.grid_coordinates(10, 6),
             (80.0, 30.0),
@@ -623,7 +628,7 @@ mod tests {
 
         let (mut fwd, mut bwd) = (shifted_map(100, 60, 0.0), shifted_map(100, 60, 0.0));
         hole(&mut fwd);
-        fill_from_history(&mut fwd, &mut bwd, history(), 2.0, true);
+        fill_from_history(&mut fwd, &mut bwd, &history(), 2.0, true);
         assert!(
             fwd.grid_coordinates(10, 6).0.is_nan(),
             "the round trip is 6 cells off"
