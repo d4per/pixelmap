@@ -4,6 +4,24 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `Builder::local_consistency` and `LocalConsistency`: an opt-in filter, applied last,
+  that drops the answers out of line with their neighbours'. It catches regions that are
+  wrong consistently in both directions, which the round trip cannot. A cell goes if its
+  flow is more than 3.2 working px from the median of its 3×3 neighbourhood, or the
+  Jacobian the map implies there is more than 5× stretched along one axis, or differs
+  from the median Jacobian of its 5×5 neighbourhood by more than 1.2 (Frobenius). All
+  three limits are settable. The tests are relative to the neighbourhood, never
+  absolute, so legitimate strong scaling and shear pass. On the training splits of
+  KITTI 2015, MPI-Sintel, ETH3D and HPatches (`High`, fill off) it raised the share of
+  answers within 3 px of the truth by 2–5 points, for 4–10 points of coverage. Lowering
+  `Builder::max_round_trip_error` does about as well at equal coverage, and the two
+  stack: on top of a round trip of `0.7` the filter added 0.5–1.4 points of precision
+  for 1–2 points of coverage. Off by default, so every mapping is unchanged.
+
 ## 0.4.2 - 2026-11-22
 
 ### Fixed

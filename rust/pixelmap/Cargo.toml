@@ -32,7 +32,8 @@ parallel = ["dep:rayon"]
 # `From<image::RgbaImage>` and `From<image::DynamicImage>` for `Photo`.
 image = ["dep:image"]
 # Compiles `matcher_bench`, used to tune the match stride and to re-check the
-# search backends against each other.
+# search backends against each other, and `filter_bench`, the per-cell diagnostics
+# `filter_lab` experiments with.
 bench = []
 
 # Needs image decoding, so it is only built when the `image` feature is on.

@@ -333,6 +333,41 @@ impl DensePhotoMap {
         }
     }
 
+    /// The local Jacobian of the map at every grid node, row-major, as
+    /// `[dX/dx, dX/dy, dY/dx, dY/dy]` (an affine transform's `a11, a12, a21, a22`).
+    ///
+    /// Central differences where both neighbours along an axis are mapped, one-sided ones
+    /// where only one is. `None` where the node is unmapped, or has no mapped neighbour
+    /// along an axis.
+    pub(crate) fn jacobians(&self) -> Vec<Option<[f32; 4]>> {
+        let (gw, gh) = (self.grid_width, self.grid_height);
+        let c = self.grid_cell_size as f32;
+        let at = |x: isize, y: isize| -> Option<(f32, f32)> {
+            if x < 0 || y < 0 {
+                return None;
+            }
+            let p = self.grid_coordinates(x as usize, y as usize);
+            (!p.0.is_nan() && !p.1.is_nan()).then_some(p)
+        };
+        let diff = |lo: Option<(f32, f32)>, mid: (f32, f32), hi: Option<(f32, f32)>| match (lo, hi) {
+            (Some(a), Some(b)) => Some(((b.0 - a.0) / (2.0 * c), (b.1 - a.1) / (2.0 * c))),
+            (None, Some(b)) => Some(((b.0 - mid.0) / c, (b.1 - mid.1) / c)),
+            (Some(a), None) => Some(((mid.0 - a.0) / c, (mid.1 - a.1) / c)),
+            (None, None) => None,
+        };
+        let mut out = Vec::with_capacity(gw * gh);
+        for y in 0..gh as isize {
+            for x in 0..gw as isize {
+                out.push(at(x, y).and_then(|mid| {
+                    let dx = diff(at(x - 1, y), mid, at(x + 1, y))?;
+                    let dy = diff(at(x, y - 1), mid, at(x, y + 1))?;
+                    Some([dx.0, dy.0, dx.1, dy.1])
+                }));
+            }
+        }
+        out
+    }
+
     /// Calculates how many valid cells (non-NaN) exist in this map, expressed as
     /// a fraction of the total number of cells.
     ///

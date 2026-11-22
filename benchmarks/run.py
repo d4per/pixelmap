@@ -57,6 +57,7 @@ FIELDS = (
     + _METRICS
     + [f"{m}_noc" for m in ("coverage", "epe", "fl")] + [f"pck{k}_noc" for k in PCK]
     + ["epe_shared", "shared_frac", "error"]
+    + ["occ_frac"] + [f"{m}_occ" for m in ("coverage", "epe", "fl")] + [f"pck{k}_occ" for k in PCK]
 )
 
 
@@ -90,8 +91,17 @@ def main() -> int:
             for r in csv.DictReader(f):
                 done.add((r["dataset"], r["pair"], r["method"], r["threads"]))
     new_file = not args.out.exists()
+    fields = FIELDS
+    if not new_file:
+        # Append in the file's own column order. A CSV started before a column was added
+        # keeps its header, and the new column is left out of the rows appended to it.
+        with open(args.out, newline="") as f:
+            fields = next(csv.reader(f), FIELDS)
+        missing = [c for c in FIELDS if c not in fields]
+        if missing:
+            print(f"{args.out} has no columns {missing}; they will not be written", file=sys.stderr)
     out = open(args.out, "a", newline="")
-    writer = csv.DictWriter(out, fieldnames=FIELDS, extrasaction="ignore")
+    writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
     if new_file:
         writer.writeheader()
 

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::error::Error;
 use crate::photo::Photo;
+use crate::local_consistency::LocalConsistency;
 use crate::pixelmap_processor::{FillMode, PixelMapProcessor, DEFAULT_SEED};
 use crate::processing_mode::{IterationParams, Quality, MAX_NEIGHBORHOOD_RADIUS};
 
@@ -143,6 +144,7 @@ pub struct Builder {
     seed: u64,
     final_max_dist: f32,
     fill_mode: Option<FillMode>,
+    local_consistency: Option<LocalConsistency>,
     neighborhood_radius: Option<usize>,
     init_neighborhood_radius: Option<usize>,
 }
@@ -162,6 +164,7 @@ impl Builder {
             seed: DEFAULT_SEED,
             final_max_dist: 2.0,
             fill_mode: None,
+            local_consistency: None,
             neighborhood_radius: None,
             init_neighborhood_radius: None,
         }
@@ -175,6 +178,25 @@ impl Builder {
     /// answer costs more than no answer, as when triangulating points.
     pub fn fill_mode(mut self, mode: FillMode) -> Self {
         self.fill_mode = Some(mode);
+        self
+    }
+
+    /// Drops the answers that are out of line with their neighbours', after the
+    /// round-trip check and after hole filling; see [`LocalConsistency`] for the tests
+    /// and what they cost. Off unless this is called.
+    ///
+    /// ```no_run
+    /// use pixelmap::{Correspondence, LocalConsistency, Photo, Quality};
+    /// # fn photos() -> (Photo, Photo) { unimplemented!() }
+    /// # let (a, b) = photos();
+    /// let mapping = Correspondence::builder()
+    ///     .quality(Quality::High)
+    ///     .local_consistency(LocalConsistency::default())
+    ///     .run(a, b)?;
+    /// # Ok::<(), pixelmap::Error>(())
+    /// ```
+    pub fn local_consistency(mut self, filter: LocalConsistency) -> Self {
+        self.local_consistency = Some(filter);
         self
     }
 
@@ -348,6 +370,7 @@ impl Builder {
         let mut processor =
             PixelMapProcessor::with_seed(photo1, photo2, this.quality.photo_width(), this.seed);
         processor.set_fill_mode(this.fill_mode.unwrap_or(this.quality.fill_mode()));
+        processor.set_local_consistency(this.local_consistency);
         if let Some(radius) = this.init_neighborhood_radius.or(this.neighborhood_radius) {
             processor.set_init_neighborhood_radius(radius);
         }
@@ -391,6 +414,8 @@ impl Builder {
     ///   `PIXELMAP_SCHEDULE` it only fills in the steps that name no radius.
     /// - `PIXELMAP_INIT_RADIUS`: [`Self::init_neighborhood_radius`].
     /// - `PIXELMAP_FILL`: `off`, `plain` or `checked`.
+    /// - `PIXELMAP_LOCAL_CONSISTENCY`: `off`, `on` (the defaults), or
+    ///   `flow,jacobian,anisotropy` thresholds for [`Self::local_consistency`].
     fn with_env_overrides(&self) -> Builder {
         let mut b = self.clone();
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
@@ -438,6 +463,28 @@ impl Builder {
                 "checked" => FillMode::Checked,
                 other => panic!("PIXELMAP_FILL must be off, plain or checked, not {other}"),
             });
+        }
+        if let Some(v) = var("PIXELMAP_LOCAL_CONSISTENCY") {
+            b.local_consistency = match v.trim() {
+                "off" => None,
+                "on" => Some(LocalConsistency::default()),
+                list => {
+                    let t: Vec<f32> = list
+                        .split(',')
+                        .map(|t| t.trim().parse().expect("PIXELMAP_LOCAL_CONSISTENCY threshold"))
+                        .collect();
+                    assert!(
+                        t.len() == 3,
+                        "PIXELMAP_LOCAL_CONSISTENCY is off, on or flow,jacobian,anisotropy, not {list}"
+                    );
+                    Some(
+                        LocalConsistency::default()
+                            .max_flow_deviation(t[0])
+                            .max_jacobian_deviation(t[1])
+                            .max_anisotropy(t[2]),
+                    )
+                }
+            };
         }
         b
     }

@@ -99,6 +99,7 @@ mod circular_feature_grid;
 mod correspondence_mapping_algorithm;
 mod correspondence_scoring;
 mod kdtree;
+mod local_consistency;
 mod rng;
 
 /// Head-to-head benchmark of the matcher's nearest-neighbour backends.
@@ -108,9 +109,17 @@ mod rng;
 #[doc(hidden)]
 pub mod matcher_bench;
 
+/// Per-cell diagnostics of a finished map, for the experiments in `filter_lab` on
+/// rejecting wrong answers. Enabled by the `bench` feature and hidden like
+/// `matcher_bench`.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod filter_bench;
+
 pub use correspondence::{correspond, Builder, Correspondence, Progress};
 pub use dense_photo_map::DensePhotoMap;
 pub use error::{DecodeError, Error};
+pub use local_consistency::LocalConsistency;
 pub use photo::{Photo, MIN_DIMENSION};
 pub use pixelmap_processor::{FillMode, PixelMapProcessor, DEFAULT_SEED};
 pub use processing_mode::{

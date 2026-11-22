@@ -78,6 +78,25 @@ coarser working width. That raises coverage and the share of pixels mapped withi
 pixels of the truth, but the filled cells are less precise than the rest. Use
 `Builder::fill_mode(FillMode::Off)` when a wrong answer costs more than no answer.
 
+Two options trade more coverage for precision. `Builder::max_round_trip_error` (default 2
+grid cells) is how far a round trip through both directions may land from its start.
+`Builder::local_consistency` drops the answers out of line with their neighbours': a
+jump in the flow, or a local transform stretched far along one axis or bent away from
+the ones around it. It catches regions that are wrong the same way in both directions,
+which pass the round trip, typically at occlusions and where the mapping leaves the
+frame. On the benchmarks (`High`, fill off), the filter raised the share of answers
+within 3 px of the truth by 2–5 points, for 4–10 points of coverage. A round trip of
+0.7 did about as well on its own, and the two stack.
+
+```rust,no_run
+let mapping = Correspondence::builder()
+    .quality(Quality::High)
+    .fill_mode(FillMode::Off)
+    .max_round_trip_error(0.7)
+    .local_consistency(LocalConsistency::default())
+    .run(a, b)?;
+```
+
 `Builder::schedule` takes an explicit list of `IterationParams` for callers tuning the
 algorithm itself.
 

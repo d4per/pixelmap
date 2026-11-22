@@ -10,6 +10,10 @@ S = the shared mask, i.e. the reference method's P ∩ G.
                 misses. This is the headline number: refusing to answer cannot inflate it.
 - epe_shared    mean EPE over S ∩ P. For a method that answers everywhere, that is S.
 - *_noc         the same over the non-occluded subset, where the dataset has one
+- *_occ         the same over the rest of G: pixels with no counterpart in the second image
+                (occluded or moved out of frame). The datasets still give them a true flow
+- occ_frac      |G \ noc| / |G|, so that metric = (1 - occ_frac)·*_noc + occ_frac·*_occ
+                for the PCK and coverage columns
 - gt_mag        mean |gt| over G, which the `zero` method's EPE must equal
 """
 
@@ -54,6 +58,9 @@ def score(flow: np.ndarray, gt: np.ndarray, valid: np.ndarray,
     row.update(block(valid))
     if noc is not None:
         row.update({k: v for k, v in block(noc, "_noc").items() if not k.startswith("epe_med")})
+        occ = valid & ~noc
+        row["occ_frac"] = occ.sum() / max(int(valid.sum()), 1)
+        row.update({k: v for k, v in block(occ, "_occ").items() if not k.startswith("epe_med")})
     if shared is not None:
         s = shared & answered & valid
         row["epe_shared"] = _mean(err[s])

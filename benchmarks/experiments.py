@@ -10,6 +10,7 @@ plain `high`. Write their results to a separate CSV (`--out results/experiments.
     PIXELMAP_FILL         off | plain | checked      fill final holes from earlier widths
     PIXELMAP_RADIUS       r                          scoring disc radius of every step (default 5)
     PIXELMAP_INIT_RADIUS  r                          ... of the init solve alone
+    PIXELMAP_LOCAL_CONSISTENCY  off | on | flow,jacobian,anisotropy   `Builder::local_consistency`
 
 A `PIXELMAP_SCHEDULE` step may also name its own radius, `width:dist:radius`.
 
@@ -43,7 +44,8 @@ MEDIUM: list[tuple[int, float]] = [
 ]
 HIGH: list[tuple[int, float]] = MEDIUM + [(1600, 1.0), (1600, 2.0), (1600, 2.0)]
 
-_ENV = ("PIXELMAP_SCHEDULE", "PIXELMAP_FILL", "PIXELMAP_RADIUS", "PIXELMAP_INIT_RADIUS")
+_ENV = ("PIXELMAP_SCHEDULE", "PIXELMAP_FILL", "PIXELMAP_RADIUS", "PIXELMAP_INIT_RADIUS",
+        "PIXELMAP_LOCAL_CONSISTENCY")
 
 
 def _variant(
@@ -122,6 +124,25 @@ def _radius(
     return run
 
 
+def _shipped(quality: str, fill: str = "", lc: str = "off", finish: float = 2.0) -> Callable[[Pair], np.ndarray]:
+    """The shipped `quality` preset, with its fill mode replaced unless `fill` is empty, the
+    local-consistency filter set by `lc` (see `PIXELMAP_LOCAL_CONSISTENCY`), and `finish`
+    as the final round-trip threshold."""
+
+    def run(pair: Pair) -> np.ndarray:
+        os.environ.update({"PIXELMAP_FILL": fill, "PIXELMAP_LOCAL_CONSISTENCY": lc})
+        try:
+            mapping = pixelmap.correspond(
+                pair.img1, pair.img2, quality=quality, seed=methods.SEED, max_round_trip_error=finish
+            )
+        finally:
+            for k in _ENV:
+                os.environ.pop(k, None)
+        return np.asarray(mapping.flow(), dtype=np.float32)
+
+    return run
+
+
 def _split(coarse: int, final: int) -> Callable[[int, bool], int]:
     """`coarse` at every width before the last, `final` at the last."""
     return lambda _w, is_final: final if is_final else coarse
@@ -170,6 +191,15 @@ VARIANTS: dict[str, Callable[[Pair], np.ndarray]] = {
     "x_i9_c5_f7": _radius("high", per_width=_split(5, 7), init_radius=9),
     "x_i13_c7_f7": _radius("high", per_width=_split(7, 7), init_radius=13),
     "x_med_i9": _radius("medium", init_radius=9),
+    # the local-consistency filter, on High with its own fill and with fill off (2026-11-22)
+    "x_high_base": _shipped("high"),
+    "x_high_lc": _shipped("high", lc="on"),
+    "x_high_off": _shipped("high", fill="off"),
+    "x_high_off_lc": _shipped("high", fill="off", lc="on"),
+    # the existing knob, for comparison at equal coverage
+    "x_high_off_rt1": _shipped("high", fill="off", finish=1.0),
+    "x_high_off_rt07": _shipped("high", fill="off", finish=0.7),
+    "x_high_off_rt07_lc": _shipped("high", fill="off", lc="on", finish=0.7),
 }
 
 

@@ -35,6 +35,10 @@ COLUMNS = [
     ("pck3", "PCK@3", "{:.1%}", "mean"),
     ("pck10", "PCK@10", "{:.1%}", "mean"),
     ("pck3_noc", "PCK@3 noc", "{:.1%}", "mean"),
+    ("occ_frac", "occ share", "{:.1%}", "mean"),
+    ("coverage_occ", "coverage occ", "{:.1%}", "mean"),
+    ("epe_occ", "EPE occ", "{:.2f}", "mean"),
+    ("pck3_occ", "PCK@3 occ", "{:.1%}", "mean"),
     ("seconds", "s/pair", "{:.2f}", "mean"),
 ]
 

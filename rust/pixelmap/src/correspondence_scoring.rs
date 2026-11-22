@@ -558,6 +558,36 @@ impl CorrespondenceScoring {
             },
         )
     }
+
+    /// The five scores [`Self::optimize_translation`] would compare, all relative to `cm`
+    /// itself rather than to the x winner: `[centre, -x, +x, -y, +y]`. Also returns the
+    /// variance of `photo1`'s colours over the compared samples, in the score's units,
+    /// and the share of the offered disc that was compared. `None` where the disc is not
+    /// comparable.
+    #[cfg(feature = "bench")]
+    pub(crate) fn probe(&self, cm: &AffineTransform, s: &mut Samples) -> Option<([f32; 5], f32, f32)> {
+        self.resolve_disc(&FixedTransform::new(cm), s, true);
+        if !s.is_comparable() {
+            return None;
+        }
+        let [x1, c, x2] = self.score_taps(s, 0, [-1, 0, 1]);
+        let w = self.photo2.width as i32;
+        let [y1, y2] = self.score_taps(s, 0, [-w, w]);
+
+        let n = s.len;
+        let (mut sum, mut sum2) = ([0i64; 3], 0i64);
+        for px in s.p1[..4 * n].chunks_exact(4) {
+            for ch in 0..3 {
+                let v = px[ch] as i64;
+                sum[ch] += v;
+                sum2 += v * v;
+            }
+        }
+        let n64 = n as i64;
+        let num = n64 * sum2 - sum.iter().map(|v| v * v).sum::<i64>();
+        let texture = (num as f64 / (n as f64 * n as f64)) as f32;
+        Some(([c, x1, x2, y1, y2], texture, s.len as f32 / s.offered.max(1) as f32))
+    }
 }
 
 #[cfg(test)]

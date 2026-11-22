@@ -1,0 +1,11 @@
+[package]
+name = "filter_lab"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Experiments on telling pixelmap's wrong answers from its right ones, against benchmark ground truth"
+
+[dependencies]
+pixelmap = { path = "../pixelmap", features = ["image", "bench"] }
+image = { version = ">=0.25, <0.25.10", default-features = false, features = ["png", "pnm"] }
+nalgebra = "0.33"

@@ -1,5 +1,6 @@
 //! The pipeline driver behind [`crate::Correspondence`].
 
+use crate::local_consistency::LocalConsistency;
 use crate::circular_feature_descriptor_matcher::{
     CircularFeatureDescriptorMatcher, DEFAULT_MATCH_STRIDE,
 };
@@ -80,6 +81,9 @@ pub struct PixelMapProcessor {
     /// most recent last. Only collected when `fill_mode` is not [`FillMode::Off`].
     history: Vec<(DensePhotoMap, DensePhotoMap)>,
 
+    /// The filter [`Self::finish`] applies last, if any; see [`LocalConsistency`].
+    local_consistency: Option<LocalConsistency>,
+
     /// Whether [`Self::iterate`] has run, so that the init solve's map, which is far
     /// rougher than anything after it, is not kept in `history`.
     iterated: bool,
@@ -153,6 +157,7 @@ impl PixelMapProcessor {
             init_radius: 5,
             fill_mode: FillMode::Off,
             history: Vec::new(),
+            local_consistency: None,
             iterated: false,
         }
     }
@@ -164,6 +169,12 @@ impl PixelMapProcessor {
     /// as the iterations run.
     pub fn set_fill_mode(&mut self, mode: FillMode) {
         self.fill_mode = mode;
+    }
+
+    /// Sets the filter [`Self::finish`] applies to both maps once they are cleaned and
+    /// filled, or `None` (the default) for none.
+    pub fn set_local_consistency(&mut self, filter: Option<LocalConsistency>) {
+        self.local_consistency = filter;
     }
 
     /// Sets the disc radius of the solve [`Self::init`] runs from the feature matches.
@@ -430,6 +441,12 @@ impl PixelMapProcessor {
                 clean_max_dist,
                 self.fill_mode == FillMode::Checked,
             );
+        }
+
+        // Last, so that every answer handed out passed it, filled ones included.
+        if let Some(filter) = &self.local_consistency {
+            filter.apply(&mut pm1);
+            filter.apply(&mut pm2);
         }
 
         (pm1, pm2)

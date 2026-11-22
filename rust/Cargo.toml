@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "command_line_tool",
+    "filter_lab",
     "model_3d",
     "multiview",
     "multiview_cli",
