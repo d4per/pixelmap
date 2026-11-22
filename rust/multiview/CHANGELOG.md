@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.2.0 - 2026-11-22
 
 ### Added
 
@@ -16,7 +16,8 @@ All notable changes to this crate are documented here. The format follows
 
 ### Changed
 
-- Requires pixelmap 0.4.0.
+- Requires pixelmap 0.4.1. This is a breaking change: the re-exported `pixelmap`, and
+  with it the `Quality` of `Options::quality`, are now pixelmap 0.4's types.
 - Accepts pixelmap's new `Quality::Ultra`. Pairs are mapped with `FillMode::Off`, so the
   mappings it triangulates are unchanged by pixelmap's hole filling; the change to
   `Medium` and `High`'s working widths (never wider than the photos) does apply.

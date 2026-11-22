@@ -8,7 +8,7 @@ publish = false
 # Default features off so that the `parallel` passthrough below is the only way rayon gets
 # in: nothing here needs it (this crate only reads a finished mapping), and the wasm build
 # has to be able to leave it out.
-pixelmap = { path = "../pixelmap", version = "0.4.0", default-features = false }
+pixelmap = { path = "../pixelmap", version = "0.4.1", default-features = false }
 # The SVD that lifts a correspondence field into 3D. Kept out of `pixelmap` itself: the
 # library is the correspondence algorithm, and a caller who wants the mapping should not
 # pay for a linear-algebra dependency.
@@ -16,7 +16,7 @@ nalgebra = "0.33"
 
 [dev-dependencies]
 # The example decodes photos from disc, which needs `Photo: From<DynamicImage>`.
-pixelmap = { path = "../pixelmap", version = "0.4.0", features = ["image"] }
+pixelmap = { path = "../pixelmap", version = "0.4.1", features = ["image"] }
 # Only the codecs the example reads and writes: the default feature set pulls in every
 # format image supports, including an AVIF encoder with a heavy C-adjacent tree.
 # Upper-bounded: image 0.25.10 depends on a `zune-core` release that does not exist.
