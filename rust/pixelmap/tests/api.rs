@@ -882,3 +882,106 @@ fn the_fill_mode_defaults_to_the_presets() {
     let default = run(None);
     assert_eq!(default, run(Some(FillMode::Plain)));
 }
+
+/// The forward map and the comparison count of a `Low` run over a shifted pair, built by
+/// `configure`, for comparing runs that should or should not agree.
+fn low_run(configure: impl Fn(pixelmap::Builder) -> pixelmap::Builder) -> (Vec<u8>, usize) {
+    let (a, b) = shifted_pair(240, 160, 6, 3);
+    let mapping = configure(Correspondence::builder().quality(Quality::Low))
+        .run(a, b)
+        .expect("synthetic photos are valid input");
+    (mapping.forward().serialize(), mapping.comparisons())
+}
+
+/// Setting the radii to the presets' own 5 changes nothing, bit for bit.
+#[test]
+fn a_neighborhood_radius_of_5_is_the_default() {
+    let default = low_run(|b| b);
+    assert_eq!(default, low_run(|b| b.neighborhood_radius(5)));
+    assert_eq!(default, low_run(|b| b.init_neighborhood_radius(5)));
+}
+
+/// Both radii reach the solver, and a larger disc still recovers the translation.
+#[test]
+fn the_neighborhood_radii_change_the_mapping() {
+    let default = low_run(|b| b);
+    let init_only = low_run(|b| b.init_neighborhood_radius(9));
+    let every_solve = low_run(|b| b.neighborhood_radius(9));
+    assert_ne!(default, init_only, "the init radius had no effect");
+    assert_ne!(default, every_solve, "the step radius had no effect");
+    assert_ne!(init_only, every_solve, "the steps ignored the radius");
+    // `neighborhood_radius` covers the init solve too, unless it is set apart.
+    assert_eq!(
+        every_solve,
+        low_run(|b| b.neighborhood_radius(9).init_neighborhood_radius(9))
+    );
+    assert_ne!(
+        every_solve,
+        low_run(|b| b.neighborhood_radius(9).init_neighborhood_radius(5))
+    );
+
+    let (a, b) = shifted_pair(240, 160, 6, 3);
+    let mapping = Correspondence::builder()
+        .quality(Quality::Low)
+        .neighborhood_radius(9)
+        .run(a, b)
+        .expect("synthetic photos are valid input");
+    let (x, y) = mapping.lookup(120.0, 80.0).expect("the centre is mapped");
+    assert!(
+        (x - 114.0).abs() < 1.5 && (y - 77.0).abs() < 1.5,
+        "expected (114, 77), got ({x}, {y})"
+    );
+}
+
+/// `neighborhood_radius` replaces the radius of an explicit schedule's steps.
+#[test]
+fn the_neighborhood_radius_overrides_an_explicit_schedule() {
+    use pixelmap::IterationParams;
+    let schedule = |neighborhood_radius| {
+        [3.0, 2.0, 1.0].map(|clean_max_dist| IterationParams {
+            photo_width: 240,
+            grid_cell_size: 5,
+            neighborhood_radius,
+            smooth_iterations: 2,
+            clean_max_dist,
+        })
+    };
+    assert_eq!(
+        low_run(|b| b.schedule(schedule(7)).init_neighborhood_radius(7)),
+        low_run(|b| b.schedule(schedule(5)).neighborhood_radius(7)),
+    );
+}
+
+#[test]
+#[should_panic(expected = "neighborhood radius must be in")]
+fn a_zero_neighborhood_radius_is_rejected() {
+    let _ = Correspondence::builder().neighborhood_radius(0);
+}
+
+#[test]
+#[should_panic(expected = "neighborhood radius must be in")]
+fn an_init_radius_beyond_the_maximum_is_rejected() {
+    let _ =
+        Correspondence::builder().init_neighborhood_radius(pixelmap::MAX_NEIGHBORHOOD_RADIUS + 1);
+}
+
+/// A schedule step past the limit would overflow the score sums, so it panics rather
+/// than quietly mapping garbage.
+#[test]
+#[should_panic(expected = "neighborhood radius must be at most")]
+fn a_schedule_radius_beyond_the_maximum_is_rejected() {
+    let step = pixelmap::IterationParams {
+        photo_width: 240,
+        grid_cell_size: 5,
+        neighborhood_radius: pixelmap::MAX_NEIGHBORHOOD_RADIUS + 1,
+        smooth_iterations: 2,
+        clean_max_dist: 2.0,
+    };
+    low_run(|b| b.schedule(vec![step]));
+}
+
+/// The largest radius allowed runs.
+#[test]
+fn the_maximum_neighborhood_radius_runs() {
+    low_run(|b| b.neighborhood_radius(pixelmap::MAX_NEIGHBORHOOD_RADIUS));
+}

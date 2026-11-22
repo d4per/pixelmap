@@ -37,6 +37,12 @@ use crate::pixelmap_processor::{FillMode, PixelMapProcessor};
 /// spelling and remains an alias for it.
 pub type Quality = ProcessingMode;
 
+/// The largest disc radius the solver can score over.
+///
+/// The colour differences over a disc are summed in 32-bit integers, and a radius of
+/// 51 is the largest whose disc cannot overflow them.
+pub const MAX_NEIGHBORHOOD_RADIUS: usize = 51;
+
 /// The parameters of a single [`PixelMapProcessor::iterate`] call.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct IterationParams {
@@ -44,7 +50,8 @@ pub struct IterationParams {
     pub photo_width: usize,
     /// Size (in pixels) of one cell of the affine correspondence grid.
     pub grid_cell_size: usize,
-    /// How far each cell looks around itself for a better match.
+    /// Radius, in working pixels, of the disc each cell's candidate matches are scored
+    /// over. At most [`MAX_NEIGHBORHOOD_RADIUS`].
     pub neighborhood_radius: usize,
     /// How many smoothing passes are applied to the grid before re-running.
     pub smooth_iterations: usize,

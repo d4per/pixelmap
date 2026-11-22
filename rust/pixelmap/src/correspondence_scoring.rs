@@ -1,5 +1,6 @@
 use crate::affine_transform::AffineTransform;
 use crate::photo::Photo;
+use crate::processing_mode::MAX_NEIGHBORHOOD_RADIUS;
 use std::sync::Arc;
 
 /// Number of fractional bits used by the fixed-point coordinate walk.
@@ -206,6 +207,17 @@ impl CorrespondenceScoring {
     /// for each y-offset in the circular neighborhood, and lists the pixels of a full disc
     /// for the fast path.
     pub(crate) fn new(photo1: Arc<Photo>, photo2: Arc<Photo>, neighborhood_radius: isize) -> Self {
+        // The accumulators in `Acc` are i32. Worst case is `s2`, which sums the squared
+        // differences of all three channels: `pixels * 3 * 255^2`. That bounds the radius
+        // at `MAX_NEIGHBORHOOD_RADIUS`. Checked always, not just in debug builds: a
+        // radius from a caller's schedule lands here, and an overflow would quietly
+        // corrupt the scores.
+        const _: () =
+            assert!((2 * MAX_NEIGHBORHOOD_RADIUS as i64 + 1).pow(2) * 3 * 65025 <= i32::MAX as i64);
+        assert!(
+            (0..=MAX_NEIGHBORHOOD_RADIUS as isize).contains(&neighborhood_radius),
+            "neighborhood radius must be at most {MAX_NEIGHBORHOOD_RADIUS}, not {neighborhood_radius}"
+        );
         let neighborhood_radius = neighborhood_radius as i32;
         let diameter = (2 * neighborhood_radius + 1) as usize;
         let mut sqrt_table = vec![0i32; diameter];
@@ -217,13 +229,6 @@ impl CorrespondenceScoring {
             let yy = y * y;
             sqrt_table[idx] = f32::sqrt((radius2 - yy) as f32).floor() as i32;
         }
-
-        // The accumulators in `Acc` are i32. Worst case is
-        // `pixels * 255^2`; assert we are nowhere near overflowing.
-        debug_assert!(
-            (diameter as i64) * (diameter as i64) * 65025 < i32::MAX as i64,
-            "neighborhood_radius {neighborhood_radius} would overflow the i32 accumulators"
-        );
 
         // Row by row and left to right, the order both paths of `resolve_disc` emit a
         // full disc in.

@@ -6,6 +6,25 @@ All notable changes to this crate are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `Builder::neighborhood_radius` and `Builder::init_neighborhood_radius`: the radius of
+  the disc the solver scores matches over, in every solve or in the initial solve alone.
+  `PixelMapProcessor::set_init_neighborhood_radius` does the same for the initial solve.
+  The default stays 5, so every preset maps as before. On the benchmarks, a radius of 9
+  in the initial solve alone mapped more of the strongly warped HPatches pairs within
+  3 px of the truth (72.8% → 76.2% at `High`) for 20–30% more time, with no measurable
+  effect elsewhere. A radius of 9 in every solve also raised the share within 1 px on
+  ETH3D, HPatches and KITTI by 3–7 points, but lowered Sintel's share within 3 px a
+  little and took about twice the time.
+- `MAX_NEIGHBORHOOD_RADIUS` (51), the largest radius the solver accepts.
+
+### Fixed
+
+- An `IterationParams::neighborhood_radius` above 51 overflowed the scorer's 32-bit
+  sums, which went unnoticed in release builds and silently corrupted the scores. It
+  now panics.
+
 ### Changed
 
 Faster at every preset and much leaner at `Ultra`, with the same output: every preset

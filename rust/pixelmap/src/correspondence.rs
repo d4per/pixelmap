@@ -7,7 +7,7 @@ use crate::dense_photo_map::DensePhotoMap;
 use crate::error::Error;
 use crate::photo::Photo;
 use crate::pixelmap_processor::{FillMode, PixelMapProcessor, DEFAULT_SEED};
-use crate::processing_mode::{IterationParams, Quality};
+use crate::processing_mode::{IterationParams, Quality, MAX_NEIGHBORHOOD_RADIUS};
 
 /// How far along a run is, reported to [`Builder::run_with_progress`] and
 /// [`Builder::run_with_control`].
@@ -143,6 +143,8 @@ pub struct Builder {
     seed: u64,
     final_max_dist: f32,
     fill_mode: Option<FillMode>,
+    neighborhood_radius: Option<usize>,
+    init_neighborhood_radius: Option<usize>,
 }
 
 impl Default for Builder {
@@ -160,6 +162,8 @@ impl Builder {
             seed: DEFAULT_SEED,
             final_max_dist: 2.0,
             fill_mode: None,
+            neighborhood_radius: None,
+            init_neighborhood_radius: None,
         }
     }
 
@@ -188,6 +192,43 @@ impl Builder {
     /// photos' width ([`Quality::steps_for`]).
     pub fn schedule(mut self, steps: impl Into<Vec<IterationParams>>) -> Self {
         self.schedule = Some(steps.into());
+        self
+    }
+
+    /// The radius, in working pixels, of the disc the solver compares the two photos
+    /// over: in every step of the schedule, and in the initial solve unless
+    /// [`Self::init_neighborhood_radius`] sets that one apart. Defaults to 5, the radius
+    /// of every preset step.
+    ///
+    /// It replaces the radius of an explicit [`Self::schedule`]'s steps too. To vary the
+    /// radius from step to step, leave this unset and give each [`IterationParams`] its
+    /// own.
+    ///
+    /// A larger disc matches less textured regions more reliably and gets more pixels
+    /// within a pixel of the truth, but it blurs the mapping across motion and depth
+    /// edges, and the time grows with its area. On the benchmarks a radius of 9
+    /// roughly doubled the time.
+    ///
+    /// # Panics
+    /// If `radius` is 0 or above [`MAX_NEIGHBORHOOD_RADIUS`].
+    pub fn neighborhood_radius(mut self, radius: usize) -> Self {
+        self.neighborhood_radius = Some(checked_radius(radius));
+        self
+    }
+
+    /// The disc radius of the initial solve alone: the one that grows the mapping
+    /// out from the feature matches, before the schedule's steps refine it. Defaults to
+    /// [`Self::neighborhood_radius`], and to 5 if that is unset too.
+    ///
+    /// A start from sparse matches benefits from the larger disc's robustness more than
+    /// the later steps do. On the benchmarks a radius of 9 here mapped more of the
+    /// strongly warped HPatches pairs correctly and cost 20–30% more time, with no
+    /// measurable effect on the other sets.
+    ///
+    /// # Panics
+    /// If `radius` is 0 or above [`MAX_NEIGHBORHOOD_RADIUS`].
+    pub fn init_neighborhood_radius(mut self, radius: usize) -> Self {
+        self.init_neighborhood_radius = Some(checked_radius(radius));
         self
     }
 
@@ -291,10 +332,15 @@ impl Builder {
         #[cfg(not(feature = "bench"))]
         let this = self;
 
-        let steps = this
+        let mut steps = this
             .schedule
             .clone()
             .unwrap_or_else(|| this.quality.steps_for(source_size.0));
+        if let Some(radius) = this.neighborhood_radius {
+            steps
+                .iter_mut()
+                .for_each(|s| s.neighborhood_radius = radius);
+        }
         // The initial matching pass counts as a step, so the reported total matches the
         // number of callbacks.
         let total = steps.len() + 1;
@@ -302,6 +348,9 @@ impl Builder {
         let mut processor =
             PixelMapProcessor::with_seed(photo1, photo2, this.quality.photo_width(), this.seed);
         processor.set_fill_mode(this.fill_mode.unwrap_or(this.quality.fill_mode()));
+        if let Some(radius) = this.init_neighborhood_radius.or(this.neighborhood_radius) {
+            processor.set_init_neighborhood_radius(radius);
+        }
         processor.prepare(&steps);
         processor.init();
         if on_progress(Progress { step: 1, total }).is_break() {
@@ -337,29 +386,50 @@ impl Builder {
     /// caller that cannot reach these options (the Python binding) can still drive
     /// them. Unset variables change nothing.
     ///
-    /// - `PIXELMAP_SCHEDULE`: comma-separated `width:clean_max_dist` steps.
+    /// - `PIXELMAP_SCHEDULE`: comma-separated `width:clean_max_dist[:radius]` steps.
+    /// - `PIXELMAP_RADIUS`: [`Self::neighborhood_radius`], except that with
+    ///   `PIXELMAP_SCHEDULE` it only fills in the steps that name no radius.
+    /// - `PIXELMAP_INIT_RADIUS`: [`Self::init_neighborhood_radius`].
     /// - `PIXELMAP_FILL`: `off`, `plain` or `checked`.
     fn with_env_overrides(&self) -> Builder {
         let mut b = self.clone();
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let radius = |name: &str| {
+            var(name).map(|v| {
+                let r = v.trim().parse();
+                checked_radius(r.unwrap_or_else(|_| panic!("{name} is a radius")))
+            })
+        };
+        let env_radius = radius("PIXELMAP_RADIUS");
+        if let Some(r) = radius("PIXELMAP_INIT_RADIUS").or(env_radius) {
+            b = b.init_neighborhood_radius(r);
+        }
         if let Some(v) = var("PIXELMAP_SCHEDULE") {
             let steps = v
                 .split(',')
                 .map(|step| {
-                    let (w, d) = step
-                        .trim()
-                        .split_once(':')
-                        .expect("PIXELMAP_SCHEDULE step is width:dist");
+                    let mut f = step.trim().split(':');
+                    let (w, d) = (f.next(), f.next());
+                    let r = f.next();
+                    assert!(
+                        d.is_some() && f.next().is_none(),
+                        "PIXELMAP_SCHEDULE step is width:dist[:radius], not {step}"
+                    );
                     IterationParams {
-                        photo_width: w.parse().expect("PIXELMAP_SCHEDULE width"),
+                        photo_width: w.unwrap().parse().expect("PIXELMAP_SCHEDULE width"),
                         grid_cell_size: 5,
-                        neighborhood_radius: 5,
+                        neighborhood_radius: r
+                            .map(|r| r.parse().expect("PIXELMAP_SCHEDULE radius"))
+                            .or(env_radius)
+                            .unwrap_or(5),
                         smooth_iterations: 2,
-                        clean_max_dist: d.parse().expect("PIXELMAP_SCHEDULE dist"),
+                        clean_max_dist: d.unwrap().parse().expect("PIXELMAP_SCHEDULE dist"),
                     }
                 })
                 .collect::<Vec<_>>();
             b.schedule = Some(steps);
+        } else if let Some(r) = env_radius {
+            b = b.neighborhood_radius(r);
         }
         if let Some(v) = var("PIXELMAP_FILL") {
             b.fill_mode = Some(match v.trim() {
@@ -371,6 +441,15 @@ impl Builder {
         }
         b
     }
+}
+
+/// `radius`, if it is a usable disc radius.
+fn checked_radius(radius: usize) -> usize {
+    assert!(
+        (1..=MAX_NEIGHBORHOOD_RADIUS).contains(&radius),
+        "neighborhood radius must be in 1..={MAX_NEIGHBORHOOD_RADIUS}, not {radius}"
+    );
+    radius
 }
 
 /// Maps two photos onto each other with every default.
