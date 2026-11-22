@@ -6,6 +6,14 @@ All notable changes to this crate are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `Options::neighborhood_radius` and `Options::init_neighborhood_radius`, passed through to
+  pixelmap's `Builder` methods of the same names for every pair. Unset by default, so
+  every pair is mapped as before. Both panic on a radius pixelmap cannot score (0, or
+  above `pixelmap::MAX_NEIGHBORHOOD_RADIUS`) when set, rather than when the run reaches
+  pixelmap.
+
 ### Changed
 
 - Requires pixelmap 0.4.0.

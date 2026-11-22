@@ -299,9 +299,12 @@ def evaluate(benchmark: str, root: Path) -> dict:
 def pack(benchmark: str, root: Path) -> Path:
     if benchmark == "sintel":
         data = _data() / "sintel"
-        bundler = next((p for p in (data / "bundler").rglob("bundler") if p.is_file() and os.access(p, os.X_OK)), None)
-        if bundler is None:
-            raise SystemExit(f"no executable bundler under {data / 'bundler'}")
+        # The zip ships one Bundler per platform (linux-x64/, osx/, win/), all executable.
+        system = platform.system()
+        sub = {"Linux": "linux-x64/bundler", "Darwin": "osx/bundler", "Windows": "win/bundler.exe"}.get(system)
+        bundler = data / "bundler" / sub if sub else None
+        if bundler is None or not bundler.is_file():
+            raise SystemExit(f"no Sintel bundler for {system} under {data / 'bundler'}")
         target = root.with_suffix(".lzma")
         subprocess.run([str(bundler), str(root / "clean"), str(root / "final"), str(target)], check=True)
         return target

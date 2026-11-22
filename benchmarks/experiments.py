@@ -8,6 +8,10 @@ plain `high`. Write their results to a separate CSV (`--out results/experiments.
 
     PIXELMAP_SCHEDULE     width:clean_max_dist,...   replaces the preset's schedule
     PIXELMAP_FILL         off | plain | checked      fill final holes from earlier widths
+    PIXELMAP_RADIUS       r                          scoring disc radius of every step (default 5)
+    PIXELMAP_INIT_RADIUS  r                          ... of the init solve alone
+
+A `PIXELMAP_SCHEDULE` step may also name its own radius, `width:dist:radius`.
 
 These are the variants that led to `ultra` and to the source-width cap and hole filling in
 `medium` and `high`. A variant that names no fill mode runs with it off, so
@@ -39,7 +43,7 @@ MEDIUM: list[tuple[int, float]] = [
 ]
 HIGH: list[tuple[int, float]] = MEDIUM + [(1600, 1.0), (1600, 2.0), (1600, 2.0)]
 
-_ENV = ("PIXELMAP_SCHEDULE", "PIXELMAP_FILL")
+_ENV = ("PIXELMAP_SCHEDULE", "PIXELMAP_FILL", "PIXELMAP_RADIUS", "PIXELMAP_INIT_RADIUS")
 
 
 def _variant(
@@ -85,6 +89,44 @@ def _ultra(w: int) -> list[tuple[int, float]]:
     return steps
 
 
+def _radius(
+    quality: str,
+    radius: Optional[int] = None,
+    per_width: Optional[Callable[[int, bool], int]] = None,
+    init_radius: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> Callable[[Pair], np.ndarray]:
+    """The shipped `quality` preset (its own capped schedule and fill) with another scoring
+    disc radius. `radius` sets every step and the init solve. `per_width(width, final)` picks
+    a step's radius from its working width and whether that is the schedule's last width,
+    and then the schedule is rebuilt here exactly as `Quality::steps_for` builds it."""
+
+    def run(pair: Pair) -> np.ndarray:
+        env = {"PIXELMAP_RADIUS": "" if radius is None else str(radius),
+               "PIXELMAP_INIT_RADIUS": "" if init_radius is None else str(init_radius)}
+        if per_width is not None:
+            w = pair.img1.shape[1]
+            steps = [(min(sw, w), d) for sw, d in {"medium": MEDIUM, "high": HIGH}[quality]]
+            last = steps[-1][0]
+            env["PIXELMAP_SCHEDULE"] = ",".join(f"{sw}:{d}:{per_width(sw, sw == last)}" for sw, d in steps)
+        os.environ.update(env)
+        try:
+            mapping = pixelmap.correspond(
+                pair.img1, pair.img2, quality=quality, seed=methods.SEED if seed is None else seed
+            )
+        finally:
+            for k in _ENV:
+                os.environ.pop(k, None)
+        return np.asarray(mapping.flow(), dtype=np.float32)
+
+    return run
+
+
+def _split(coarse: int, final: int) -> Callable[[int, bool], int]:
+    """`coarse` at every width before the last, `final` at the last."""
+    return lambda _w, is_final: final if is_final else coarse
+
+
 VARIANTS: dict[str, Callable[[Pair], np.ndarray]] = {
     # idea 2: final round-trip threshold (grid cells at the final working width)
     "x_high_fin3": _variant("high", finish=3.0),
@@ -111,6 +153,23 @@ VARIANTS: dict[str, Callable[[Pair], np.ndarray]] = {
     "x_ultra_s2": _variant("high", schedule=_ultra, fill="plain", seed=2),
     "x_high_s2": _variant("high", seed=2),
     "x_high_3200_fill": _variant("high", schedule=HIGH + [(3200, 1.0), (3200, 2.0)], fill="plain"),
+    # scoring disc radius, on the shipped presets (2026-11-21)
+    **{f"x_r{r}": _radius("high", radius=r) for r in (3, 4, 5, 6, 7, 9)},
+    **{f"x_med_r{r}": _radius("medium", radius=r) for r in (4, 5, 7)},
+    "x_r5_s2": _radius("high", radius=5, seed=2),
+    **{f"x_r{r}": _radius("high", radius=r) for r in (11, 13)},
+    # a different radius at the coarse widths (and the init solve) than at the final one
+    **{f"x_c{c}_f{f}": _radius("high", per_width=_split(c, f), init_radius=c)
+       for c, f in ((7, 5), (9, 5), (13, 5), (9, 7), (5, 9))},
+    "x_i9": _radius("high", init_radius=9),
+    "x_med_c9_f5": _radius("medium", per_width=_split(9, 5), init_radius=9),
+    # the init solve's radius on its own and combined
+    "x_i13": _radius("high", init_radius=13),
+    "x_i9_s2": _radius("high", init_radius=9, seed=2),
+    "x_i9_c7_f5": _radius("high", per_width=_split(7, 5), init_radius=9),
+    "x_i9_c5_f7": _radius("high", per_width=_split(5, 7), init_radius=9),
+    "x_i13_c7_f7": _radius("high", per_width=_split(7, 7), init_radius=13),
+    "x_med_i9": _radius("medium", init_radius=9),
 }
 
 

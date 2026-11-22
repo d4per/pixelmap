@@ -8,7 +8,7 @@ use pixelmap_multiview::pairs::{self, MIN_PAIR_COVERAGE};
 use pixelmap_multiview::rng::Rng;
 use pixelmap_multiview::synthetic::{Scene, SyntheticSet};
 use pixelmap_multiview::twoview::{self, Params};
-use pixelmap_multiview::{Error, Event, Flow, PairLookup, PhotoPx, Stage, ViewId};
+use pixelmap_multiview::{Error, Event, Flow, Options, PairLookup, PhotoPx, Stage, ViewId};
 
 fn rendered(set: &SyntheticSet) -> Vec<Arc<pixelmap::Photo>> {
     (0..set.views())
@@ -199,4 +199,41 @@ fn a_mapping_looks_up_exactly_what_its_correspondence_did() {
         "{mapped} mapped, {unmapped} not"
     );
     assert_eq!(mapping.coverage(), correspondence.coverage());
+}
+
+/// The raw grid of every pair `options` maps `photos` into, in pair order.
+fn mapped_points(photos: &[Arc<pixelmap::Photo>], options: &Options) -> Vec<Vec<f32>> {
+    let mut points = Vec::new();
+    pairs::compute_with_options(photos, options, &mut |event| {
+        if let Event::PairMapped { map, .. } = event {
+            points.push(map.points);
+        }
+        Flow::Continue(())
+    })
+    .expect("rendered photos are valid input");
+    points
+}
+
+#[test]
+fn the_neighborhood_radius_reaches_pixelmap() {
+    let set = SyntheticSet::orbit(Scene::sphere(), 3, 24.0, 400, 300);
+    let photos = rendered(&set);
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+
+    let defaults = mapped_points(&photos, &Options::new());
+    // Naming pixelmap's default radius changes nothing.
+    let five = mapped_points(&photos, &Options::new().neighborhood_radius(5));
+    assert!(defaults.iter().zip(&five).all(|(a, b)| same(a, b)));
+
+    for options in [
+        Options::new().neighborhood_radius(9),
+        Options::new().init_neighborhood_radius(9),
+    ] {
+        let wider = mapped_points(&photos, &options);
+        assert_eq!(wider.len(), defaults.len());
+        assert!(
+            defaults.iter().zip(&wider).any(|(a, b)| !same(a, b)),
+            "{options:?} mapped every pair exactly as the default radius does"
+        );
+    }
 }

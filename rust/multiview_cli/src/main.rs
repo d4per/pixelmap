@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use image::imageops::FilterType;
 use image::DynamicImage;
-use pixelmap::{Correspondence, Photo, ProcessingMode, DEFAULT_SEED};
+use pixelmap::{
+    Correspondence, FillMode, Photo, ProcessingMode, DEFAULT_SEED, MAX_NEIGHBORHOOD_RADIUS,
+};
 use pixelmap_multiview::depth::{self, DepthMap};
 use pixelmap_multiview::{
     export, input, Error, Event, Flow, Focal, FocalSource, Job, Model, Options, PairId, Pose, World,
@@ -44,6 +46,17 @@ struct Args {
     #[arg(long, default_value = "low")]
     processing_mode: ProcessingMode,
 
+    /// Radius, in working pixels, of the disc pixelmap compares the photos over, in every
+    /// solve of every pair. Defaults to pixelmap's 5. Larger matches weak texture more
+    /// reliably but blurs depth edges, and the time per pair grows with its area.
+    #[arg(long, value_name = "PIXELS", value_parser = radius_parser())]
+    radius: Option<usize>,
+
+    /// The disc radius of pixelmap's initial solve alone, the one grown from the feature
+    /// matches. Defaults to `--radius`. 9 was the cheap gain on pixelmap's benchmarks.
+    #[arg(long, value_name = "PIXELS", value_parser = radius_parser())]
+    init_radius: Option<usize>,
+
     /// Write the textured mesh into this directory rather than the current one, along with
     /// the photos as used, the sparse model and the depth maps.
     #[arg(long)]
@@ -65,6 +78,12 @@ struct Args {
     /// `--processing-mode`.
     #[arg(long, value_name = "SECONDS")]
     cancel_after: Option<f64>,
+}
+
+/// Accepts the radii pixelmap can score, so that a bad one is a usage error rather than a
+/// panic.
+fn radius_parser() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::new().range(1..=MAX_NEIGHBORHOOD_RADIUS as u64)
 }
 
 fn main() -> ExitCode {
@@ -123,7 +142,9 @@ fn run(args: Args) -> Result<(), String> {
         .quality(args.processing_mode)
         .focal(focal)
         .seed(seed)
-        .refine_focal(args.refine_focal);
+        .refine_focal(args.refine_focal)
+        .neighborhood_radius(args.radius)
+        .init_neighborhood_radius(args.init_radius);
 
     let start = Instant::now();
     let result = match args.cancel_after {
@@ -581,9 +602,18 @@ fn describe_focal(focal: Option<f64>) -> String {
 
 fn time_pair(args: &Args, photos: &[Arc<Photo>], seed: u64) -> Result<(), String> {
     let start = Instant::now();
-    let mapping = Correspondence::builder()
+    // Built as the library builds each pair's, so the time is the one a run will see.
+    let mut builder = Correspondence::builder()
         .quality(args.processing_mode)
         .seed(seed)
+        .fill_mode(FillMode::Off);
+    if let Some(radius) = args.radius {
+        builder = builder.neighborhood_radius(radius);
+    }
+    if let Some(radius) = args.init_radius {
+        builder = builder.init_neighborhood_radius(radius);
+    }
+    let mapping = builder
         .run(photos[0].clone(), photos[1].clone())
         .map_err(|e| e.to_string())?;
     let elapsed = start.elapsed();
