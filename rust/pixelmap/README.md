@@ -81,6 +81,21 @@ pixels of the truth, but the filled cells are less precise than the rest. Use
 `Builder::schedule` takes an explicit list of `IterationParams` for callers tuning the
 algorithm itself.
 
+`Builder::neighborhood_radius` sets the radius of the disc the solver compares the photos
+over. It defaults to 5 pixels at the working width. `Builder::init_neighborhood_radius`
+sets it for the initial solve alone, the one that grows the mapping out from the feature
+matches. A larger disc matches weakly textured or strongly warped regions more reliably.
+But it blurs the mapping across motion and depth edges, and the time grows with its area.
+On the benchmarks, `init_neighborhood_radius(9)` was the cheap gain: on HPatches, 76% of
+pixels mapped within 3 px of the truth instead of 73%, for 20–30% more time.
+
+```rust,no_run
+let mapping = Correspondence::builder()
+    .quality(Quality::High)
+    .init_neighborhood_radius(9)
+    .run(a, b)?;
+```
+
 ## Progress and cancelling
 
 `Builder::run_with_progress` reports a `Progress` after the initial matching pass and after

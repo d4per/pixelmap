@@ -246,7 +246,7 @@ pub fn run(
         format!("{} photos at {width}×{height}", photos.len()),
     )?;
 
-    let graph = pairs::compute(photos, options.quality, options.resolved_seed(), on_event)?;
+    let graph = pairs::compute_with_options(photos, options, on_event)?;
     reconstruct_with_params(
         &graph,
         photos,

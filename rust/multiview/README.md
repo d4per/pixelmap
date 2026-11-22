@@ -76,6 +76,10 @@ texture atlas to produce. The thresholds each stage judges by — about fifty of
 derived from those and are deliberately not part of the API: they are meaningful only
 together, and publishing them would turn tuning decisions into this crate's contract.
 
+For a caller tuning the pairwise correspondence, `Options::neighborhood_radius` and
+`Options::init_neighborhood_radius` pass pixelmap's disc radius through unchanged; see
+pixelmap's README for what they trade. Left unset, pixelmap's default of 5 applies.
+
 `run` gives back a `Model`: the mesh, its texture, the camera intrinsics, where each photo
 was taken from, and which photos made it. Everything is in one frame: the first camera of
 the best pair sits at the origin, and the distance between that pair's cameras is the unit

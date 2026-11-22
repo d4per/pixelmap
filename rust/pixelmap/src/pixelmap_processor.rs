@@ -6,7 +6,7 @@ use crate::circular_feature_descriptor_matcher::{
 use crate::correspondence_mapping_algorithm::CorrespondenceMappingAlgorithm;
 use crate::dense_photo_map::DensePhotoMap;
 use crate::photo::Photo;
-use crate::processing_mode::IterationParams;
+use crate::processing_mode::{IterationParams, MAX_NEIGHBORHOOD_RADIUS};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -67,6 +67,10 @@ pub struct PixelMapProcessor {
     /// [`Self::prepare`] from the schedule, and `None` for a caller that runs without
     /// one. Each step drops the entries of `scaled` that no later step will ask for.
     widths_ahead: Option<VecDeque<usize>>,
+
+    /// The disc radius of the init solve, the one seeded from the feature matches; see
+    /// [`Self::set_init_neighborhood_radius`].
+    init_radius: usize,
 
     /// How [`Self::finish`] fills the cells the final map left empty; see
     /// [`FillMode`].
@@ -146,6 +150,7 @@ impl PixelMapProcessor {
             algorithms_built: 0,
             scaled: HashMap::new(),
             widths_ahead: None,
+            init_radius: 5,
             fill_mode: FillMode::Off,
             history: Vec::new(),
             iterated: false,
@@ -159,6 +164,22 @@ impl PixelMapProcessor {
     /// as the iterations run.
     pub fn set_fill_mode(&mut self, mode: FillMode) {
         self.fill_mode = mode;
+    }
+
+    /// Sets the disc radius of the solve [`Self::init`] runs from the feature matches.
+    /// Defaults to 5. Each [`Self::iterate`] takes its own radius.
+    ///
+    /// Call it before [`Self::init`]. See
+    /// [`Builder::init_neighborhood_radius`](crate::Builder::init_neighborhood_radius).
+    ///
+    /// # Panics
+    /// If `radius` is 0 or above [`MAX_NEIGHBORHOOD_RADIUS`].
+    pub fn set_init_neighborhood_radius(&mut self, radius: usize) {
+        assert!(
+            (1..=MAX_NEIGHBORHOOD_RADIUS).contains(&radius),
+            "neighborhood radius must be in 1..={MAX_NEIGHBORHOOD_RADIUS}, not {radius}"
+        );
+        self.init_radius = radius;
     }
 
     /// The width of the full-resolution photos, which [`crate::Quality::steps_for`]
@@ -264,9 +285,10 @@ impl PixelMapProcessor {
         let w = photo1scaled.width;
         let (s1, s2) = (self.scaled(0, w), self.scaled(1, w));
         let (seed1, seed2) = (self.next_seed(), self.next_seed());
+        let r = self.init_radius;
         let mut ocm_manager1 =
-            CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, 5, seed1);
-        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, 5, seed2);
+            CorrespondenceMappingAlgorithm::with_scaled(s1.clone(), s2.clone(), 5, r, seed1);
+        let mut ocm_manager2 = CorrespondenceMappingAlgorithm::with_scaled(s2, s1, 5, r, seed2);
 
         // Add the initial matched points.
         for m in pairs {

@@ -11,6 +11,7 @@ use crate::error::Error;
 use crate::event::{emit, Event, Flow, PairMap, Stage};
 use crate::input::MIN_VIEWS;
 use crate::lookup::{Directed, PairLookup};
+use crate::options::Options;
 use crate::types::{PairId, PhotoPx, ViewId};
 
 /// The coverage below which a pair is not trusted to connect its two views.
@@ -268,6 +269,23 @@ pub fn compute(
     seed: u64,
     on_event: &mut dyn FnMut(Event) -> Flow,
 ) -> Result<PairGraph<Mapping>, Error> {
+    compute_with_options(
+        photos,
+        &Options::new().quality(quality).seed(seed),
+        on_event,
+    )
+}
+
+/// [`compute`], with the pixelmap settings of `options`: its quality, seed and
+/// neighborhood radii. The rest of `options` is for the later stages and is ignored here.
+///
+/// # Errors
+/// [`Error::Correspondence`] if pixelmap rejects a pair; [`Error::Cancelled`].
+pub fn compute_with_options(
+    photos: &[Arc<Photo>],
+    options: &Options,
+    on_event: &mut dyn FnMut(Event) -> Flow,
+) -> Result<PairGraph<Mapping>, Error> {
     let views = photos.len();
     let total = PairId::count(views);
     let mut maps = Vec::with_capacity(total);
@@ -276,10 +294,17 @@ pub fn compute(
         // Every mapped cell becomes a 3D point, so only the ones that passed the final
         // round-trip check: cells filled from coarser steps raise coverage at the cost of
         // precision, which suits flow but not triangulation.
-        let mapping = Correspondence::builder()
-            .quality(quality)
-            .seed(seed)
-            .fill_mode(FillMode::Off)
+        let mut builder = Correspondence::builder()
+            .quality(options.quality)
+            .seed(options.resolved_seed())
+            .fill_mode(FillMode::Off);
+        if let Some(radius) = options.neighborhood_radius {
+            builder = builder.neighborhood_radius(radius);
+        }
+        if let Some(radius) = options.init_neighborhood_radius {
+            builder = builder.init_neighborhood_radius(radius);
+        }
+        let mapping = builder
             .run_with_control(
                 photos[pair.a().index()].clone(),
                 photos[pair.b().index()].clone(),
